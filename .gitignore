@@ -1,0 +1,49 @@
+# --- User-specified exclusions (do not upload) ---
+/MLLM_MER_pinpline_main/
+/pre_datasets/
+/Q-T-A/
+/pre_process/
+/README_reference.md
+/runs/
+/MEWM-Agent_完整执行方案.md
+/formwork.md
+/.env.example
+/Weights/
+
+# --- Secrets: never upload real credentials ---
+.env
+*.env
+!.env.*.example
+**/api_key*
+**/*_token*
+**/secrets.*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- Model weights / large artifacts (belt-and-suspenders) ---
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt

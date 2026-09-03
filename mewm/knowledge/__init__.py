@@ -1,0 +1,1 @@
+"""MEWM-Agent knowledge subpackage."""
