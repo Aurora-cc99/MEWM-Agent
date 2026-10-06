@@ -244,7 +244,10 @@ MEWM-Agent-main/
 │                                         #   (FLOW_ROOT; populated at runtime)
 ├── Q-T-A/                                # ME-LVQA QA annotation root (QTA_ROOT),
 │                                         #   one JSONL per dataset
+├── dataset/                              # raw dataset videos (gated benchmarks,
+│                                         #   kept local; empty placeholder in git)
 ├── runs/                                 # pre-computed intermediate outputs
+│                                         #   (empty placeholder in git; outputs stay local)
 │   └── softnet_features/casme_sq/        # per-clip SoftNet feature arrays (.npz)
 │       └── …                             #   one file per subject-clip pair
 │   └── softnet_spotter/casme_sq/         # per-fold SoftNet spotter weights (.npz)
@@ -264,11 +267,11 @@ MEWM-Agent-main/
 │       ├── weights/                      # face alignment + landmark model weights
 │       └── thirdparty/DepthAnythingV2/   # DepthAnythingV2 depth-estimation module
 │
-├── assets/
+├── assets/                               # runtime binary assets (kept local, not in git)
 │   └── shape_predictor_68_face_landmarks.dat  # dlib 68-point facial landmark
 │                                              #   predictor (required at runtime)
 │
-└── Weights/                              # local model checkpoints (not in git)
+└── Weights/                              # local model checkpoints (kept local; empty placeholder in git)
     ├── Qwen3-VL-30B-A3B-Instruct/        # default policy backbone
     ├── Qwen3-VL-8B-Instruct/             # lighter local policy
     ├── Qwen3-VL-30B-Instruct/
@@ -277,6 +280,8 @@ MEWM-Agent-main/
     ├── Qwen2.5-Omni-7B/
     └── GLM-4.1V-9B-Thinking/
 ```
+
+Empty directories (`Weights/`, `dataset/`, `runs/`, `Q-T-A/`, `pre_datasets/`) are kept on GitHub as placeholders via `.gitkeep`; their runtime contents (model checkpoints, raw videos, pre-computed outputs) stay local and are git-ignored.
 
 ## 📊 Datasets & Protocols
 
