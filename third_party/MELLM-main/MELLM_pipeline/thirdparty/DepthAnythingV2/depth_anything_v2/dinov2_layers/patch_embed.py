@@ -1,4 +1,4 @@
-
+"""Patch embedding layer that converts image patches to DINOv2 tokens."""
 
 from typing import Callable, Optional, Tuple, Union
 

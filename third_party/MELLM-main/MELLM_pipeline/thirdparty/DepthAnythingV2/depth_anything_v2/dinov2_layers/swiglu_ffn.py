@@ -1,3 +1,4 @@
+"""SwiGLU feed-forward network used in the DINOv2 block MLP."""
 
 from typing import Callable, Optional
 

@@ -1,4 +1,4 @@
-
+"""LayerScale module that scales feature maps per channel."""
 
 from typing import Union
 

@@ -1,4 +1,4 @@
-
+"""DINOv2 multi-head attention block for the vision transformer backbone."""
 
 import logging
 

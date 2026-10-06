@@ -1,3 +1,5 @@
+"""DPT head building blocks (feature fusion and scratch output layers)."""
+
 import torch.nn as nn
 
 

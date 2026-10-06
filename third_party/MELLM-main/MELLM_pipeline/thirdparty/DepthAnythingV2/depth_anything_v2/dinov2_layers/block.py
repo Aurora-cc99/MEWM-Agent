@@ -1,4 +1,4 @@
-
+"""DINOv2 transformer block: attention, SwiGLU MLP, layer scale, and drop path."""
 
 import logging
 from typing import Callable, List, Any, Tuple, Dict

@@ -1,4 +1,4 @@
-
+"""DINOv2 vision transformer backbone definition for DepthAnythingV2."""
 
 from functools import partial
 import math

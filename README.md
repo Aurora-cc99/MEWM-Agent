@@ -240,6 +240,10 @@ MEWM-Agent-main/
 │   └── qa/
 │       └── interrogate.py                # interactive QA interrogation utility
 │
+├── pre_datasets/                         # preprocessed flow / face-crop data root
+│                                         #   (FLOW_ROOT; populated at runtime)
+├── Q-T-A/                                # ME-LVQA QA annotation root (QTA_ROOT),
+│                                         #   one JSONL per dataset
 ├── runs/                                 # pre-computed intermediate outputs
 │   └── softnet_features/casme_sq/        # per-clip SoftNet feature arrays (.npz)
 │       └── …                             #   one file per subject-clip pair

@@ -1,5 +1,4 @@
-
-
+"""SwiGLU MLP used inside DINOv2 transformer blocks."""
 
 from typing import Callable, Optional
 

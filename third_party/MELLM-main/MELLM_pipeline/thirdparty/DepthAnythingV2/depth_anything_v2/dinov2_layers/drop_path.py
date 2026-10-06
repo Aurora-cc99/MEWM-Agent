@@ -1,5 +1,4 @@
-
-
+"""Stochastic depth (drop path) helper for DINOv2 transformer blocks."""
 
 from torch import nn
 

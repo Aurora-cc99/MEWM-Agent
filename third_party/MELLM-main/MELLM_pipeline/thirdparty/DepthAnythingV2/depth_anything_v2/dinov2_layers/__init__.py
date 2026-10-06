@@ -1,3 +1,4 @@
+"""DINOv2 backbone building blocks (attention, blocks, patch embedding, etc.)."""
 
 from .mlp import Mlp
 from .patch_embed import PatchEmbed

@@ -1,3 +1,5 @@
+"""DepthAnythingV2 model: DINOv2 encoder plus DPT-based depth prediction head."""
+
 import cv2
 import torch
 import torch.nn as nn
