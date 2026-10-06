@@ -1,33 +1,4 @@
-"""SFT sufficiency diagnostics: is the policy trained enough to hand over to RL?
-
-**1a Format alignment.** Does the policy follow the instruction contract -- reason in the
-required order and emit parseable JSON? Measured as the share of sampled outputs that
-satisfy :mod:`mewm.eval.pass_criteria.check_format`.
-
-**1b Loss plateau.** Has the curve stopped moving? Judged on the trailing window by two
-statistics together: the slope (is it still descending?) and the coefficient of variation
-(has the noise settled?). Either one alone is misleading -- a curve can be flat on average
-while oscillating, and it can be smooth while still descending steadily.
-
-**2a pass@k headroom.** ``pass@k >= pass@1`` holds by construction for any sampler, so the
-inequality itself carries no information. What matters is the *gap*: a large gap means the
-policy can already produce a passing answer but does not rank it first, which is precisely
-what a policy-gradient update fixes. A small gap at a low rate means the capability is
-absent and more SFT is the answer; a small gap at a high rate means saturation.
-
-**2b Reward spread.** A group of samples with no spread carries no preference information
-*whether the rewards are all low or all high*, because the group-relative advantage
-``(R - mean)/std`` is then identically zero and the update is a no-op. All-low means SFT is
-undertrained. All-high means the prompt is exhausted and should leave the RL prompt set.
-Only a spread group is trainable.
-
-**On what these numbers are measured over.** When ``TrainingConfig.n_val_subjects`` is 0 --
-the configured default -- there is no held-out subject and every statistic here is computed
-on the same material the policy was fitted to. Such a report carries ``in_sample=True`` and
-every consumer prints it, because an in-sample plateau is evidence of memorisation rather
-than convergence and an in-sample pass@1 is optimistic. The arithmetic does not change; the
-interpretation does.
-"""
+"""Training diagnostics: loss curves, reward histograms, and fold summaries."""
 
 from __future__ import annotations
 
@@ -44,14 +15,8 @@ from ..eval.pass_criteria import PassOutcome, stage_rates
 LOGGER = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# 1a -- format alignment
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class FormatAlignment:
-    """Share of sampled outputs that satisfy the instruction contract."""
 
     rate: float = 0.0
     n: int = 0
@@ -75,7 +40,6 @@ class FormatAlignment:
 
 def format_alignment(outcomes: Sequence[PassOutcome],
                      threshold: float = 0.95) -> FormatAlignment:
-    """Judgement 1a."""
     report = FormatAlignment(n=len(outcomes), threshold=threshold)
     if not outcomes:
         return report
@@ -95,14 +59,8 @@ def format_alignment(outcomes: Sequence[PassOutcome],
     return report
 
 
-# ---------------------------------------------------------------------------
-# 1b -- loss plateau
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class PlateauReport:
-    """Whether the loss curve has stopped moving."""
 
     slope: float = 0.0
     cv: float = 0.0
@@ -115,7 +73,6 @@ class PlateauReport:
 
     @property
     def ok(self) -> bool:
-        """A plateau needs both a flat trend and settled noise."""
         return (self.window >= 4 and abs(self.slope) <= self.max_slope
                 and self.cv <= self.max_cv)
 
@@ -133,13 +90,6 @@ def loss_plateau(
     losses: Sequence[float], window_ratio: float = 0.2,
     max_slope: float = 1e-3, max_cv: float = 0.05,
 ) -> PlateauReport:
-    """Judgement 1b.
-
-    The slope is a least-squares fit over the trailing window, normalised per step so the
-    threshold does not depend on how long training ran. ``still_descending`` is reported
-    separately from ``ok``: a curve that is descending faster than the tolerance has not
-    plateaued, and stopping there would leave capability on the table.
-    """
     values = np.asarray([float(v) for v in losses if np.isfinite(v)], dtype=np.float64)
     report = PlateauReport(max_slope=max_slope, max_cv=max_cv)
     if values.size == 0:
@@ -164,19 +114,7 @@ def loss_plateau(
     return report
 
 
-# ---------------------------------------------------------------------------
-# 2a -- pass@k
-# ---------------------------------------------------------------------------
-
-
 def pass_at_k(n: int, c: int, k: int) -> float:
-    """Unbiased ``pass@k`` from ``c`` passing samples out of ``n`` draws.
-
-    ``1 - C(n-c, k) / C(n, k)``, evaluated as a product to stay stable for large ``n``.
-    The naive alternative -- draw k samples and check -- is a high-variance estimate of
-    the same quantity, and at the sample counts available here the variance dominates the
-    signal the gate is trying to read.
-    """
     if k <= 0 or n <= 0:
         return 0.0
     k = min(k, n)
@@ -192,7 +130,6 @@ def pass_at_k(n: int, c: int, k: int) -> float:
 
 @dataclass
 class HeadroomReport:
-    """pass@1 against pass@k: is there anything for RL to sharpen?"""
 
     pass_1: float = 0.0
     pass_k: float = 0.0
@@ -209,7 +146,6 @@ class HeadroomReport:
 
     @property
     def ok(self) -> bool:
-        """Headroom exists: the policy can pass but does not rank the pass first."""
         return self.n_prompts > 0 and self.gap >= self.gap_min and self.pass_k >= self.floor
 
     @property
@@ -217,9 +153,9 @@ class HeadroomReport:
         if self.n_prompts == 0:
             return "no_data"
         if self.pass_k < self.floor:
-            return "undertrained"          # cannot pass even with k tries
+            return "undertrained"
         if self.gap < self.gap_min:
-            return "saturated"            # already ranks its best answer first
+            return "saturated"
         return "rl_ready"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -237,7 +173,6 @@ def headroom(
     per_prompt_outcomes: Dict[str, Sequence[PassOutcome]],
     k: int = 8, gap_min: float = 0.15, floor: float = 0.5,
 ) -> HeadroomReport:
-    """Judgement 2a, averaged over prompts."""
     report = HeadroomReport(k=k, gap_min=gap_min, floor=floor)
     ones: List[float] = []
     ks: List[float] = []
@@ -264,19 +199,12 @@ def headroom(
     report.pass_k = float(np.mean(ks))
     report.n_prompts = len(ones)
     report.samples_per_prompt = float(np.mean(counts))
-    # Surface the prompts with the widest gap first: those are the ones RL can move.
     report.per_prompt.sort(key=lambda row: row["pass_1"] - row["pass_k"])
     return report
 
 
-# ---------------------------------------------------------------------------
-# 2b -- reward distribution
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class RewardDistribution:
-    """Three-way verdict over per-prompt reward groups."""
 
     n_groups: int = 0
     mean: float = 0.0
@@ -292,12 +220,6 @@ class RewardDistribution:
 
     @property
     def verdict(self) -> str:
-        """``undertrained`` / ``saturated`` / ``rl_ready``.
-
-        Decided on the *majority* of groups rather than the pooled mean: a pool whose
-        mean sits in range can still be made entirely of degenerate groups, half of them
-        at the floor and half at the ceiling, and that pool trains nothing.
-        """
         if self.n_groups == 0:
             return "no_data"
         if self.n_spread >= max(1, self.n_groups // 2):
@@ -325,8 +247,6 @@ class RewardDistribution:
 
 def classify_group(rewards: Sequence[float], std_min: float = 0.05,
                    mean_low: float = 0.20, mean_high: float = 0.85) -> str:
-    """One group's contribution: ``spread`` / ``all_low`` / ``all_high``.
-    """
     values = np.asarray([float(r) for r in rewards], dtype=np.float64)
     if values.size == 0:
         return "all_low"
@@ -341,7 +261,6 @@ def reward_distribution(
     groups: Sequence[Sequence[float]], std_min: float = 0.05,
     mean_low: float = 0.20, mean_high: float = 0.85,
 ) -> RewardDistribution:
-    """Judgement 2b."""
     report = RewardDistribution(std_min=std_min, mean_low=mean_low, mean_high=mean_high)
     populated = [list(g) for g in groups if len(g) > 0]
     if not populated:
@@ -369,14 +288,8 @@ def reward_distribution(
     return report
 
 
-# ---------------------------------------------------------------------------
-# Composite gate
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class SufficiencyReport:
-    """All four judgements plus the decision they imply."""
 
     fold: str = ""
     round_index: int = 0
@@ -390,8 +303,6 @@ class SufficiencyReport:
 
     @property
     def decision(self) -> str:
-        """``continue_sft`` / ``rl_ready`` / ``saturated``.
-        """
         if self.format is not None and not self.format.ok:
             return "continue_sft"
         if self.plateau is not None and self.plateau.still_descending:
@@ -409,7 +320,6 @@ class SufficiencyReport:
         return "continue_sft"
 
     def reasons(self) -> List[str]:
-        """Why the decision came out the way it did."""
         out: List[str] = []
         if self.format is not None and not self.format.ok:
             out.append(f"format alignment {self.format.rate:.3f} < "
@@ -451,7 +361,6 @@ def assess(
     round_index: int = 0,
     in_sample: bool = True,
 ) -> SufficiencyReport:
-    """Run all four judgements and compose the gate decision."""
     config = config or TrainingConfig()
     flat = [o for outcomes in outcomes_by_prompt.values() for o in outcomes]
 

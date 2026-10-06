@@ -1,22 +1,4 @@
-"""RL / QA-augmentation prompt construction.
-
-**Filtering (which reference instructions are eligible at all).** The reference QA set
-mixes two kinds of question. Most of it is *deterministic*: "how many expression events
-appear in this video", "localize every event", "what is the expression type of the 3rd
-event". The annotation answers those exactly, and a sampled paraphrase can only be equal
-to the reference or wrong -- there is no headroom, and a wrong count is a poisoned
-training row. Those are excluded, by name, with the reason recorded. What remains is the
-*free-form reasoning* subset -- the event-anchored "describe the face and infer the
-emotional state" items and the whole-video "reason over the whole video" items -- where a
-different-but-correct answer genuinely exists and augmentation can add something.
-
-**Augmentation (what the policy is shown).** The eligible prompt carries the question
-verbatim plus an evidence block drawn from the *frozen* representation and spotting
-engines: slot activations over the queried window, the engine's own proposals, the
-prediction-error decomposition. It never carries the ground-truth label, and it never
-carries the reference answer. The truth travels beside the prompt, in ``truth``, where the
-scorer can reach it and the policy cannot.
-"""
+"""RL prompt templates: system and user prompts for policy-training rollouts."""
 
 from __future__ import annotations
 
@@ -32,15 +14,12 @@ from ..knowledge.au_anatomy import SLOT_AUS
 
 LOGGER = logging.getLogger(__name__)
 
-#: Question kinds. Only the last two are eligible for augmentation.
 KIND_DETERMINISTIC = "deterministic"
 KIND_EVENT_REASONING = "event_reasoning"
 KIND_VIDEO_REASONING = "video_reasoning"
 
 ELIGIBLE_KINDS = (KIND_EVENT_REASONING, KIND_VIDEO_REASONING)
 
-#: Reference questions whose answer is fixed by the annotation. Matched as prefixes
-#: because the reference builder emits them from a small set of templates.
 _DETERMINISTIC_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("How many expression events", "event count is fixed by the annotation"),
     ("How many micro-expression events", "micro count is fixed by the annotation"),
@@ -54,25 +33,13 @@ _EVENT_ANCHOR = re.compile(
     r"\(frames (\d+)-(\d+), apex (\d+)\)", re.IGNORECASE)
 
 
-# ---------------------------------------------------------------------------
-# Classification
-# ---------------------------------------------------------------------------
-
-
 def classify_question(question: str) -> Tuple[str, str]:
-    """Return ``(kind, reason)`` for one reference question.
-
-    The reason is kept even for admitted prompts so the ledger can state why something
-    was eligible, not only why something was dropped.
-    """
     text = (question or "").strip()
     if not text:
         return KIND_DETERMINISTIC, "empty question"
 
     for prefix, reason in _DETERMINISTIC_PREFIXES:
         if text.startswith(prefix):
-            # "Localize every event" rides on the counting stem but is still exactly
-            # determined -- the intervals come straight from the annotation.
             return KIND_DETERMINISTIC, reason
 
     if _EVENT_ANCHOR.search(text):
@@ -84,12 +51,6 @@ def classify_question(question: str) -> Tuple[str, str]:
 
 
 def parse_event_anchor(question: str) -> Optional[Dict[str, int]]:
-    """The ``(ordinal, onset, offset, apex)`` a question names, if it names one.
-
-    These numbers are *in the question the reference set already published*, so putting
-    them in front of the policy is not leakage -- the reference asks about a stated
-    window. The label and the AU set are what must not leak, and those are not here.
-    """
     match = _EVENT_ANCHOR.search(question or "")
     if not match:
         return None
@@ -97,19 +58,8 @@ def parse_event_anchor(question: str) -> Optional[Dict[str, int]]:
     return {"ordinal": ordinal, "onset": onset, "offset": offset, "apex": apex}
 
 
-# ---------------------------------------------------------------------------
-# Evidence
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class VideoEvidence:
-    """The frozen engines' output for one video, in the form a prompt can carry.
-
-    Built once per video by :func:`evidence_from_spotting` and shared by every prompt on
-    that video. Holding the raw activation matrix rather than a pre-rendered string lets
-    an event-anchored prompt describe its own window instead of the whole video.
-    """
 
     video: str
     n_frames: int = 0
@@ -129,12 +79,6 @@ class VideoEvidence:
         return self.status == "ok" and self.activations is not None
 
     def window_slots(self, onset: int, offset: int, top_k: int = 6) -> List[Dict[str, Any]]:
-        """Slots whose activation over ``[onset, offset]`` stands out from the video.
-
-        The contrast is against the video's own median rather than against zero: a
-        subject with a resting brow furrow would otherwise show AU4 as the top slot in
-        every window of their every video.
-        """
         if self.activations is None or self.activations.size == 0:
             return []
         lo = max(0, onset - self.frame_offset)
@@ -156,7 +100,6 @@ class VideoEvidence:
         ]
 
     def overlapping_proposals(self, onset: int, offset: int) -> List[Dict[str, Any]]:
-        """Engine proposals touching the queried window, with their IoU against it."""
         rows = []
         for t_on, t_off, apex, peak in self.proposals:
             lo, hi = max(t_on, onset), min(t_off, offset)
@@ -174,19 +117,12 @@ class VideoEvidence:
 def evidence_from_spotting(
     video: LongVideo, representation: Any, spotting: Any,
 ) -> VideoEvidence:
-    """Adapt one video's stage-I/II output into a :class:`VideoEvidence`."""
     activations = getattr(representation, "slot_activations", None)
     frames = list(getattr(representation, "frames", []) or [])
     record = getattr(spotting, "error_record", None)
     offset = int(getattr(record, "t_start", 0) or 0)
     decomposition = getattr(spotting, "decomposition", None)
 
-    # ``micro_intervals`` is M2b's decoded extents when the localiser is enabled,
-    # else the hysteresis proposals. The policy copies the geometry it is shown:
-    # on the raw hysteresis set its claimed intervals came out at a median 9
-    # frames against a ground-truth median of 14, and 45.5% were shorter than the
-    # shortest annotated micro-expression, so they could not reach IoU 0.5
-    # however well placed they were.
     micro = getattr(spotting, "micro_intervals", None)
     if micro is None:
         micro = getattr(spotting, "proposals", [])
@@ -208,27 +144,10 @@ def evidence_from_spotting(
 
 
 def unavailable_evidence(video: str, reason: str) -> VideoEvidence:
-    """A placeholder that says *why* there is no evidence.
-
-    A prompt built on this still goes out, but it goes out labelled: the policy is told
-    the perceptual channel is missing rather than being handed an empty block it might
-    read as "nothing happened".
-    """
     return VideoEvidence(video=video, status="unavailable", note=reason)
 
 
-# ---------------------------------------------------------------------------
-# Prompt assembly
-# ---------------------------------------------------------------------------
-
-
 def _match_event(video: LongVideo, anchor: Dict[str, int]) -> Optional[ExpressionEvent]:
-    """The annotated event a question's stated window refers to.
-
-    Matched on the interval rather than on the ordinal: the ordinal is the reference
-    builder's own numbering and a mismatch there would silently score a candidate
-    against the wrong event.
-    """
     target = (anchor["onset"], anchor["offset"])
     for event in video.events:
         if event.interval == target:
@@ -253,7 +172,6 @@ def _truth_for_event(event: ExpressionEvent) -> Dict[str, Any]:
 
 
 def _render_evidence(evidence: VideoEvidence, anchor: Optional[Dict[str, int]]) -> str:
-    """The evidence block, as the text the policy actually sees."""
     if not evidence.available:
         return ("PERCEPTUAL EVIDENCE: unavailable for this video "
                 f"({evidence.note or 'no reason recorded'}). Answer from the question's "
@@ -295,7 +213,6 @@ def _render_evidence(evidence: VideoEvidence, anchor: Optional[Dict[str, int]]) 
 
 @dataclass
 class PromptLedgerEntry:
-    """One reference instruction and what was decided about it."""
 
     video_id: str
     video: str
@@ -318,8 +235,6 @@ def build_rl_prompts(
     evidence_by_video: Optional[Dict[str, VideoEvidence]] = None,
     include_kinds: Sequence[str] = ELIGIBLE_KINDS,
 ) -> Tuple[List[Dict[str, Any]], List[PromptLedgerEntry]]:
-    """Turn reference QA rows into sampler prompts, and record every decision.
-    """
     evidence_by_video = evidence_by_video or {}
     by_key = {v.video_key: v for v in videos}
     allowed = set(include_kinds)
@@ -356,10 +271,6 @@ def build_rl_prompts(
                 continue
             event = _match_event(video, anchor)
             if event is None:
-                # Without the matched event there is no interval, no label and no AU set
-                # to score against. Admitting it would mean every component of the reward
-                # scoring against an empty truth, which reads as a uniformly bad policy
-                # rather than as a missing reference.
                 ledger.append(PromptLedgerEntry(
                     video_id, video_key, subject, kind, False,
                     f"no annotated event matches the stated window "
@@ -393,7 +304,6 @@ def build_rl_prompts(
 
 
 def ledger_by_subject(ledger: Sequence[PromptLedgerEntry]) -> Dict[str, Dict[str, Any]]:
-    """Collapse the ledger into the per-subject filtering summary."""
     out: Dict[str, Dict[str, Any]] = {}
     for entry in ledger:
         bucket = out.setdefault(entry.subject or "(unknown)", {

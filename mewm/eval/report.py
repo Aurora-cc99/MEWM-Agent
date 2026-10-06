@@ -1,21 +1,4 @@
-"""Assemble the paper's 4.2 evaluation report from finished runs.
-
-**What this reads.** A finished ``run`` leaves four artefacts per video under
-``runs/<video_id>/``: ``answer.json`` (the composed answer, its proposals and per-proposal
-analyses), ``state.json`` (the full working state, including gate records, challenges and
-the critic's counterfactual analysis), ``summary.json`` and ``episodic.json``. The report
-is computed from the first two. Nothing is re-run, so a report is cheap and can be
-regenerated at a different IoU threshold without touching a GPU.
-
-**Unavailable is a first-class answer.** A section that cannot be computed says so, with
-the reason and what would fix it. It does not fall back to a default that happens to look
-good. This matters more than it sounds: a narrative section silently reporting BLEU 0.0
-against absent references, or a causal-reliability block reporting a perfect 0.0
-hallucination rate because no AU was ever claimed, is worse than no number at all --
-both read as results, and both are artefacts of missing input. Every such section here
-carries ``status: "unavailable"`` and the reader can tell the difference.
-"""
-
+"""Aggregate evaluation report builder across subjects and datasets."""
 from __future__ import annotations
 
 import json
@@ -28,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from ..config import MEWMConfig, load_config
 from ..knowledge.au_anatomy import SLOT_AUS
 from ..knowledge.emotion_prototypes import FINE_EMOTIONS, canonical_fine_label
+from . import megc_metrics as mm
 from .metrics import (
     accuracy, aggregate_proposal_metrics, au_set_metrics, bleu, brier_score,
     causal_reliability, count_errors, evaluate_proposals, expected_calibration_error,
@@ -39,21 +23,14 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _unavailable(reason: str, remedy: str = "") -> Dict[str, Any]:
-    """A section that could not be computed, and why. Never a zero pretending to be one."""
     out: Dict[str, Any] = {"status": "unavailable", "reason": reason}
     if remedy:
         out["remedy"] = remedy
     return out
 
 
-# ---------------------------------------------------------------------------
-# Artefact loading
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class RunArtefacts:
-    """One finished video run, as it sits on disk."""
 
     video_id: str
     path: Path
@@ -63,7 +40,6 @@ class RunArtefacts:
 
     @property
     def from_annotation(self) -> bool:
-        """True when this run was given the ground-truth intervals -- the P4 upper bound."""
         return bool(self.answer.get("proposals_from_annotation"))
 
     def proposals(self) -> List[Tuple[int, int]]:
@@ -75,12 +51,6 @@ class RunArtefacts:
 
 
 def load_runs(root: Path | str, video_ids: Optional[Sequence[str]] = None) -> List[RunArtefacts]:
-    """Load every run under ``root``, or only the named ones.
-
-    A directory missing ``answer.json`` is skipped with a warning rather than failing the
-    report: a partially-completed sweep should still produce numbers for what finished,
-    and the count of what was loaded is reported alongside them.
-    """
     root = Path(root)
     if not root.is_dir():
         return []
@@ -111,14 +81,7 @@ def load_runs(root: Path | str, video_ids: Optional[Sequence[str]] = None) -> Li
     return runs
 
 
-# ---------------------------------------------------------------------------
-# Layer 2 -- P1 localisation, P2 AU detection, P3 emotion recognition
-# ---------------------------------------------------------------------------
-
-
 def _paired_events(run: RunArtefacts, events: Sequence[Any], config: MEWMConfig):
-    """Pair each analysed proposal with the ground-truth event it claimed.
-    """
     analyses = run.analyses()
     proposals = run.proposals()
     labels = [str(a.get("fine_label", "")) for a in analyses]
@@ -138,7 +101,6 @@ def _paired_events(run: RunArtefacts, events: Sequence[Any], config: MEWMConfig)
 
 def _p1(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
         config: MEWMConfig) -> Dict[str, Any]:
-    """Proposal-level localisation under eq. (2) and under strict IoU."""
     per_video, details = [], []
     for run in runs:
         events = events_by_video.get(run.video_id)
@@ -164,11 +126,6 @@ def _p1(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
 
 def _p2(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
         config: MEWMConfig) -> Dict[str, Any]:
-    """AU detection over the slot AUs: per-unit F1, macro UF1, and set-level agreement.
-
-    Reported over the *matched* proposals only. Scoring AU sets on proposals that located
-    nothing would measure localisation a second time under an AU-shaped name.
-    """
     predicted_sets: List[List[str]] = []
     truth_sets: List[List[str]] = []
     for run in runs:
@@ -180,15 +137,13 @@ def _p2(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
             truth_sets.append([str(a) for a in (event.aus or [])])
 
     if not predicted_sets:
-        return _unavailable("no matched proposal to score AUs on",
-                            "P2 is conditioned on P1: fix localisation first")
+        return _unavailable("",
+                            "")
     if not any(truth_sets):
         return _unavailable(
-            "the annotations carry no AU labels for the matched events",
-            "P2 needs an AU-annotated corpus; CAS(ME)^2/CAS(ME)^3 carry them, a "
-            "spotting-only annotation file does not")
+            "",
+            "")
 
-    # Per-unit: each slot AU becomes a binary problem over the matched events.
     per_au: Dict[str, Dict[str, float]] = {}
     f1s: List[float] = []
     for au in SLOT_AUS:
@@ -197,9 +152,6 @@ def _p2(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
         fn = sum(1 for p, t in zip(predicted_sets, truth_sets) if au not in p and au in t)
         support = tp + fn
         if not support:
-            # An AU that never occurs in the reference has no F1 to speak of; including a
-            # 0.0 for it would drag the macro average by an amount that depends only on
-            # how many units the corpus happens not to annotate.
             per_au[au] = {"f1": None, "support": 0}
             continue
         precision = tp / (tp + fp) if (tp + fp) else 0.0
@@ -217,15 +169,13 @@ def _p2(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
         "uf1_macro": round(sum(f1s) / len(f1s), 4) if f1s else 0.0,
         "n_units_scored": len(f1s),
         "set_level": au_set_metrics(predicted_sets, truth_sets),
-        "note": ("LOSO only. The paper also asks for LODO; build the folds with "
-                 "mewm.data.datasets.lodo_folds and re-run this report per held-out "
-                 "corpus to produce that column."),
+        "note": (""),
     }
 
 
 def _p3(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
         config: MEWMConfig) -> Dict[str, Any]:
-    """Emotion recognition on the matched events, plus event-count error per video."""
+
     y_true: List[str] = []
     y_pred: List[str] = []
     predicted_counts: List[int] = []
@@ -251,6 +201,7 @@ def _p3(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
 
     labels = [e for e in FINE_EMOTIONS if e in set(y_true) | set(y_pred)]
     uf1, per_class = unweighted_f1(y_true, y_pred, labels)
+    megc = mm.recognition_scores(y_true, y_pred)
     return {
         "status": "ok",
         "n_events": len(y_true),
@@ -258,22 +209,174 @@ def _p3(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
         "uar": unweighted_average_recall(y_true, y_pred, labels),
         "accuracy": accuracy(y_true, y_pred),
         "per_class_f1": per_class,
+        "coarse": megc["coarse"],
+        "fine": megc["fine"],
+        "headline": "",
         "event_counts": counts,
     }
 
 
-# ---------------------------------------------------------------------------
-# Calibration, causal reliability, trajectory
-# ---------------------------------------------------------------------------
+def _canonical_or_empty(label: Any) -> str:
+    text, recognised = canonical_fine_label(str(label or ""))
+    return text if recognised else ""
+
+
+def _qa_segment_reference(interval: Tuple[int, int], items: Sequence[Any]) -> Optional[str]:
+    from ..data.qa_loader import parse_segment_question
+
+    best: Optional[Tuple[float, str]] = None
+    for item in items:
+        if item.qtype != "segment_analysis":
+            continue
+        span = parse_segment_question(item.question)
+        if not span:
+            continue
+        from .metrics import iou as _iou
+        overlap = _iou(tuple(interval), (int(span["onset"]), int(span["offset"])))
+        if best is None or overlap > best[0]:
+            best = (overlap, item.answer_text)
+    return best[1] if best and best[0] > 0.0 else None
+
+
+def _megc_suite(runs: Sequence[RunArtefacts],
+                events_by_video: Dict[str, List[Any]],
+                all_events_by_video: Dict[str, List[Any]],
+                config: MEWMConfig,
+                qa: Optional[Dict[str, Sequence[Any]]] = None) -> Dict[str, Any]:
+    threshold = config.evaluation.iou_threshold
+    rescue_min_iou = config.evaluation.rescue_min_iou
+
+    spotting_rows: List[Dict[str, Any]] = []
+    count_pairs: Dict[str, List[Tuple[int, int]]] = {
+        quantity: [] for quantity in mm.COUNT_QUANTITIES}
+    au_pred: List[List[str]] = []
+    au_true: List[List[str]] = []
+    emo_true: List[str] = []
+    emo_pred: List[str] = []
+    event_candidates: List[str] = []
+    event_references: List[str] = []
+    whole_candidates: List[str] = []
+    whole_references: List[str] = []
+
+    n_pred_labels = 0
+    n_true_labels = 0
+    tp_correct = 0
+    tp_fine_true: List[str] = []
+    tp_fine_pred: List[str] = []
+
+    for run in runs:
+        micro_events = events_by_video.get(run.video_id)
+        if micro_events is None:
+            continue
+        all_events = all_events_by_video.get(run.video_id, micro_events)
+        proposals = run.proposals()
+        analyses = run.analyses()
+        labels = [_canonical_or_empty(a.get("fine_label", "")) for a in analyses]
+        truths = [e.interval for e in micro_events]
+
+        spotting_rows.append({
+            "proposals": proposals,
+            "proposal_types": ["micro-expression"] * len(proposals),
+            "proposal_labels": labels,
+            "truth": truths,
+            "truth_types": ["micro-expression"] * len(truths),
+            "truth_labels": [str(e.fine_label or "") for e in micro_events],
+        })
+
+        n_pred_labels += len(proposals)
+        n_true_labels += len(truths)
+        for pred_i, truth_i, overlap in mm._greedy_pairs(proposals, truths, threshold):
+            if overlap < threshold:
+                continue
+            gold = _canonical_or_empty(micro_events[truth_i].fine_label)
+            tp_fine_true.append(gold)
+            tp_fine_pred.append(labels[pred_i])
+            if labels[pred_i] and gold and labels[pred_i] == gold:
+                tp_correct += 1
+
+        for analysis, event, _ in _paired_events(run, micro_events, config):
+            au_pred.append([str(a) for a in (analysis.get("active_aus") or [])])
+            au_true.append([str(a) for a in (event.aus or [])])
+            emo_pred.append(_canonical_or_empty(analysis.get("fine_label", "")))
+            emo_true.append(_canonical_or_empty(event.fine_label))
+
+        count_pairs["micro"].append((len(proposals), len(micro_events)))
+        count_pairs["expression"].append((
+            int(run.answer.get("n_detected", len(proposals))),
+            int(run.answer.get("n_annotated", len(all_events)))))
+        spotting_summary = run.summary.get("spotting") or {}
+        n_macro_pred = int(spotting_summary.get("n_macro", 0))
+        n_macro_true = len(all_events) - len(micro_events)
+        count_pairs["macro"].append((n_macro_pred, n_macro_true))
+
+        if qa is not None:
+            items = list(qa.get(run.video_id) or [])
+            whole = next((it for it in items if it.qtype == "reason_full"), None)
+            if whole is not None:
+                whole_candidates.append(str(run.answer.get("answer", "")))
+                whole_references.append(whole.answer_text)
+            for analysis in analyses:
+                interval = analysis.get("interval")
+                if not (isinstance(interval, (list, tuple)) and len(interval) >= 2):
+                    continue
+                reference = _qa_segment_reference(
+                    (int(interval[0]), int(interval[1])), items)
+                if reference is None:
+                    continue
+                event_candidates.append(str(analysis.get("au_cot") or ""))
+                event_references.append(reference)
+
+    spotting = mm.spotting_scores(spotting_rows, iou_threshold=threshold,
+                                  rescue_min_iou=rescue_min_iou)
+    f1_spot = (spotting.get("headline_f1")
+               if spotting.get("status") == "ok" else None)
+    analysis = mm._prf(tp_correct, n_pred_labels, n_true_labels)
+    f1a_block = mm.recognition_scores(tp_fine_true, tp_fine_pred)
+    f1a_fine = f1a_block.get("fine", {}).get("megc", {})
+    f1_analysis = (f1a_fine.get("reg_uf1")
+                   if f1a_fine.get("status") == "ok" else 0.0)
+
+    if f1_spot is None:
+        strs_block = _unavailable(
+            "no spotting F1 was computed, so STRS has no F1_s to multiply")
+    else:
+        strs_block = {
+            "status": "ok",
+            "strs": mm.strs(f1_spot, f1_analysis),
+            "f1_spotting": round(f1_spot, 4),
+            "f1_analysis": round(f1_analysis, 4),
+            "f1_analysis_basis": (""),
+            "f1_analysis_micro": round(float(analysis.get("f1", 0.0) or 0.0), 4),
+            "analysis": dict(analysis, note=(
+                "")),
+            "definition": "",
+        }
+
+    return {
+        "spotting": {
+            "interval": dict(spotting, n_videos=len(spotting_rows)),
+            "counting": mm.count_scores(count_pairs),
+        },
+        "recognition": {
+            "action_units": mm.au_scores(au_pred, au_true),
+            "emotion": mm.recognition_scores(emo_true, emo_pred),
+            "text": mm.text_scores(event_candidates, event_references),
+        },
+        "strs": {
+            "score": strs_block,
+            "text": mm.text_scores(whole_candidates, whole_references),
+        },
+        "provenance": {
+            "spotting": "",
+            "counting": "",
+            "recognition": "",
+            "strs": "",
+        },
+    }
 
 
 def _calibration(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[Any]],
                  config: MEWMConfig) -> Dict[str, Any]:
-    """ECE and Brier over the confidence attached to each matched analysis.
-
-    "Correct" here means the fine label was right, which is the event the confidence is
-    a statement about.
-    """
     confidences: List[float] = []
     correct: List[bool] = []
     for run in runs:
@@ -300,13 +403,66 @@ def _calibration(runs: Sequence[RunArtefacts], events_by_video: Dict[str, List[A
     }
 
 
-def _causal(runs: Sequence[RunArtefacts]) -> Dict[str, Any]:
-    """rho_pass / rho_hall / mean MNI / rho_flip, read out of the saved states.
+def _runtime(runs: Sequence[RunArtefacts]) -> Dict[str, Any]:
+    per_video: List[Dict[str, Any]] = []
+    times: List[float] = []
+    fps_values: List[float] = []
+    for run in runs:
+        elapsed = run.summary.get("elapsed_s")
+        if elapsed is None:
+            continue
+        elapsed = float(elapsed)
+        frames = int(run.summary.get("frames_processed", 0) or 0)
+        fps = round(frames / elapsed, 4) if elapsed > 0 and frames else None
+        per_video.append({
+            "video": run.video_id, "elapsed_s": round(elapsed, 2),
+            "frames_processed": frames, "frames_per_s": fps,
+        })
+        times.append(elapsed)
+        if fps is not None:
+            fps_values.append(fps)
 
-    ``rho_flip`` is the one that used to be unrecoverable: the critic computed the
-    per-AU belief flips, printed them into its own prompt, and dropped them. They are now
-    persisted on the causal chain, so this reads them.
-    """
+    if not times:
+        return _unavailable(
+            "no run carried a summary.json with elapsed_s",
+            "the pipeline writes summary.json (with elapsed_s) at the end of every "
+            "video automatically -- check that runs were not copied without it")
+
+    times_sorted = sorted(times)
+    n = len(times_sorted)
+    median = (times_sorted[n // 2] if n % 2 else
+              (times_sorted[n // 2 - 1] + times_sorted[n // 2]) / 2)
+    total_wall_s = sum(times)
+    return {
+        "status": "ok",
+        "n_videos": n,
+        "total_wall_s": round(total_wall_s, 2),
+        "total_wall_hms": _format_hms(total_wall_s),
+        "throughput_videos_per_hour": round(3600.0 * n / total_wall_s, 4) if total_wall_s else 0.0,
+        "throughput_frames_per_s_pooled": (
+            round(sum(v["frames_processed"] for v in per_video) / total_wall_s, 4)
+            if total_wall_s else 0.0),
+        "per_video_seconds": {
+            "mean": round(total_wall_s / n, 2),
+            "median": round(median, 2),
+            "min": round(min(times_sorted), 2),
+            "max": round(max(times_sorted), 2),
+        },
+        "per_video_frames_per_s": {
+            "mean": round(sum(fps_values) / len(fps_values), 4) if fps_values else None,
+        },
+        "per_video": per_video,
+    }
+
+
+def _format_hms(seconds: float) -> str:
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _causal(runs: Sequence[RunArtefacts]) -> Dict[str, Any]:
     challenge_finals: List[str] = []
     claimed: List[List[str]] = []
     evidenced: List[List[str]] = []
@@ -325,7 +481,6 @@ def _causal(runs: Sequence[RunArtefacts]) -> Dict[str, Any]:
                     challenge_finals.append(final)
         for analysis in run.analyses():
             claimed.append([str(a) for a in (analysis.get("active_aus") or [])])
-            # Evidence-backed units: the k_crit set is what the agent could defend.
             evidenced.append([str(a) for a in (analysis.get("k_crit") or [])])
         for cot in (state.get("causal_cots") or {}).values():
             cf = cot.get("cf_mhv") or {}
@@ -343,8 +498,6 @@ def _causal(runs: Sequence[RunArtefacts]) -> Dict[str, Any]:
     report = causal_reliability(challenge_finals, claimed, evidenced, mni_values, flips)
     out = {"status": "ok", "n_challenges": len(challenge_finals), **report.to_dict()}
     if missing_flips:
-        # Runs produced before the critic persisted its flips cannot contribute here,
-        # and a rho_flip averaged over only the newer half is not the run's rho_flip.
         out["flip_rate"] = None
         out["flip_rate_note"] = (
             f"{missing_flips} proposal(s) predate the fix that persists the critic's "
@@ -354,16 +507,9 @@ def _causal(runs: Sequence[RunArtefacts]) -> Dict[str, Any]:
 
 
 class _RecordView(SimpleNamespace):
-    """Attribute access over a saved gate record, for :func:`trajectory_metrics`."""
-
+    pass
 
 def _trajectory(runs: Sequence[RunArtefacts]) -> Dict[str, Any]:
-    """Gate first-pass rate, revision effectiveness, degradation rate.
-
-    Adapts the saved JSON to the attribute shape :func:`trajectory_metrics` expects
-    rather than reimplementing it -- the point of this module is to give the existing
-    metric a caller, not to grow a second copy of it that can drift.
-    """
     views = []
     for run in runs:
         state = run.state
@@ -390,10 +536,6 @@ def _trajectory(runs: Sequence[RunArtefacts]) -> Dict[str, Any]:
 
 def _narrative(runs: Sequence[RunArtefacts],
                references: Optional[Dict[str, str]]) -> Dict[str, Any]:
-    """BLEU / ROUGE against reference narratives, when there are any.
-
-    Without references this is *not* zero -- it is unmeasured, and says so.
-    """
     if not references:
         return _unavailable(
             "no reference narratives supplied",
@@ -421,15 +563,8 @@ def _narrative(runs: Sequence[RunArtefacts],
     }
 
 
-# ---------------------------------------------------------------------------
-# P4 -- localisation error propagating through the pipeline
-# ---------------------------------------------------------------------------
-
-
 def compare_p4(self_runs: Sequence[RunArtefacts], upper_bound_runs: Sequence[RunArtefacts],
                events_by_video: Dict[str, List[Any]], config: MEWMConfig) -> Dict[str, Any]:
-    """How much of the end-to-end error is localisation error, stratified by how far off.
-    """
     by_id = {run.video_id: run for run in upper_bound_runs}
     paired = [(run, by_id[run.video_id]) for run in self_runs if run.video_id in by_id]
     if not paired:
@@ -486,14 +621,8 @@ def compare_p4(self_runs: Sequence[RunArtefacts], upper_bound_runs: Sequence[Run
             for name, values in strata.items()
         },
         "per_video": rows,
-        "reading": ("delta_f1 is upper bound minus self-produced: large and positive "
-                    "means localisation error is what is costing the answer."),
+        "reading": (""),
     }
-
-
-# ---------------------------------------------------------------------------
-# Assembly
-# ---------------------------------------------------------------------------
 
 
 def build_report(
@@ -504,10 +633,11 @@ def build_report(
     references: Optional[Dict[str, str]] = None,
     layer1: Optional[Dict[str, Any]] = None,
     upper_bound_runs: Sequence[RunArtefacts] = (),
+    qa: Optional[Dict[str, Sequence[Any]]] = None,
 ) -> Dict[str, Any]:
-    """The whole 4.2 table for one dataset, from artefacts already on disk."""
     config = config or load_config()
     events_by_video = {v.video_id: v.micro_events() for v in videos}
+    all_events_by_video = {v.video_id: v.events for v in videos}
     self_runs = [r for r in runs if not r.from_annotation]
     upper = list(upper_bound_runs) or [r for r in runs if r.from_annotation]
 
@@ -528,9 +658,12 @@ def build_report(
         "layer2_p1_localisation": _p1(self_runs or list(runs), events_by_video, config),
         "layer2_p2_au_detection": _p2(self_runs or list(runs), events_by_video, config),
         "layer2_p3_emotion": _p3(self_runs or list(runs), events_by_video, config),
+        "megc": _megc_suite(self_runs or list(runs), events_by_video,
+                            all_events_by_video, config, qa),
         "calibration": _calibration(self_runs or list(runs), events_by_video, config),
         "causal_reliability": _causal(runs),
         "trajectory": _trajectory(runs),
+        "runtime": _runtime(runs),
         "narrative": _narrative(self_runs or list(runs), references),
     }
     report["p4_propagation"] = (
@@ -542,7 +675,6 @@ def build_report(
 
 
 def format_report(report: Dict[str, Any]) -> str:
-    """A flat text rendering, so the command is readable without a JSON viewer."""
     lines: List[str] = []
     lines.append(f"{report.get('dataset', '?')}  --  {report.get('n_runs', 0)} run(s), "
                  f"IoU>{report.get('evaluation', {}).get('iou_threshold')}")
@@ -568,7 +700,31 @@ def format_report(report: Dict[str, Any]) -> str:
     section("P2  AU detection", report.get("layer2_p2_au_detection", {}),
             ("n_matched_events", "uf1_macro", "n_units_scored", "set_level", "note"))
     section("P3  emotion recognition", report.get("layer2_p3_emotion", {}),
-            ("n_events", "uf1", "uar", "accuracy", "event_counts"))
+            ("n_events", "uf1", "uar", "accuracy", "coarse", "fine", "event_counts"))
+    megc = report.get("megc", {})
+    megc_spot = megc.get("spotting", {})
+    megc_rec = megc.get("recognition", {})
+    megc_strs = megc.get("strs", {})
+    section("",
+            megc_spot.get("interval", {}),
+            (""))
+    section("",
+            megc_spot.get("counting", {}),
+            ("expression", "micro", "macro"))
+    section("",
+            megc_rec.get("action_units", {}),
+            ("f1_au", "jaccard_au", "n"))
+    section("",
+            megc_rec.get("emotion", {}),
+            ("fine", "coarse"))
+    section("",
+            megc_rec.get("text", {}),
+            ("bleu", "rouge_1", "n"))
+    section("", megc_strs.get("score", {}),
+            ("strs", "f1_spotting", "f1_analysis", "definition"))
+    section("",
+            megc_strs.get("text", {}),
+            ("bleu", "rouge_1", "n"))
     section("calibration", report.get("calibration", {}),
             ("n", "ece", "brier", "mean_confidence", "empirical_accuracy"))
     section("causal reliability", report.get("causal_reliability", {}),
@@ -577,6 +733,10 @@ def format_report(report: Dict[str, Any]) -> str:
     section("trajectory", report.get("trajectory", {}),
             ("n_videos", "gate_first_pass_rate", "revision_effectiveness",
              "degraded_video_rate", "mean_llm_calls"))
+    section("runtime", report.get("runtime", {}),
+            ("n_videos", "total_wall_s", "total_wall_hms",
+             "throughput_videos_per_hour", "throughput_frames_per_s_pooled",
+             "per_video_seconds", "per_video_frames_per_s"))
     section("layer 1  rollout quality", report.get("layer1_rollout_quality", {}),
             ("alignment_auc", "prediction_error", "counterfactual_structure"))
     section("P4  localisation propagation", report.get("p4_propagation", {}),

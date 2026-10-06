@@ -1,16 +1,4 @@
-"""V1 -- the deterministic motion quantisation front end (paper 3.2.1).
-
-*Salience is disjunctive.*  ``salient = [m >= m_min OR c >= c_min]``.  A magnitude-only
-threshold deletes the signal this whole system is about -- micro-expression displacement
-is sub-pixel, so it fails any magnitude test that also rejects sensor noise.  What
-separates it from noise is *direction agreement*: by proposition B.1, ``c`` decays as
-``O(|Omega_r|^{-1/2})`` for independent random directions but stays near 1 for a real
-muscle pull, so the coherence channel keeps the signal a magnitude gate would drop.
-
-*The module is fully deterministic.*  Nothing here is learned, so every number an agent
-quotes can be recomputed bit-for-bit from the same frame pair.  That is what makes the
-evidence chain's physical root node auditable.
-"""
+"""V1 motion encoder: frame-level optical-flow and motion feature extraction."""
 
 from __future__ import annotations
 
@@ -31,34 +19,24 @@ from ..schemas import ROIMeasurement
 
 LOGGER = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Labelling helpers (shared vocabulary with the QA sets)
-# ---------------------------------------------------------------------------
-
 _DIRECTION_LABELS: Tuple[Tuple[float, str], ...] = (
     (22.5, "right"), (67.5, "up-right"), (112.5, "up"), (157.5, "up-left"),
     (202.5, "left"), (247.5, "down-left"), (292.5, "down"), (337.5, "down-right"),
 )
 
-
 def direction_label(angle_deg: float) -> str:
-    """Eight-way compass label; 0 deg is image-right, angles increase counter-clockwise."""
     angle = float(angle_deg) % 360.0
     for edge, label in _DIRECTION_LABELS:
         if angle < edge:
             return label
     return "right"
 
-
 def magnitude_class(value: float) -> str:
-    """Micro / Moderate / Macro bands, matching the observation-record vocabulary."""
     if value < 0.15:
         return "Micro"
     if value < 0.60:
         return "Moderate"
     return "Macro"
-
 
 def coherence_label(value: float) -> str:
     if value < 0.45:
@@ -67,18 +45,7 @@ def coherence_label(value: float) -> str:
         return "Medium"
     return "High"
 
-
-# ---------------------------------------------------------------------------
-# Core measurement
-# ---------------------------------------------------------------------------
-
-
 def roi_motion(flow: np.ndarray, box: Tuple[int, int, int, int]) -> Tuple[float, float, float]:
-    """The ``(m, theta, c)`` triple of eq. (3) for one region.
-
-    ``flow`` is ``(H, W, 2)`` in pixels with ``+x`` right and ``+y`` down; the returned
-    angle flips ``y`` so that "up" is 90 deg, matching the anatomical priors.
-    """
     x1, y1, x2, y2 = box
     patch = flow[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
     if patch.size == 0:
@@ -94,19 +61,11 @@ def roi_motion(flow: np.ndarray, box: Tuple[int, int, int, int]) -> Tuple[float,
     angle = float(np.degrees(np.arctan2(-resultant[1], resultant[0])) % 360.0)
     return mean_magnitude, angle, coherence
 
-
 def coherence_noise_floor(n_pixels: int) -> float:
-    """Expected coherence of pure directional noise, ``O(n^{-1/2})`` (proposition B.1).
-
-    Used to turn a raw coherence into a signal-to-noise statement: a region whose
-    coherence sits at this floor carries no directional evidence however large ``m`` is.
-    """
     return 1.0 / math.sqrt(max(1, n_pixels))
-
 
 @dataclass
 class HeadMotion:
-    """Rigid similarity transform between two landmark sets -- ``g_t`` of paper 3.2.1."""
 
     dx: float = 0.0
     dy: float = 0.0
@@ -122,7 +81,6 @@ class HeadMotion:
         return (self.dx, self.dy, self.rotation_deg, self.scale)
 
     def as_regressor(self) -> np.ndarray:
-        """Design row for the scene-term regression of appendix B.5 step 1."""
         return np.array([
             self.dx, self.dy, self.rotation_deg, self.scale - 1.0,
             self.translation_norm, abs(self.rotation_deg),
@@ -133,15 +91,7 @@ class HeadMotion:
                 "rotation_deg": round(self.rotation_deg, 4),
                 "scale": round(self.scale, 5), "residual": round(self.residual, 4)}
 
-
 def estimate_head_motion(src: np.ndarray, dst: np.ndarray) -> HeadMotion:
-    """Least-squares similarity transform (Umeyama) between two landmark sets.
-
-    Rigid head movement is a dominant error source in long video, so it is estimated
-    from *stable* landmarks only -- the jaw and nose bridge, which no AU displaces.
-    Using the full 68 points would let an expression bleed into the head estimate and
-    then be subtracted out of the very signal we are looking for.
-    """
     if src is None or dst is None or len(src) < 3 or len(src) != len(dst):
         return HeadMotion()
     src = np.asarray(src, dtype=np.float64)
@@ -170,10 +120,7 @@ def estimate_head_motion(src: np.ndarray, dst: np.ndarray) -> HeadMotion:
         scale=scale, residual=residual,
     )
 
-
-#: 68-point landmark indices that no facial action displaces: jaw outline + nose bridge.
 STABLE_LANDMARKS: Tuple[int, ...] = tuple(range(0, 17)) + (27, 28, 29, 30)
-
 
 def stable_subset(landmarks: np.ndarray) -> np.ndarray:
     points = np.asarray(landmarks, dtype=np.float64)
@@ -181,18 +128,7 @@ def stable_subset(landmarks: np.ndarray) -> np.ndarray:
         return points
     return points[list(STABLE_LANDMARKS)]
 
-
-# ---------------------------------------------------------------------------
-# ROI geometry
-# ---------------------------------------------------------------------------
-
-
 def _fallback_roi_boxes(landmarks: np.ndarray, width: int, height: int) -> Dict[str, Tuple[int, int, int, int]]:
-    """Square patches around anchor landmarks, sized to the inter-ocular distance.
-
-    Only used when the shared ``pre_process`` box builder is unreachable; it keeps this
-    module runnable standalone at the cost of coarser regions.
-    """
     points = np.asarray(landmarks, dtype=np.float64)
     if points.ndim != 2 or len(points) < 68:
         return {name: (0, 0, 0, 0) for name in ROI_NAMES}
@@ -234,44 +170,32 @@ def _fallback_roi_boxes(landmarks: np.ndarray, width: int, height: int) -> Dict[
         boxes[name] = (x1, y1, x2, y2)
     return boxes
 
-
-def build_roi_boxes(landmarks: np.ndarray, width: int, height: int) -> Dict[str, Tuple[int, int, int, int]]:
-    """29 anatomical region boxes; prefers the shared front-end geometry."""
+def build_roi_boxes(landmarks: np.ndarray, width: int, height: int,
+                    me_flow=None) -> Dict[str, Tuple[int, int, int, int]]:
     try:
         ensure_pre_process_importable()
-        from me_flow import build_roi_boxes as shared_boxes  # type: ignore
+        from me_flow import build_roi_boxes as shared_boxes
         boxes = shared_boxes(np.asarray(landmarks), width, height)
         if boxes:
             return boxes
-    except Exception as exc:  # noqa: BLE001 - standalone operation is supported
+    except Exception as exc:
         LOGGER.debug("shared ROI box builder unavailable (%s); using fallback", exc)
     return _fallback_roi_boxes(landmarks, width, height)
 
-
-# ---------------------------------------------------------------------------
-# Landmark detection
-# ---------------------------------------------------------------------------
-
 _DLIB_STATE: Dict[str, Any] = {"detector": None, "predictor": None, "warned": False}
 
-
 def _dlib_pair():
-    """Lazily construct the dlib detector and 68-point predictor.
-
-    The predictor file is located through the same pointer/environment chain the flow
-    front end uses, so both halves of the pipeline resolve to one model file.
-    """
     if _DLIB_STATE["detector"] is not None:
         return _DLIB_STATE["detector"], _DLIB_STATE["predictor"]
     try:
         ensure_pre_process_importable()
-        import dlib  # type: ignore
+        import dlib
 
         predictor_path = None
         try:
-            import me_flow  # type: ignore
+            import me_flow
             predictor_path = me_flow.configure_dlib_predictor()
-        except Exception:  # noqa: BLE001
+        except Exception:
             import os
             env_path = os.environ.get("DLIB_PREDICTOR")
             predictor_path = Path(env_path) if env_path else None
@@ -283,27 +207,20 @@ def _dlib_pair():
             LOGGER.warning("dlib 68-point predictor not found; ROI geometry will be "
                            "nominal and measurements only approximate")
             _DLIB_STATE["warned"] = True
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         if not _DLIB_STATE["warned"]:
             LOGGER.warning("dlib unavailable (%s); ROI geometry will be nominal", exc)
             _DLIB_STATE["warned"] = True
     return _DLIB_STATE["detector"], _DLIB_STATE["predictor"]
 
-
 def detect_landmarks(image_path: Path | str) -> Optional[np.ndarray]:
-    """68-point facial landmarks for one frame, or ``None`` when detection fails.
-
-    Returning ``None`` rather than a guess matters: the caller marks the frame
-    unavailable and that flag propagates, whereas a silent fallback would feed wrong ROI
-    geometry into the measurements and produce confident nonsense.
-    """
     detector, predictor = _dlib_pair()
     if detector is None or predictor is None:
         return None
     try:
         import cv2
-        import dlib  # type: ignore
-    except ImportError:  # pragma: no cover
+        import dlib
+    except ImportError:
         return None
 
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -313,8 +230,6 @@ def detect_landmarks(image_path: Path | str) -> Optional[np.ndarray]:
 
     faces = detector(grey, 1)
     if not faces:
-        # The dataset frames are already face-cropped, so a detector miss usually means
-        # the face fills the frame; fall back to the full frame as the region of interest.
         height, width = grey.shape[:2]
         faces = [dlib.rectangle(0, 0, width - 1, height - 1)]
     face = max(faces, key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()))
@@ -322,19 +237,10 @@ def detect_landmarks(image_path: Path | str) -> Optional[np.ndarray]:
     return np.array([[shape.part(i).x, shape.part(i).y] for i in range(68)],
                     dtype=np.float64)
 
-
-# ---------------------------------------------------------------------------
-# The front end
-# ---------------------------------------------------------------------------
-
-
 class MotionFrontEnd:
-    """Turns ``(flow, landmarks)`` into the per-frame measurement set and ``g_t``."""
 
     def __init__(self, config: Optional[MotionConfig] = None) -> None:
         self.config = config or MotionConfig()
-
-    # -- per-frame ----------------------------------------------------------
 
     def measure(
         self,
@@ -342,7 +248,6 @@ class MotionFrontEnd:
         landmarks: np.ndarray,
         boxes: Optional[Dict[str, Tuple[int, int, int, int]]] = None,
     ) -> List[ROIMeasurement]:
-        """Measurement triples for all 29 regions, in canonical ROI order."""
         height, width = flow.shape[:2]
         boxes = boxes or build_roi_boxes(landmarks, width, height)
         out: List[ROIMeasurement] = []
@@ -364,20 +269,12 @@ class MotionFrontEnd:
         return out
 
     def is_salient(self, magnitude: float, coherence: float) -> bool:
-        """``[m >= m_min OR c >= c_min]`` -- disjunctive on purpose (paper 3.2.1)."""
         return bool(magnitude >= self.config.m_min or coherence >= self.config.c_min)
 
     def head_motion(self, landmarks_prev: np.ndarray, landmarks_now: np.ndarray) -> HeadMotion:
         return estimate_head_motion(stable_subset(landmarks_prev), stable_subset(landmarks_now))
 
-    # -- feature views ------------------------------------------------------
-
     def measurement_matrix(self, measurements: Sequence[ROIMeasurement]) -> np.ndarray:
-        """``(n_roi, 4)`` array of ``[m, sin theta, cos theta, c]``.
-
-        The direction is carried as its sine/cosine pair rather than as degrees so that
-        the 359 deg / 1 deg wrap does not look like a large jump to a downstream encoder.
-        """
         rows = np.zeros((N_ROI, 4), dtype=np.float32)
         for measurement in measurements:
             radians = math.radians(measurement.direction_deg)
@@ -393,11 +290,6 @@ class MotionFrontEnd:
     def observation_payload(
         self, measurements: Sequence[ROIMeasurement], top_k: int = 8, salient_only: bool = True,
     ) -> Dict[str, object]:
-        """``{"motion_observations": [...]}`` -- the observation-model output format.
-
-        Same shape as the reference records in the QA ``_full.json`` side, so the
-        observation model's output and its training target are directly comparable.
-        """
         pool = self.salient_measurements(measurements) if salient_only else list(measurements)
         if not pool:
             pool = sorted(measurements, key=lambda m: -m.magnitude_px)[:top_k]
@@ -423,19 +315,8 @@ class MotionFrontEnd:
             ]
         }
 
-    # -- flow IO ------------------------------------------------------------
-
     @staticmethod
     def load_flow(path: Path | str) -> Optional[np.ndarray]:
-        """Read a flow field.
-
-        * hue holds ``angle / 2`` in degrees, so direction round-trips to within the
-          8-bit quantisation step (~2 degrees);
-        * **magnitude is in the saturation channel, min-max normalised per image**, with
-          value pinned at 255. Direction therefore survives; *absolute* magnitude does
-          not. What comes back is each pixel's magnitude relative to the largest in that
-          frame.
-        """
         path = Path(path)
         if not path.is_file():
             return None
@@ -443,35 +324,29 @@ class MotionFrontEnd:
             return np.load(path).astype(np.float32)
         try:
             import cv2
-        except ImportError:  # pragma: no cover
+        except ImportError:
             LOGGER.warning("cv2 unavailable; cannot decode %s", path.name)
             return None
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
             return None
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
-        # Hue -> degrees -> radians, matching cartToPolar's convention on the raw (x, y).
         angle = np.deg2rad(hsv[..., 0] * 2.0)
-        magnitude = hsv[..., 1] / 255.0          # saturation, not value
+        magnitude = hsv[..., 1] / 255.0
         flow = np.stack([magnitude * np.cos(angle), magnitude * np.sin(angle)], axis=-1)
         return flow.astype(np.float32)
 
-    #: True when the loaded field came from a rendered image, so magnitudes are
-    #: frame-relative rather than absolute pixels.
     @staticmethod
     def flow_is_relative(path: Path | str) -> bool:
         return Path(path).suffix.lower() not in {".npy", ".flo"}
 
     @staticmethod
     def prefer_raw_flow(image_path: Path | str) -> Path:
-        """Swap a rendered flow image for its ``.npy`` sibling when one exists."""
         path = Path(image_path)
         raw = path.with_suffix(".npy")
         return raw if raw.is_file() else path
 
-
 def summarise_measurements(measurements: Sequence[ROIMeasurement], lang: str = "en") -> str:
-    """One promptable line per salient region -- the P-Agent's verification input."""
     from ..knowledge.au_anatomy import roi_label as localised
     rows = [m for m in measurements if m.salient] or list(measurements)[:6]
     rows = sorted(rows, key=lambda m: -m.magnitude_px)
@@ -488,7 +363,6 @@ def summarise_measurements(measurements: Sequence[ROIMeasurement], lang: str = "
         f"coherence {m.coherence:.3f} ({m.coherence_label}), salient={m.salient}"
         for m in rows
     )
-
 
 __all__ = [
     "direction_label", "magnitude_class", "coherence_label", "roi_motion",

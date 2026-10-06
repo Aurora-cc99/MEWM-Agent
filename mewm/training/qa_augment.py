@@ -1,24 +1,4 @@
-"""Augmented QA pairs mined from the policy's own accepted outputs.
-
-**Format fidelity.** The reference sets carry exactly four fields --
-``video_id``, ``video``, ``question``, ``answer`` -- and ``answer`` is an ``int`` for the
-counting questions and a ``str`` elsewhere. Adding a fifth field for provenance would make
-the file a different format that merely looks compatible, so provenance goes into the
-``video_id`` (which already encodes a split in the reference files:
-``casme_sq_train_s15_15_0401girlcrashing_1``) and into a **sidecar manifest** that lives
-next to the jsonl and is never loaded as training data.
-
-**Fold isolation.** Every fold writes into its own directory, keyed by the held-out
-subject. A shared output directory would let fold *A*'s augmented pairs -- derived from
-videos that are in fold *B*'s **test** set -- be read while training fold *B*. That is a
-leak with no symptom: training succeeds, and the reported number for fold *B* is simply
-wrong. :func:`load_augmented` therefore takes the fold's permitted video keys and refuses
-anything outside them rather than filtering quietly.
-
-**Correct-answer bias.** Only accepted candidates are written. An augmented set that
-contains the policy's mistakes would train it towards its own error distribution, which is
-the opposite of the intent.
-"""
+"""QA data augmentation: synthetic question generation from spotting annotations."""
 
 from __future__ import annotations
 
@@ -32,32 +12,22 @@ from ..data.paths import qa_dir
 
 LOGGER = logging.getLogger(__name__)
 
-#: Directory name under a dataset's QA root that holds machine-generated pairs.
 AUGMENTED_SUBDIR = "augmented"
 
-#: The four fields of the reference format, in order. Nothing else may be written.
 QA_FIELDS = ("video_id", "video", "question", "answer")
 
 
 class AugmentationError(RuntimeError):
-    """Raised when an augmented set would violate format or fold isolation."""
-
-
-# ---------------------------------------------------------------------------
-# Records
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class AugmentedPair:
-    """One generated QA pair plus the provenance that stays out of the jsonl."""
 
     video_id: str
     video: str
     question: str
     answer: Any
 
-    # -- provenance: written to the manifest only ---------------------------
     dataset: str = ""
     fold: str = ""
     subject: str = ""
@@ -66,12 +36,9 @@ class AugmentedPair:
     reward: float = 0.0
     policy_model: str = ""
     accepted_because: List[str] = field(default_factory=list)
-    #: The reference row's ``video_id`` the pair was sampled from -- the link back to
-    #: the original QA pair, carried for the consolidated corpus-level file.
     source_video_id: str = ""
 
     def to_jsonl(self) -> Dict[str, Any]:
-        """Exactly the four reference fields, in the reference order."""
         return {"video_id": self.video_id, "video": self.video,
                 "question": self.question, "answer": self.answer}
 
@@ -88,7 +55,6 @@ class AugmentedPair:
 
 
 def validate_schema(payload: Dict[str, Any]) -> None:
-    """Reject anything that is not the reference format."""
     keys = tuple(payload.keys())
     if keys != QA_FIELDS:
         raise AugmentationError(
@@ -104,13 +70,7 @@ def validate_schema(payload: Dict[str, Any]) -> None:
             f"answer must be a string or a number, got {type(payload['answer']).__name__}")
 
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-
-
 def augmented_dir(dataset: str, fold: str) -> Path:
-    """``Q-T-A/<dataset>/augmented/fold_<held-out subject>/``."""
     return qa_dir(dataset) / AUGMENTED_SUBDIR / f"fold_{fold}"
 
 
@@ -123,34 +83,18 @@ def augmented_manifest(dataset: str, fold: str) -> Path:
 
 
 def consolidated_path(dataset: str, policy_model: str) -> Path:
-    """The corpus-level JSON beside the per-fold directories.
-
-    ``Q-T-A/<dataset>/augmented/<dataset>_augmented_full_<model>.json`` -- every
-    accepted pair exactly once, beside the reference QA pair it was sampled from.
-    """
     safe = str(policy_model).replace(".", "-")
     return qa_dir(dataset) / AUGMENTED_SUBDIR / f"{dataset}_augmented_full_{safe}.json"
 
 
 def sampling_checkpoint_path(dataset: str, policy_model: str) -> Path:
-    """The scratch jsonl a long sweep writes as it goes, so ``--resume`` can pick it up.
-
-    Underscore-prefixed on purpose: it is not a QA artefact and is deleted once the
-    sweep has written its folds and the consolidated file.
-    """
     safe = str(policy_model).replace(".", "-")
     return (qa_dir(dataset) / AUGMENTED_SUBDIR
             / f"_{dataset}_sampling_checkpoint_{safe}.jsonl")
 
 
 def make_video_id(dataset: str, fold: str, video: str, index: int) -> str:
-    """Mirror the reference id shape with ``aug<fold>`` in the split position."""
     return f"{dataset}_aug{fold}_{video}_{index}"
-
-
-# ---------------------------------------------------------------------------
-# Building
-# ---------------------------------------------------------------------------
 
 
 def build_pairs(
@@ -163,18 +107,6 @@ def build_pairs(
     tp_iou_threshold: float = 0.5,
     require_strict_tp: bool = True,
 ) -> List[AugmentedPair]:
-    """Turn accepted candidates into augmented pairs.
-
-    **Only true positives are augmented.** With ``require_strict_tp`` the candidate must
-    have localised its event at ``IoU >= tp_iou_threshold`` -- the MEGC2025 §2.3 spotting
-    criterion -- and must not have been *rescued*, which is the label-only pass granted to
-    a proposal that missed the interval. The direction matters: augmented data is a
-    training target, so a pair built on a mislocalised interval teaches the policy to
-    describe a window that does not contain the event. Reward alone does not protect
-    against this, because the description reward can be high for a fluent answer about the
-    wrong frames. Filtering here rather than at write time keeps the manifest's
-    ``accepted_because`` honest about what admitted each pair.
-    """
     subject_by_video = subject_by_video or {}
     pairs: List[AugmentedPair] = []
     per_video_counter: Dict[str, int] = {}
@@ -189,8 +121,6 @@ def build_pairs(
 
         outcome = getattr(candidate, "outcome", None)
         if require_strict_tp:
-            # No outcome means the localisation was never scored, which is not evidence
-            # of a true positive -- treat it as a drop rather than assume it passed.
             if outcome is None:
                 dropped["no_outcome"] = dropped.get("no_outcome", 0) + 1
                 continue
@@ -249,13 +179,6 @@ def write_augmented(
     pairs: Sequence[AugmentedPair], dataset: str, fold: str,
     allowed_videos: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
-    """Write the jsonl and its manifest; refuse on a fold violation.
-
-    ``allowed_videos`` is the fold's training-pool video keys. A pair outside that set
-    would mean the policy was sampled on material it is about to be evaluated on, so this
-    raises rather than dropping the offending row -- a silent drop would leave a smaller
-    file and no indication that the sampling stage was misconfigured.
-    """
     if allowed_videos is not None:
         stray = sorted({p.video for p in pairs if p.video not in allowed_videos})
         if stray:
@@ -302,20 +225,9 @@ def write_augmented(
             "n_pairs": len(pairs), "n_videos": manifest["n_videos"]}
 
 
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
-
-
 def load_augmented(
     dataset: str, fold: str, allowed_videos: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Read one fold's augmented pairs, enforcing fold isolation on the way in.
-
-    Validation is on *video keys* rather than parsed subject ids on purpose: the key is
-    exact, while deriving a subject from a video string differs per corpus (SAMM's long
-    videos are flat) and a parsing mistake would turn the leak check into a no-op.
-    """
     path = augmented_jsonl(dataset, fold)
     if not path.is_file():
         return []
@@ -347,8 +259,6 @@ def load_consolidated(
     dataset: str, policy_model: str, allowed_videos: Optional[Set[str]] = None,
     fold: str = "",
 ) -> List[Dict[str, Any]]:
-    """Read the corpus-level sweep and project it onto one fold's training pool.
-    """
     path = consolidated_path(dataset, policy_model)
     if not path.is_file():
         return []
@@ -377,10 +287,7 @@ def load_consolidated(
 
     if disputed:
         LOGGER.warning(
-            "%s: %d pair(s) are in fold %s's pool by video key but do not list that "
-            "fold in provenance.folds. Keeping them -- the video key is authoritative "
-            "-- but the sweep's fold arithmetic and the runner's disagree, which means "
-            "one of the two saw a different subject list.", path.name, disputed, fold)
+            "", path.name, disputed, fold)
 
     LOGGER.info("fold %s: %d consolidated augmented pair(s) admitted from %s",
                 fold or "-", len(records), path.name)
@@ -388,7 +295,6 @@ def load_consolidated(
 
 
 def discover_folds(dataset: str) -> List[str]:
-    """Folds that already have an augmented set on disk."""
     root = qa_dir(dataset) / AUGMENTED_SUBDIR
     if not root.is_dir():
         return []

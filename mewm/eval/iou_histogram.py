@@ -1,6 +1,4 @@
-"""IoU 0-1 discrete distribution for a finished dataset run (2026-09-03).
-"""
-
+"""Temporal IoU histogram diagnostics for spotting evaluation."""
 from __future__ import annotations
 
 import csv
@@ -15,7 +13,6 @@ def truth_best_ious(
     proposals: Sequence[Tuple[int, int]],
     truths: Sequence[Tuple[int, int]],
 ) -> List[float]:
-    """Per truth: the best IoU over all proposals of one video."""
     best = []
     for truth in truths:
         peak = 0.0
@@ -62,7 +59,6 @@ def distribution(ious: Sequence[float], n_bins: int = N_BINS) -> Dict[str, objec
 
 def render_histogram(ious: Sequence[float], path: Path,
                      threshold: float = 0.5) -> None:
-    """Bar chart of the distribution with the TP threshold marked."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -90,8 +86,7 @@ def render_histogram(ious: Sequence[float], path: Path,
 
 
 def save_distribution(root: Path, rows: List[Dict[str, object]],
-                      ious: List[float]) -> None:
-    """Write the numeric table (JSON + CSV) and the histogram PNG under ``root``."""
+                      ious: List[float], threshold: float = 0.5) -> None:
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     stats = distribution(ious)
@@ -104,7 +99,26 @@ def save_distribution(root: Path, rows: List[Dict[str, object]],
             writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
             writer.writeheader()
             writer.writerows(rows)
-    render_histogram(ious, root / "iou_distribution.png")
+    render_histogram(ious, root / "iou_distribution.png", threshold=threshold)
+
+    tp_rows = [row for row in rows if row.get("is_tp")]
+    tp_ious = [value for row, value in zip(rows, ious) if row.get("is_tp")]
+    if len(tp_ious) != len(tp_rows):
+        tp_ious = [float(row["best_iou"]) for row in tp_rows]
+    tp_stats = distribution(tp_ious)
+    tp_payload = {"statistics": tp_stats, "per_truth": tp_rows,
+                 "note": "restricted to true-positive ground-truth events "
+                         f"(best_iou > {threshold})"}
+    (root / "iou_distribution_tp.json").write_text(
+        json.dumps(tp_payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    if tp_rows:
+        with open(root / "iou_distribution_tp.csv", "w", newline="",
+                  encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(tp_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(tp_rows)
+        render_histogram(tp_ious, root / "iou_distribution_tp.png",
+                         threshold=threshold)
 
 
 __all__ = ["N_BINS", "truth_best_ious", "distribution", "render_histogram",

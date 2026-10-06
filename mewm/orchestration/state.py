@@ -1,17 +1,4 @@
-"""Global state and the visibility projection matrix (appendix D.2, D.4).
-
-1. **P's verification phase and all of A are blind to emotion** (and P is additionally
-   blind to AU fields).  Together with the R2 vocabulary scan on the output side, this
-   blocks emotion conclusions from contaminating motion observation and AU judgement in
-   both directions -- what goes in and what comes out.
-2. **C cannot see the verdict.**  A critic that knows the final answer constructs
-   challenges that lead to it, which is not adversarial verification.
-3. **Whole-curve read access is granted only to P's scan phase and R's narration phase.**
-   The former localises, the latter describes the baseline outside proposals.  Every
-   phase in between sees only a within-proposal digest, so global information cannot leak
-   into mid-chain reasoning as an implicit prior.
-"""
-
+"""Shared orchestration state: typed containers for inter-agent context."""
 from __future__ import annotations
 
 import logging
@@ -26,9 +13,6 @@ from ..schemas import (
 
 LOGGER = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Phases
-# ---------------------------------------------------------------------------
 
 PHASE_P_SCAN = "P.scan"
 PHASE_P_VERIFY = "P.verify"
@@ -53,16 +37,9 @@ PHASE_AGENT: Dict[str, str] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Global state
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class MEWMState:
-    """The typed global state of appendix D.2."""
 
-    # -- long-video level
     video_meta: Optional[VideoMeta] = None
     question: str = ""
     error_record: Optional[ErrorRecord] = None
@@ -70,7 +47,6 @@ class MEWMState:
     macro_intervals: List[CandidateInterval] = field(default_factory=list)
     slow_state_log: List[SlowDigest] = field(default_factory=list)
 
-    # -- proposal level, keyed by cid
     evidence_chain: Dict[str, EvidenceChain] = field(default_factory=dict)
     rollout_requests: Dict[str, List[RolloutRecord]] = field(default_factory=dict)
     au_graphs: Dict[str, AUDynGraph] = field(default_factory=dict)
@@ -80,13 +56,10 @@ class MEWMState:
     gate_records: Dict[str, List[GateRecord]] = field(default_factory=dict)
     path_choices: Dict[str, str] = field(default_factory=dict)
 
-    # -- global output and runtime
     narrative: Optional[Narrative] = None
     open_questions: List[OpenQuestion] = field(default_factory=list)
     budget: BudgetState = field(default_factory=BudgetState)
     trace: List[Dict[str, Any]] = field(default_factory=list)
-
-    # -- accessors ----------------------------------------------------------
 
     @property
     def video_id(self) -> str:
@@ -149,10 +122,6 @@ class MEWMState:
         }
 
 
-# ---------------------------------------------------------------------------
-# Visibility matrix
-# ---------------------------------------------------------------------------
-
 VISIBLE = "full"
 DIGEST = "digest"
 HIDDEN = "hidden"
@@ -162,8 +131,6 @@ FIELDS: Tuple[str, ...] = (
     "emotion_hypotheses", "challenges", "verdict", "other_proposals",
 )
 
-#: Table D.2, transcribed.  ``error_curve = full`` means whole-video access; ``digest``
-#: means the within-proposal summary only.
 VISIBILITY_MATRIX: Dict[str, Dict[str, str]] = {
     PHASE_P_SCAN: {
         "v1_measurements": VISIBLE, "slot_trajectory": VISIBLE, "error_curve": VISIBLE,
@@ -198,7 +165,7 @@ VISIBILITY_MATRIX: Dict[str, Dict[str, str]] = {
     PHASE_C_CRITIC: {
         "v1_measurements": DIGEST, "slot_trajectory": VISIBLE, "error_curve": DIGEST,
         "prior_evidence": VISIBLE, "emotion_hypotheses": VISIBLE, "challenges": VISIBLE,
-        "verdict": HIDDEN,              # the critic must not see the adjudication
+        "verdict": HIDDEN,
         "other_proposals": HIDDEN,
     },
     PHASE_R_ADJUDICATE: {
@@ -213,20 +180,18 @@ VISIBILITY_MATRIX: Dict[str, Dict[str, str]] = {
     },
 }
 
-#: Maximum evidence level a phase may read (enforced alongside the field matrix).
 PHASE_MAX_EVIDENCE_LEVEL: Dict[str, EvidenceLevel] = {
     PHASE_P_SCAN: EvidenceLevel.MOTION,
     PHASE_P_VERIFY: EvidenceLevel.MOTION,
-    PHASE_A_ENCODE: EvidenceLevel.MOTION,      # "<= P"
-    PHASE_A_GRAPH: EvidenceLevel.AU,           # "<= A activation"
-    PHASE_R_REASON: EvidenceLevel.AU,          # "<= A"
+    PHASE_A_ENCODE: EvidenceLevel.MOTION,
+    PHASE_A_GRAPH: EvidenceLevel.AU,
+    PHASE_R_REASON: EvidenceLevel.AU,
     PHASE_R_RESPOND: EvidenceLevel.VERIFICATION,
-    PHASE_C_CRITIC: EvidenceLevel.EMOTION,     # "<= R argumentation"
+    PHASE_C_CRITIC: EvidenceLevel.EMOTION,
     PHASE_R_ADJUDICATE: EvidenceLevel.VERIFICATION,
     PHASE_R_NARRATE: EvidenceLevel.VERIFICATION,
 }
 
-#: Vocabulary bans applied to a phase's *output* (gate rule R2).
 PHASE_BANS: Dict[str, Dict[str, bool]] = {
     PHASE_P_SCAN: {"ban_au": True, "ban_emotion": True},
     PHASE_P_VERIFY: {"ban_au": True, "ban_emotion": True},
@@ -250,7 +215,6 @@ def can_see(phase: str, field_name: str) -> bool:
 
 @dataclass
 class Projection:
-    """What one phase is allowed to read, already reduced to that view."""
 
     phase: str
     cid: str
@@ -272,11 +236,6 @@ def project(
     slot_trajectory: Optional[Any] = None,
     measurements: Optional[Any] = None,
 ) -> Projection:
-    """Reduce the global state to the view ``phase`` is permitted.
-
-    Pure function of its inputs -- no state mutation, no hidden context -- so the
-    isolation properties are decidable by inspection and by test.
-    """
     if phase not in VISIBILITY_MATRIX:
         raise KeyError(f"unknown phase {phase!r}; expected one of {ALL_PHASES}")
 
@@ -288,14 +247,11 @@ def project(
         out.withheld.append(name)
 
     def _grant(name: str, value: Any) -> None:
-        """Publish a granted field, or record it as withheld when there is nothing.
-        """
         if value is None or (isinstance(value, (list, tuple, dict, str)) and not value):
             _withhold(name)
         else:
             out.fields[name] = value
 
-    # v1 measurements
     if row["v1_measurements"] == VISIBLE:
         _grant("v1_measurements", measurements)
     elif row["v1_measurements"] == DIGEST:
@@ -303,7 +259,6 @@ def project(
     else:
         _withhold("v1_measurements")
 
-    # slot trajectory
     if row["slot_trajectory"] == VISIBLE:
         _grant("slot_trajectory", slot_trajectory)
     elif row["slot_trajectory"] == DIGEST:
@@ -311,7 +266,6 @@ def project(
     else:
         _withhold("slot_trajectory")
 
-    # error curve: whole-video vs within-proposal digest
     if state.error_record is not None:
         if row["error_curve"] == VISIBLE:
             out.fields["error_record"] = state.error_record
@@ -324,11 +278,8 @@ def project(
     else:
         _withhold("error_curve")
 
-    # prior evidence, clipped to the phase's maximum readable level
     if row["prior_evidence"] != HIDDEN and cid:
         ceiling = PHASE_MAX_EVIDENCE_LEVEL.get(phase, EvidenceLevel.MOTION)
-        # Read without creating: projection is a pure function of the state, and
-        # instantiating a chain here would make it mutate what it is meant to observe.
         existing = state.evidence_chain.get(cid)
         out.fields["prior_evidence"] = [
             entry for entry in (existing.active() if existing else [])
@@ -337,7 +288,6 @@ def project(
     else:
         _withhold("prior_evidence")
 
-    # emotion hypotheses (the causal CoT)
     if row["emotion_hypotheses"] != HIDDEN and cid:
         cot = state.causal_cots.get(cid)
         if cot is not None:
@@ -345,13 +295,11 @@ def project(
     else:
         _withhold("emotion_hypotheses")
 
-    # challenges
     if row["challenges"] != HIDDEN and cid:
         out.fields["challenges"] = list(state.challenges.get(cid, []))
     else:
         _withhold("challenges")
 
-    # verdict
     if row["verdict"] != HIDDEN and cid:
         verdict = state.verdicts.get(cid)
         if verdict is not None:
@@ -359,7 +307,6 @@ def project(
     else:
         _withhold("verdict")
 
-    # other proposals -- only after adjudication, only for narration
     if row["other_proposals"] != HIDDEN:
         out.fields["other_verdicts"] = {
             other: verdict for other, verdict in state.verdicts.items() if other != cid
@@ -373,7 +320,6 @@ def project(
 
 
 def _measurement_digest(measurements: Optional[Any]) -> Optional[Dict[str, Any]]:
-    """Salient regions only, without the full per-ROI table."""
     if not measurements:
         return None
     try:
@@ -406,23 +352,12 @@ def _trajectory_digest(trajectory: Optional[Any]) -> Optional[Dict[str, Any]]:
                       for k in range(min(len(SLOT_AUS), peaks.size))
                       if peaks[k] > 0.05},
         }
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
-
-
-# ---------------------------------------------------------------------------
-# Leakage probe (appendix D.6)
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class LeakageProbe:
-    """Inject a marked pseudo-evidence upstream and look for it downstream.
-
-    Reports an (injection level x detection level) matrix.  This measures whether the
-    isolation actually holds in the assembled prompts, rather than only in the matrix
-    that is supposed to produce it.
-    """
 
     marker: str = "ZQX-PROBE-7734"
     injections: List[Tuple[str, str]] = field(default_factory=list)

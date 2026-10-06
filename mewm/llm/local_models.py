@@ -1,5 +1,4 @@
-"""Open-weight model backend: Qwen3-VL / Qwen3.8 / Gemma-4 run in-process.
-"""
+"""Local open-weight model loader: Qwen, GLM and other VLLM-served models."""
 
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ from .registry import ModelSpec, resolve
 
 LOGGER = logging.getLogger(__name__)
 
-#: Where weights land. Honours the standard HF variables so an existing cache is reused.
 DEFAULT_CACHE = Path(
     os.environ.get("MEWM_MODEL_CACHE")
     or os.environ.get("HF_HOME")
@@ -25,17 +23,17 @@ DEFAULT_CACHE = Path(
 
 
 class WeightsUnavailableError(RuntimeError):
-    """Weights could not be obtained; the message says how to fetch them by hand."""
+    pass
 
 
 class LocalBackendError(RuntimeError):
-    """The local runtime could not be constructed."""
+    pass
 
 
 def manual_download_instructions(spec: ModelSpec, reason: str = "") -> str:
-    """Actionable steps for fetching weights when the automatic path fails."""
     repo = spec.hf_repo or spec.model_id
-    target = DEFAULT_CACHE / "hub"
+    declared = declared_local_weights(spec)
+    target = declared or (DEFAULT_CACHE / "hub" / f"models--{repo.replace('/', '--')}")
     return f"""
 Could not obtain weights for {spec.model_id} ({repo}).
 {('Reason: ' + reason) if reason else ''}
@@ -80,27 +78,42 @@ def _env_suffix(spec: ModelSpec) -> str:
     return spec.model_id.upper().replace("-", "_").replace(".", "_")
 
 
-def local_weights_override(spec: ModelSpec) -> Optional[Path]:
-    """A manually downloaded directory, if one was declared for this model."""
-    value = os.environ.get(f"MEWM_LOCAL_WEIGHTS_{_env_suffix(spec)}")
-    if not value:
+def declared_local_weights(spec: ModelSpec) -> Optional[Path]:
+
+    declared = getattr(spec, "local_weights", "") or ""
+    if not declared:
         return None
-    path = Path(value)
-    return path if path.is_dir() else None
+    path = Path(declared)
+    if not path.is_absolute():
+        from ..config import PACKAGE_ROOT
+        path = PACKAGE_ROOT / path
+    return path
+
+
+def local_weights_override(spec: ModelSpec) -> Optional[Path]:
+
+    value = os.environ.get(f"MEWM_LOCAL_WEIGHTS_{_env_suffix(spec)}")
+    if value:
+        path = Path(value)
+        if path.is_dir():
+            return path
+    return declared_local_weights(spec)
 
 
 def ensure_weights(spec: ModelSpec, retries: int = 3) -> Path:
-    """Explicit snapshot download with resume + retries (修改方案 §4.2).
-    """
+
     override = local_weights_override(spec)
-    if override is not None:
+    if override is not None and (override / "config.json").is_file():
         return override
     if not spec.hf_repo:
         raise WeightsUnavailableError(manual_download_instructions(spec, "no repo id"))
 
-    target = DEFAULT_CACHE / "hub" / f"models--{spec.hf_repo.replace('/', '--')}"
-    if (target / "config.json").is_file():
-        return target
+    if override is not None:
+        target = override
+    else:
+        target = DEFAULT_CACHE / "hub" / f"models--{spec.hf_repo.replace('/', '--')}"
+        if (target / "config.json").is_file():
+            return target
 
     try:
         from huggingface_hub import snapshot_download
@@ -116,7 +129,7 @@ def ensure_weights(spec: ModelSpec, retries: int = 3) -> Path:
                         spec.hf_repo, target, attempt + 1, retries)
             snapshot_download(repo_id=spec.hf_repo, local_dir=str(target))
             return target
-        except Exception as exc:  # noqa: BLE001 - network / auth / disk
+        except Exception as exc:
             last = exc
             wait = 5.0 * (2 ** attempt)
             LOGGER.warning("download attempt %d/%d for %s failed (%s); retrying in %.0fs",
@@ -126,21 +139,15 @@ def ensure_weights(spec: ModelSpec, retries: int = 3) -> Path:
         manual_download_instructions(spec, f"{type(last).__name__}: {last}"))
 
 
-# ---------------------------------------------------------------------------
-# Runtime
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class LoadedModel:
-    """A materialised local model plus its processor."""
 
     spec: ModelSpec
     model: Any
     processor: Any
     is_vision: bool
     device: str
-    source: str            # resolved repo id or local directory
+    source: str
 
 
 _CACHE: Dict[Tuple[str, str, str], LoadedModel] = {}
@@ -148,10 +155,10 @@ _CACHE: Dict[Tuple[str, str, str], LoadedModel] = {}
 
 def _require_transformers():
     try:
-        import torch  # noqa: F401
+        import torch
         import transformers
         return transformers
-    except ImportError as exc:  # pragma: no cover
+    except ImportError as exc:
         raise LocalBackendError(
             "open-weight models need torch and transformers:\n"
             "    pip install -U torch transformers accelerate\n"
@@ -160,8 +167,8 @@ def _require_transformers():
 
 
 def preflight(spec: ModelSpec) -> Dict[str, Any]:
-    """Check disk, VRAM and reachability *before* starting a multi-GB download."""
     report: Dict[str, Any] = {"model": spec.model_id, "repo": spec.hf_repo}
+    report["declared_weights_dir"] = str(declared_local_weights(spec) or "")
     override = local_weights_override(spec)
     report["local_override"] = str(override) if override else None
 
@@ -202,12 +209,6 @@ def load_local_model(
     trust_remote_code: bool = True,
     quantization: str = "",
 ) -> LoadedModel:
-    """Load (and on first use download) an open-weight model.
-
-    ``quantization``: "" defers to the registry field + the VRAM preflight (方案 §4.3
-    -- 4-bit is applied automatically with a warning when the card cannot hold the
-    model); "4bit" forces it; "none" forbids it.
-    """
     spec = model if isinstance(model, ModelSpec) else resolve(model)
     if not spec.open_weights:
         raise LocalBackendError(f"{spec.model_id} is not an open-weight model")
@@ -219,8 +220,6 @@ def load_local_model(
     transformers = _require_transformers()
     import torch
 
-    # Explicit, resumable snapshot download (方案 §4.2) instead of the silent
-    # inside-from_pretrained path.
     source = str(ensure_weights(spec))
 
     checks = preflight(spec)
@@ -263,7 +262,7 @@ def load_local_model(
             materialised = transformers.AutoModelForCausalLM.from_pretrained(
                 source, torch_dtype=torch_dtype, device_map=device_map,
                 trust_remote_code=trust_remote_code, **quant_kwargs)
-    except Exception as exc:  # noqa: BLE001 - network, auth, disk, arch mismatch
+    except Exception as exc:
         raise WeightsUnavailableError(
             manual_download_instructions(spec, f"{type(exc).__name__}: {exc}")
         ) from exc
@@ -280,7 +279,6 @@ def load_local_model(
 
 
 def unload(model: Optional[str] = None) -> None:
-    """Free cached models; without an argument, free all of them."""
     import gc
     keys = ([k for k in _CACHE if k[0] == resolve(model).model_id] if model
             else list(_CACHE))
@@ -295,21 +293,9 @@ def unload(model: Optional[str] = None) -> None:
         pass
 
 
-# ---------------------------------------------------------------------------
-# Generation
-# ---------------------------------------------------------------------------
-
-#: What the CoT is wrapped in. The Qwen3 family emits these delimiters natively when
-#: the template's thinking mode is on; models without a thinking mode are asked for
-#: them explicitly, so one parser handles both.
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
 
-#: Prepended to the system prompt for ``thinking="prompt"`` models. Two things it has
-#: to get right: the reasoning must be *delimited* (the agent layer parses the answer
-#: as JSON, so an undelimited preamble is a parse failure), and it must come *before*
-#: the answer (reasoning emitted after the answer cannot have informed it -- it is a
-#: post-hoc rationalisation, and rewarding it teaches the policy to fabricate one).
 THINKING_DIRECTIVE = (
     "Before answering, reason step by step inside a single "
     f"{THINK_OPEN} ... {THINK_CLOSE} block: restate what the evidence actually shows, "
@@ -319,31 +305,27 @@ THINKING_DIRECTIVE = (
     "block, and never emit more than one block."
 )
 
-#: Templates that do not take the kwarg are recorded here so the retry is attempted
-#: once per model rather than on every call.
 _NO_THINKING_KWARG: set = set()
 
 
 def thinking_mode(spec: ModelSpec) -> str:
-    """``"template"``, ``"prompt"`` or ``""`` -- how to elicit a CoT from this model."""
     mode = (getattr(spec, "thinking", "") or "").strip().lower()
-    return mode if mode in {"template", "prompt"} else ""
+    return mode if mode in {"template", "prompt", "native"} else ""
+
+
+_NATIVE_THINK_MARKERS = (
+    ("<|begin_of_thought|>", "<think>"),
+    ("<|end_of_thought|>", "</think>"),
+)
 
 
 def split_reasoning(text: str) -> Tuple[str, str]:
-    """Separate ``(answer, chain_of_thought)`` on the think delimiters.
-
-    * ``<think>...</think>answer`` -- the ordinary case;
-    * ``...</think>answer`` -- templates such as the R1 family open the block inside
-      the generation prompt, so only the close tag is in the completion. Everything
-      ahead of it is reasoning;
-    * ``<think>...`` with no close -- generation hit the token budget mid-thought.
-      There is no answer to salvage, so the whole span is returned as reasoning and
-      the answer is empty, which the caller surfaces rather than handing a truncated
-      thought to a JSON parser.
-    """
     if not text:
         return "", ""
+    if THINK_OPEN not in text and any(marker in text
+                                      for marker, _ in _NATIVE_THINK_MARKERS):
+        for native, shared in _NATIVE_THINK_MARKERS:
+            text = text.replace(native, shared)
     open_at = text.find(THINK_OPEN)
     close_at = text.find(THINK_CLOSE)
     if close_at == -1:
@@ -360,22 +342,17 @@ def split_reasoning(text: str) -> Tuple[str, str]:
 
 def _apply_chat_template(processor: Any, messages: List[Dict[str, Any]],
                          spec: ModelSpec, want_thinking: bool) -> str:
-    """Render the prompt, turning the template's thinking mode on when it has one."""
     if want_thinking and spec.model_id not in _NO_THINKING_KWARG:
         try:
             return processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
                 enable_thinking=True)
         except TypeError:
-            # Older tokenizers reject unknown kwargs outright rather than passing
-            # them through to Jinja.
             _NO_THINKING_KWARG.add(spec.model_id)
-            LOGGER.info("%s: chat template does not take enable_thinking; falling "
-                        "back to the prompt-level CoT directive", spec.model_id)
-        except Exception as exc:  # noqa: BLE001 - a template that raises on the kwarg
+            LOGGER.info("", spec.model_id)
+        except Exception as exc:
             _NO_THINKING_KWARG.add(spec.model_id)
-            LOGGER.warning("%s: enable_thinking=True broke the chat template (%s); "
-                           "falling back to the prompt-level CoT directive",
+            LOGGER.warning("",
                            spec.model_id, exc)
     return processor.apply_chat_template(messages, tokenize=False,
                                          add_generation_prompt=True)
@@ -392,14 +369,6 @@ def call_local_model(
     device_map: str = "auto",
     thinking: Optional[bool] = None,
 ):
-    """Generate with a local model; signature mirrors the hosted path.
-
-    ``thinking``: ``None`` follows the registry (every open-weight entry declares a
-    mode); ``False`` forces a plain answer. When thinking is on, the chain of thought
-    is generated *and returned separately* on ``LLMResponse.reasoning`` -- the answer
-    text the agent layer parses never contains it -- and ``spec.thinking_budget``
-    extra tokens are granted so a long CoT cannot eat the answer's budget.
-    """
     from .client import LLMResponse
 
     started = time.time()
@@ -415,11 +384,9 @@ def call_local_model(
         for path in image_paths:
             try:
                 images.append(Image.open(str(path)).convert("RGB"))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 LOGGER.warning("skipping unreadable image %s: %s", path, exc)
 
-    # A template-mode model that turned out not to take the kwarg gets the directive
-    # too, so the fallback still produces a CoT instead of silently dropping it.
     effective_system = system_prompt
     if want_thinking and (mode == "prompt" or spec.model_id in _NO_THINKING_KWARG):
         effective_system = (f"{THINKING_DIRECTIVE}\n\n{system_prompt}"
@@ -433,8 +400,9 @@ def call_local_model(
 
     processor = loaded.processor
     try:
-        text = _apply_chat_template(processor, messages, spec, want_thinking)
-    except Exception:  # noqa: BLE001 - not every tokenizer ships a template
+        text = _apply_chat_template(processor, messages, spec,
+                                    want_thinking and mode == "template")
+    except Exception:
         text = (f"{effective_system}\n\n{user_prompt}" if effective_system
                 else user_prompt)
 
@@ -447,9 +415,6 @@ def call_local_model(
     inputs = {k: (v.to(loaded.model.device) if hasattr(v, "to") else v)
               for k, v in inputs.items()}
 
-    # The thinking budget is added, not shared: at max_new_tokens=2048 a CoT of any
-    # substance leaves nothing for the answer, and the truncation shows up downstream
-    # as an unparseable response rather than as a budget problem.
     budget = max_tokens + (max(0, spec.thinking_budget) if want_thinking else 0)
 
     with torch.no_grad():
@@ -461,10 +426,6 @@ def call_local_model(
     prompt_length = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
     trimmed = generated[0][prompt_length:]
     decoder = getattr(processor, "decode", None) or getattr(processor, "tokenizer").decode
-    # skip_special_tokens=False: on the Qwen3 family <think> / </think> ARE special
-    # tokens, and skipping them deletes the only boundary between the reasoning and
-    # the answer -- the CoT would then be silently concatenated onto the JSON the
-    # agent layer parses. They are stripped by hand below instead.
     output = decoder(trimmed, skip_special_tokens=not want_thinking)
     if want_thinking:
         output = _strip_special(output, processor)
@@ -473,8 +434,7 @@ def call_local_model(
                          else (output.strip(), ""))
     if want_thinking and not answer and reasoning:
         LOGGER.warning(
-            "%s: generation ended inside the reasoning block (%d chars of CoT, no "
-            "answer); raise max_tokens or thinking_budget", spec.model_id,
+            "", spec.model_id,
             len(reasoning))
 
     return LLMResponse(
@@ -485,7 +445,6 @@ def call_local_model(
 
 
 def _strip_special(text: str, processor: Any) -> str:
-    """Drop end-of-turn / padding markers while keeping the think delimiters."""
     tokenizer = getattr(processor, "tokenizer", processor)
     specials = [str(t) for t in (getattr(tokenizer, "all_special_tokens", None) or [])]
     for token in sorted(specials, key=len, reverse=True):
@@ -495,7 +454,6 @@ def _strip_special(text: str, processor: Any) -> str:
 
 
 def local_status() -> Dict[str, Any]:
-    """What is downloaded, what is loaded, and whether the box can run it."""
     from .registry import list_models
     report: Dict[str, Any] = {"cache_dir": str(DEFAULT_CACHE),
                               "loaded": [k[0] for k in _CACHE]}

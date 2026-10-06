@@ -1,13 +1,4 @@
-"""C-Agent -- intervention-free counterfactual verification (paper 3.4.5).
-
-* **The critic never proposes a rival conclusion.** A critic that advances its own
-  hypothesis becomes a second reasoner and stops being an independent check.
-* **The critic cannot see the verdict** (visibility matrix), so it cannot construct
-  challenges that happen to land on the answer.
-* **Every challenge must cite a rollout analysis report.** ``ChallengeRecord.create``
-  raises without one, so a bare assertion cannot enter the protocol at all.
-"""
-
+"""Critic-verification agent: checks hypotheses and returns evidence reports."""
 from __future__ import annotations
 
 import json
@@ -28,8 +19,6 @@ LOGGER = logging.getLogger(__name__)
 
 
 class CriticAgent(BaseAgent):
-    """Adversarial verification on a base model heterogeneous with the reasoner's."""
-
     role_files = {PHASE_C_CRITIC: "c_agent_critic"}
 
     def __init__(self, model: str, **kwargs: Any) -> None:
@@ -37,8 +26,6 @@ class CriticAgent(BaseAgent):
 
     def phases(self) -> Tuple[str, ...]:
         return (PHASE_C_CRITIC,)
-
-    # -- prompt -------------------------------------------------------------
 
     def build_user_prompt(self, phase: str, projection: Projection,
                           state: MEWMState, **kwargs: Any) -> str:
@@ -99,8 +86,6 @@ class CriticAgent(BaseAgent):
         ])
         return "\n".join(lines)
 
-    # -- parsing ------------------------------------------------------------
-
     def parse(self, phase: str, payload: Dict[str, Any], projection: Projection,
               state: MEWMState, **kwargs: Any) -> AgentResult:
         result = AgentResult(phase=PHASE_C_CRITIC)
@@ -128,7 +113,6 @@ class CriticAgent(BaseAgent):
                     round_index=round_index, cid=cid,
                 )
             except ContractError as exc:
-                # A bare assertion is bounced by the arbitration rule, as specified.
                 result.notes.append(f"challenge rejected by the arbitration rule: {exc}")
                 continue
             state.add_challenge(cid, record)
@@ -144,7 +128,6 @@ class CriticAgent(BaseAgent):
                 refs=refs, cid=cid,
             ))
 
-        # The critic owns the CF+MHV layer of the chain.
         cot = state.causal_cots.get(cid)
         if cot is not None:
             cot.cf_mhv = {
@@ -152,11 +135,6 @@ class CriticAgent(BaseAgent):
                 "cfs": analysis.get("cfs", {}),
                 "cfs_margin": analysis.get("cfs_margin"),
                 "mni": analysis.get("mni", {}),
-                # rho_flip's only data source. It was computed, shown to the critic in
-                # its prompt, and then dropped on the floor -- which made the paper's
-                # belief-flip rate unrecoverable from a finished run, because nothing
-                # downstream had ever seen it. It is a per-AU boolean: did masking this
-                # unit change the leading hypothesis.
                 "flips": analysis.get("flips", {}),
                 "template_distances": analysis.get("template_distances", {}),
                 "counterfactual_statement": str(
@@ -178,8 +156,6 @@ class CriticAgent(BaseAgent):
         }
         return result
 
-    # -- tool phase ---------------------------------------------------------
-
     def run_analysis(
         self,
         service: Any,
@@ -189,12 +165,6 @@ class CriticAgent(BaseAgent):
         k_crit: Sequence[str],
         cid: str = "",
     ) -> Dict[str, Any]:
-        """Run the three checks before any text is written.
-
-        Separated from :meth:`run` on purpose: the numbers exist before the model sees
-        them, so the challenge text is written *about* computed evidence rather than the
-        evidence being invented to fit a challenge.
-        """
         critic = self.config.critic
         scores = service.score(observed, list(candidates), caller="C", cid=cid)
         ranked = scores.ranked()
@@ -237,11 +207,6 @@ class CriticAgent(BaseAgent):
         return analysis
 
     def _auto_flags(self, analysis: Dict[str, Any], k_crit: Sequence[str]) -> List[Dict[str, str]]:
-        """Threshold breaches the tools alone establish.
-
-        Computed deterministically so a genuine breach is on the record whether or not
-        the model chooses to raise it -- the checks do not depend on the critic noticing.
-        """
         critic = self.config.critic
         flags: List[Dict[str, str]] = []
         if float(analysis.get("lambda", 0.0)) < critic.eta_lambda:
@@ -277,20 +242,11 @@ class CriticAgent(BaseAgent):
     def grade_responses(
         self, state: MEWMState, cid: str, responses: Sequence[Dict[str, Any]],
     ) -> List[ChallengeRecord]:
-        """Assign final grades deterministically from the response mode.
-
-        Grading is mechanical rather than a second judgement call: new evidence or
-        re-reasoning rejects the challenge, bare insistence is partial, concession upholds
-        it. That keeps the confidence decrement predictable and non-negotiable.
-        """
         by_id = {c.ch_id: c for c in state.challenges.get(cid, [])}
         graded: List[ChallengeRecord] = []
         answered = {str(r.get("ch_id", "")): r for r in responses}
         pending = [c for c in by_id.values() if not c.final]
 
-        # Positional fallback: a response that omits ``ch_id`` when exactly one challenge
-        # is outstanding is unambiguous, and treating it as unanswered would upgrade a
-        # real answer to an upheld challenge purely on a formatting slip.
         unlabelled = [r for r in responses if not str(r.get("ch_id", ""))]
         if len(pending) == 1 and len(unlabelled) == 1:
             answered[pending[0].ch_id] = unlabelled[0]
@@ -303,7 +259,7 @@ class CriticAgent(BaseAgent):
                 continue
             response = answered.get(ch_id)
             if response is None:
-                challenge.set_final("upheld")            # unanswered counts as conceded
+                challenge.set_final("upheld")
             else:
                 mode = str(response.get("mode", "")).lower()
                 if mode in {"new_evidence", "re_reasoning"}:
@@ -315,16 +271,8 @@ class CriticAgent(BaseAgent):
             graded.append(challenge)
         return graded
 
-    # -- fallback -----------------------------------------------------------
-
     def fallback(self, phase: str, projection: Projection, state: MEWMState,
                  reason: str, **kwargs: Any) -> AgentResult:
-        """Raise the tool-established flags even when the model is unavailable.
-
-        The three checks are numeric, so a model outage must not silently remove
-        verification -- that would turn an unverified verdict into one that merely looks
-        verified.
-        """
         result = AgentResult(phase=PHASE_C_CRITIC, degraded=True, parsed=False)
         result.notes.append(f"degraded: {reason}; raising the tool-established flags only")
         cid = projection.cid

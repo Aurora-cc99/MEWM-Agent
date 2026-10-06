@@ -1,11 +1,4 @@
-"""``K_E`` -- the emotion prototype library (paper 3.5, appendix C.3).
-
-* the emotion codebook (core AUs with weight and specificity, coarse mapping),
-* prototype AU trajectory templates ``T_e``, plus the neutralised and masked variants
-  the suppression / masquerade rules of appendix C.4 compare against,
-* the emotion-wheel similarity used by ``R_emo`` to score near-misses.
-"""
-
+"""Emotion prototype definitions: canonical AU patterns per emotion category."""
 from __future__ import annotations
 
 import json
@@ -18,12 +11,6 @@ from .au_anatomy import SLOT_AUS, au_label
 
 KB_VERSION = "K_E-1.0.0"
 
-# ---------------------------------------------------------------------------
-# Codebook: emotion -> {AU: (weight, specificity)}
-# ---------------------------------------------------------------------------
-# weight       -- how strongly the AU belongs to the prototype (drives ES)
-# specificity  -- how exclusive the AU is to this emotion (down-weights shared AUs
-#                 such as AU4, which is in disgust, anger, fear and sadness alike)
 
 EMOTION_CODEBOOK: Dict[str, Dict[str, object]] = {
     "happiness": {
@@ -73,7 +60,6 @@ EMOTION_CODEBOOK: Dict[str, Dict[str, object]] = {
 }
 
 FINE_EMOTIONS: List[str] = list(EMOTION_CODEBOOK)
-#: The four coarse classes of eq. (1).
 COARSE_EMOTIONS: List[str] = ["positive", "negative", "surprise", "other"]
 
 FINE_TO_COARSE: Dict[str, str] = {
@@ -92,8 +78,6 @@ COARSE_ZH: Dict[str, str] = {
     "positive": "积极", "negative": "消极", "surprise": "惊讶", "other": "其他",
 }
 
-# AUs whose presence argues *against* an emotion.  Used both by the ES penalty and by
-# the masquerade rule of appendix C.4(i).
 CONTRADICTORY_AUS: Dict[str, List[str]] = {
     "happiness": ["AU4", "AU9", "AU15", "AU24"],
     "surprise": ["AU4", "AU7", "AU24", "AU23"],
@@ -106,37 +90,26 @@ CONTRADICTORY_AUS: Dict[str, List[str]] = {
     "other": [],
 }
 
-# Valence / arousal coordinates -- used for the continuous emotion-wheel similarity of
-# R_emo and for the arousal rank correlation of the counterfactual structure metric.
 VALENCE_AROUSAL: Dict[str, Tuple[float, float]] = {
     "happiness": (0.85, 0.55), "surprise": (0.15, 0.85), "disgust": (-0.70, 0.45),
     "anger": (-0.75, 0.80), "fear": (-0.75, 0.85), "sadness": (-0.70, -0.35),
     "contempt": (-0.50, 0.20), "repression": (-0.35, -0.15), "other": (0.0, 0.0),
 }
 
-# Onset -> apex -> offset shape family.  ``rise`` / ``fall`` are the fractions of the
-# event spent before and after the apex; micro-expressions are onset-fast, offset-slow.
 PHASE_SHAPE: Dict[str, Tuple[float, float]] = {
     "happiness": (0.40, 0.60), "surprise": (0.30, 0.70), "disgust": (0.35, 0.65),
     "anger": (0.40, 0.60), "fear": (0.28, 0.72), "sadness": (0.45, 0.55),
     "contempt": (0.40, 0.60), "repression": (0.50, 0.50), "other": (0.40, 0.60),
 }
 
-#: Resolution of the time-normalised prototype templates.
 TEMPLATE_LENGTH = 32
-
-
-# ---------------------------------------------------------------------------
-# Prototype trajectory templates
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class PrototypeTemplate:
-    """``T_e = {sigma_bar^(e)_k(tau)}`` with the per-point variance band of C.3."""
 
     emotion: str
-    variant: str                            # "full" | "neutralised" | "masked"
+    variant: str
     curves: Dict[str, List[float]] = field(default_factory=dict)
     bands: Dict[str, List[float]] = field(default_factory=dict)
     n_samples: int = 0
@@ -156,13 +129,11 @@ class PrototypeTemplate:
 
 
 def _phase_curve(peak: float, length: int, rise: float, plateau: float = 0.12) -> List[float]:
-    """Asymmetric onset/apex/offset profile normalised to ``[0, 1]`` in time."""
     apex = max(1, int(round(length * rise)))
     hold = max(1, int(round(length * plateau)))
     curve: List[float] = []
     for i in range(length):
         if i < apex:
-            # Smooth accelerating rise (cosine ease-in).
             x = i / max(1, apex)
             value = peak * (0.5 - 0.5 * math.cos(math.pi * x))
         elif i < apex + hold:
@@ -175,12 +146,10 @@ def _phase_curve(peak: float, length: int, rise: float, plateau: float = 0.12) -
 
 
 def _analytic_template(emotion: str) -> PrototypeTemplate:
-    """Default ``T_e`` built from the codebook weights and the phase-shape family."""
     meta = EMOTION_CODEBOOK[emotion]
     rise, _fall = PHASE_SHAPE.get(emotion, (0.4, 0.6))
     curves, bands = {}, {}
-    # Higher-weight AUs lead slightly: the onset order is part of what DC scores.
-    ordered = sorted(meta["aus"].items(), key=lambda kv: -kv[1][0])  # type: ignore[index]
+    ordered = sorted(meta["aus"].items(), key=lambda kv: -kv[1][0])
     for rank, (au, (weight, _spec)) in enumerate(ordered):
         shift = min(0.18, 0.05 * rank)
         curve = _phase_curve(float(weight), TEMPLATE_LENGTH, rise + shift)
@@ -190,11 +159,6 @@ def _analytic_template(emotion: str) -> PrototypeTemplate:
 
 
 def _neutralised_from(full: PrototypeTemplate, cut: float = 0.35) -> PrototypeTemplate:
-    """Suppression: core AUs truncated to a residual trace, shapes otherwise intact.
-
-    This is what a *neutralised* micro-expression looks like -- the intent reaches the
-    face but is cut short, so the strongest AU keeps only a weak trace.
-    """
     ordered = sorted(full.curves.items(), key=lambda kv: -max(kv[1]))
     curves, bands = {}, {}
     for rank, (au, curve) in enumerate(ordered):
@@ -206,18 +170,11 @@ def _neutralised_from(full: PrototypeTemplate, cut: float = 0.35) -> PrototypeTe
 
 
 def _masked_from(full: PrototypeTemplate, emotion: str) -> PrototypeTemplate:
-    """Masquerade: the prototype plus a slowly ramping contradictory AU.
-
-    The overlay rises across the whole window instead of spiking, which is exactly the
-    social-smile signature rule C.4(iii) keys on (``kappa_rise`` below the transient
-    threshold, plus an activation baseline that predates the proposal).
-    """
     curves = {au: list(c) for au, c in full.curves.items()}
     bands = {au: list(full.band(au)) for au in full.curves}
     contradictions = CONTRADICTORY_AUS.get(emotion, [])
     overlay = next((au for au in contradictions if au in SLOT_AUS), None)
     if overlay:
-        # Linear social ramp from an already non-zero baseline.
         curves[overlay] = [round(0.18 + 0.35 * (i / (TEMPLATE_LENGTH - 1)), 5)
                            for i in range(TEMPLATE_LENGTH)]
         bands[overlay] = [0.14] * TEMPLATE_LENGTH
@@ -225,13 +182,7 @@ def _masked_from(full: PrototypeTemplate, emotion: str) -> PrototypeTemplate:
                              n_samples=full.n_samples, provenance=full.provenance)
 
 
-# ---------------------------------------------------------------------------
-# Library
-# ---------------------------------------------------------------------------
-
-
 class PrototypeLibrary:
-    """Versioned, read-only store of ``T_e`` and its suppression variants."""
 
     def __init__(self, templates: Optional[Dict[Tuple[str, str], PrototypeTemplate]] = None) -> None:
         self._templates: Dict[Tuple[str, str], PrototypeTemplate] = templates or {}
@@ -259,20 +210,11 @@ class PrototypeLibrary:
     def emotions(self) -> List[str]:
         return sorted({e for e, _ in self._templates})
 
-    # -- fitting from a training fold ---------------------------------------
-
     def fit(
         self,
         samples: Iterable[Tuple[str, Dict[str, List[float]], Tuple[int, int, int]]],
         min_samples: int = 3,
     ) -> Dict[str, int]:
-        """Rebuild ``T_e`` by averaging real slot trajectories (appendix C.3).
-
-        ``samples`` yields ``(emotion, {au: sigma_hat trajectory}, (onset, apex, offset))``
-        with frame indices absolute.  Each trajectory is piecewise-linearly time
-        normalised on the three anchors before averaging, so samples of different
-        duration stay phase aligned.
-        """
         buckets: Dict[str, List[Dict[str, List[float]]]] = {}
         for emotion, traj, anchors in samples:
             if emotion not in EMOTION_CODEBOOK:
@@ -310,8 +252,6 @@ class PrototypeLibrary:
             counts[emotion] = len(entries)
         return counts
 
-    # -- persistence --------------------------------------------------------
-
     def save(self, path: Path | str) -> Path:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -336,14 +276,12 @@ class PrototypeLibrary:
 def _anchor_normalise(
     curve: Sequence[float], anchors: Tuple[int, int, int], length: int = TEMPLATE_LENGTH
 ) -> List[float]:
-    """Piecewise-linear time normalisation on the onset/apex/offset anchors."""
     onset, apex, offset = anchors
     n = len(curve)
     if n == 0:
         return [0.0] * length
     if n == 1 or offset <= onset:
         return [float(curve[0])] * length
-    # Fractional position of the apex within the event, clamped away from the edges.
     apex_frac = min(0.9, max(0.1, (apex - onset) / max(1, offset - onset)))
     split = max(1, int(round(length * apex_frac)))
 
@@ -366,24 +304,18 @@ def _anchor_normalise(
             _resample(curve[: apex_idx + 1], split) + _resample(curve[apex_idx:], length - split)]
 
 
-# ---------------------------------------------------------------------------
-# Scoring helpers used by the R-Agent and the reward
-# ---------------------------------------------------------------------------
-
-
 def core_aus(emotion: str) -> List[str]:
-    """``A^+_e`` -- the prototype AU set."""
-    return sorted(EMOTION_CODEBOOK.get(emotion, {}).get("aus", {}),  # type: ignore[arg-type]
+    return sorted(EMOTION_CODEBOOK.get(emotion, {}).get("aus", {}),
                   key=lambda a: int(a[2:]))
 
 
 def au_weight(emotion: str, au: str) -> float:
-    entry = EMOTION_CODEBOOK.get(emotion, {}).get("aus", {}).get(au)  # type: ignore[union-attr]
+    entry = EMOTION_CODEBOOK.get(emotion, {}).get("aus", {}).get(au)
     return float(entry[0]) if entry else 0.0
 
 
 def au_specificity(emotion: str, au: str) -> float:
-    entry = EMOTION_CODEBOOK.get(emotion, {}).get("aus", {}).get(au)  # type: ignore[union-attr]
+    entry = EMOTION_CODEBOOK.get(emotion, {}).get("aus", {}).get(au)
     return float(entry[1]) if entry else 0.0
 
 
@@ -393,13 +325,7 @@ def evidence_sufficiency(
     weak_aus: Sequence[str] = (),
     intensities: Optional[Dict[str, float]] = None,
 ) -> float:
-    """``ES(e)`` -- weighted share of the prototype's core mass that is present.
-
-    Weak activations count at half weight, and each contradictory AU that *is* present
-    removes its own specificity-scaled mass, so a hypothesis cannot score well merely by
-    having some of its AUs present while carrying evidence that refutes it.
-    """
-    codebook = EMOTION_CODEBOOK.get(emotion, {}).get("aus", {})  # type: ignore[union-attr]
+    codebook = EMOTION_CODEBOOK.get(emotion, {}).get("aus", {})
     if not codebook:
         return 0.0
     active, weak = set(active_aus), set(weak_aus)
@@ -422,7 +348,6 @@ def evidence_sufficiency(
 
 
 def normalise_scores(scores: Dict[str, float]) -> Dict[str, float]:
-    """Min-max normalisation within the candidate set (appendix C.1) for DC."""
     if not scores:
         return {}
     values = list(scores.values())
@@ -433,7 +358,6 @@ def normalise_scores(scores: Dict[str, float]) -> Dict[str, float]:
 
 
 def emotion_similarity(a: str, b: str) -> float:
-    """Continuous emotion-wheel similarity in ``[0, 1]``, for partial ``R_emo`` credit."""
     if a == b:
         return 1.0
     va, aa = VALENCE_AROUSAL.get(a, (0.0, 0.0))
@@ -443,7 +367,6 @@ def emotion_similarity(a: str, b: str) -> float:
 
 
 def prototype_completeness(emotion: str, active_aus: Sequence[str]) -> float:
-    """IoU of the activation set with the prototype core set (appendix H.6)."""
     core = set(core_aus(emotion))
     active = set(active_aus)
     if not core and not active:
@@ -452,10 +375,6 @@ def prototype_completeness(emotion: str, active_aus: Sequence[str]) -> float:
     return round(len(core & active) / len(union), 4) if union else 0.0
 
 
-#: Free-text answers models give when they decline to commit to an emotion. These are
-#: legitimate positions, but they are not members of the label set, and letting one
-#: through as ``fine_label`` puts an invented category into every downstream field --
-#: the main path, the authenticity score, the AU chain of thought.
 _UNDETERMINED_MARKERS = (
     "undetermined", "unknown", "none", "no_activation", "inconclusive", "n/a",
     "not determined", "unclear", "indeterminate", "no emotion", "neutral",
@@ -463,17 +382,10 @@ _UNDETERMINED_MARKERS = (
 
 
 def canonical_fine_label(raw: str) -> Tuple[str, bool]:
-    """Map a model-emitted fine label onto the vocabulary; ``(label, was_recognised)``.
-
-    An unrecognised label is folded to ``other`` -- which is the label set's own way of
-    saying "no determinate category" -- and flagged, so the answer can say the reading
-    was indeterminate instead of inventing a class name and then scoring against it.
-    """
     text = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
     if text in EMOTION_CODEBOOK:
         return text, True
     for name in EMOTION_CODEBOOK:
-        # Tolerate "disgust (low intensity)" and similar decorations.
         if text.startswith(name) or name in text.split("_"):
             return name, True
     if any(marker in text for marker in _UNDETERMINED_MARKERS) or not text:
@@ -487,12 +399,10 @@ def coarse_of(fine: str) -> str:
 
 
 def labels_consistent(fine: str, coarse: str) -> bool:
-    """Gate rule R5's mapping-consistency half."""
     return FINE_TO_COARSE.get(fine, "other") == coarse
 
 
 def competing_hypotheses(emotion: str, k: int = 3) -> List[str]:
-    """The ``k`` nearest emotions -- the candidate set the C-Agent must rule out."""
     others = [e for e in FINE_EMOTIONS if e != emotion]
     others.sort(key=lambda e: -emotion_similarity(emotion, e))
     return others[:k]
@@ -506,7 +416,6 @@ def describe_emotion(emotion: str, lang: str = "en") -> str:
 
 
 def knowledge_digest(lang: str = "en") -> Dict[str, object]:
-    """Compact, promptable view of ``K_E``."""
     return {
         "version": KB_VERSION,
         "coarse_classes": COARSE_EMOTIONS,
@@ -523,7 +432,6 @@ def knowledge_digest(lang: str = "en") -> Dict[str, object]:
     }
 
 
-#: Process-wide default library.
 DEFAULT_LIBRARY = PrototypeLibrary()
 
 

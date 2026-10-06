@@ -1,49 +1,40 @@
-# --- User-specified exclusions (do not upload) ---
-/MLLM_MER_pinpline_main/
-/pre_datasets/
-/Q-T-A/
-/pre_process/
-/README_reference.md
-/runs/
-/MEWM-Agent_完整执行方案.md
-/formwork.md
-/.env.example
-/Weights/
-
-# --- Secrets: never upload real credentials ---
-.env
-*.env
-!.env.*.example
-**/api_key*
-**/*_token*
-**/secrets.*
-
-# --- Python ---
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+*.pyo
+*.pyd
+.Python
 *.egg-info/
-.eggs/
-build/
 dist/
+build/
+.eggs/
 
-# --- Virtual environments ---
+# Virtual environments
 .venv/
 venv/
 env/
 
-# --- IDE / OS ---
+# IDE
 .idea/
 .vscode/
+*.iml
+
+# Model weights (too large for git)
+Weights/
+
+# Raw datasets (gated, not redistributable)
+dataset/
+
+# OS
 .DS_Store
 Thumbs.db
 
-# --- Model weights / large artifacts (belt-and-suspenders) ---
-*.pt
-*.pth
-*.bin
-*.safetensors
-*.ckpt
+# Pre-computed intermediate outputs (too large / not redistributable)
+runs/
+
+# dlib landmark data and other binary assets
+assets/
+
+# Logs and temp outputs
+*.log
+*.tmp

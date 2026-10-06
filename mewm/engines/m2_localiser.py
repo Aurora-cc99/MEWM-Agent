@@ -1,5 +1,4 @@
-"""M2b - micro-expression extent decoding by matched filtering.
-"""
+"""M2 localiser: refines and confirms ME interval boundaries."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,13 +17,7 @@ def double_burst_kernel(
     flank_fraction: float = 0.3,
     trough_weight: float = 1.0,
 ) -> np.ndarray:
-    """A zero-mean, unit-norm burst-trough-burst kernel of length ``duration``.
-
-    Positive over the leading and trailing ``flank_fraction`` of the window,
-    negative in between. Zero-meaning is what makes the correlation a *shape*
-    test: a constant offset in ``S`` contributes nothing, so a locally elevated
-    but featureless stretch of curve cannot score.
-    """
+    # zero-mean so a constant offset contributes nothing to the correlation score
     duration = max(3, int(duration))
     flank = max(1, int(round(flank_fraction * duration)))
     flank = min(flank, (duration - 1) // 2)
@@ -33,7 +26,7 @@ def double_burst_kernel(
     kernel[duration - flank:] = 1.0
     kernel -= kernel.mean()
     norm = np.linalg.norm(kernel)
-    if norm <= 0:  # degenerate only if duration < 3, which max() above prevents
+    if norm <= 0:
         kernel = np.zeros(duration)
         kernel[0] = 1.0
         return kernel
@@ -41,11 +34,6 @@ def double_burst_kernel(
 
 
 def _moving_stats(x: np.ndarray, width: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Centred moving mean and standard deviation, via cumulative sums.
-
-    Cumulative sums rather than a convolution so the module keeps numpy as its
-    only dependency, matching the rest of the engines.
-    """
     width = max(1, int(width))
     n = x.size
     pad = width // 2
@@ -60,11 +48,6 @@ def _moving_stats(x: np.ndarray, width: int) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _correlate_same(x: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    """``np.correlate(x, kernel, 'same')`` with edge padding instead of zeros.
-
-    Zero padding would make the first and last few frames look like a step, and
-    a step correlates well with a burst.
-    """
     k = kernel.size
     pad_lo = k // 2
     pad_hi = k - 1 - pad_lo
@@ -74,29 +57,20 @@ def _correlate_same(x: np.ndarray, kernel: np.ndarray) -> np.ndarray:
 
 @dataclass
 class LocaliserResponse:
-    """Per-frame matched-filter output, kept for inspection and calibration."""
-
-    response: np.ndarray          # best score over the duration bank, per centre
-    best_duration: np.ndarray     # argmax duration, per centre
+    response: np.ndarray
+    best_duration: np.ndarray
     durations: List[int]
 
 
 class MicroLocaliser:
-    """Decode micro-expression extents from the expressive error curve."""
 
     def __init__(self, config: Optional[SpottingConfig] = None, fps: float = 30.0) -> None:
         self.config = config or SpottingConfig()
         self.fps = float(fps) if fps and fps > 0 else 30.0
 
-    # ------------------------------------------------------------------ bank
-    #: Shortest extent the double-burst kernel can express: it needs an onset flank,
-    #: a trough and an offset flank. Not a micro-expression prior -- a kernel of two
-    #: samples has no trough, so there is nothing to match.
     MIN_DECODABLE_FRAMES = 3
 
     def duration_bank_for(self, n_frames: int = 0) -> List[int]:
-        """Candidate extents, in frames, over the whole decodable range.
-        """
         lo = self.MIN_DECODABLE_FRAMES
         if self.config.min_micro_seconds > 0:
             lo = max(lo, int(round(self.config.min_micro_seconds * self.fps)))
@@ -104,12 +78,8 @@ class MicroLocaliser:
         if self.config.max_micro_seconds > 0:
             hi = int(round(self.config.max_micro_seconds * self.fps))
         elif n_frames and n_frames > 0:
-            # A quarter of the curve: an "event" longer than that is the recording's
-            # baseline, not something to localise against it.
             hi = int(n_frames) // 4
         else:
-            # No curve to measure against (an introspective call). Four seconds is a
-            # reporting placeholder only; every real decode passes the curve length.
             hi = int(round(4.0 * self.fps))
         hi = max(lo + 1, hi)
 
@@ -122,10 +92,8 @@ class MicroLocaliser:
 
     @property
     def duration_bank(self) -> List[int]:
-        """The bank with no curve in hand; :meth:`duration_bank_for` is the real one."""
         return self.duration_bank_for(0)
 
-    # -------------------------------------------------------------- response
     def response(self, s_curve: np.ndarray) -> LocaliserResponse:
         s = np.asarray(s_curve, dtype=np.float64).reshape(-1)
         bank = self.duration_bank_for(s.size)
@@ -133,20 +101,10 @@ class MicroLocaliser:
             zeros = np.zeros(s.size)
             return LocaliserResponse(zeros, zeros.astype(int), bank)
 
-        # A constant curve carries no extent to decode. Saying so here rather
-        # than letting the normalisation below handle it matters: the kernel is
-        # zero-mean, so its correlation against a constant is 0 only up to
-        # rounding, and dividing float dust (~1e-16) by a fixed absolute epsilon
-        # manufactures a finite score out of nothing. Measured on np.full(200,
-        # 2.0) that produced 12 intervals -- the full per-video cap -- each with
-        # a score of 1.3e-6 and no signal behind it.
         scale = float(s.std())
         if not np.isfinite(scale) or scale <= 0.0:
             zeros = np.zeros(s.size)
             return LocaliserResponse(zeros, zeros.astype(int), bank)
-        # Windows flatter than one part in a million of the curve's own spread
-        # are constant for our purposes; their normalised shape is meaningless,
-        # so it is 0 by definition instead of by numerical accident.
         std_floor = 1e-6 * scale
 
         best = np.full(s.size, -np.inf)
@@ -162,9 +120,6 @@ class MicroLocaliser:
             shape = np.where(std > std_floor,
                              raw / (std * np.sqrt(duration) + 1e-12), 0.0)
 
-            # Demand that the match be made of signal, not of well-shaped noise:
-            # the flanks must actually carry error mass. Without this term a flat
-            # noisy stretch scores as well as a real event.
             flank = max(1, int(round(self.config.localiser_flank_fraction * duration)))
             energy_kernel = np.zeros(duration)
             energy_kernel[:flank] = 1.0 / (2 * flank)
@@ -179,7 +134,6 @@ class MicroLocaliser:
         best[~np.isfinite(best)] = 0.0
         return LocaliserResponse(best, best_d, bank)
 
-    # ------------------------------------------------------------- proposals
     def localise(
         self,
         s_curve: np.ndarray,
@@ -187,7 +141,6 @@ class MicroLocaliser:
         per_slot: Optional[np.ndarray] = None,
         physio_events: Optional[Sequence[PhysioEvent]] = None,
     ) -> List[CandidateInterval]:
-        """Top-scoring decoded extents, NMS'd, newest-first by score."""
         s = np.asarray(s_curve, dtype=np.float64).reshape(-1)
         out = self.response(s)
         response, best_d = out.response, out.best_duration
@@ -222,9 +175,6 @@ class MicroLocaliser:
                 cid=f"L{order_i + 1:02d}",
                 t_on=t_start + lo,
                 t_off=t_start + hi,
-                # The apex is the trough between the two bursts, which is where
-                # displacement peaks -- not the argmax of S, which by
-                # construction sits on a flank.
                 apex=t_start + centre,
                 peak_S=round(score, 4),
                 attribution=_attribute(
@@ -245,13 +195,7 @@ def _iou(a: Tuple[int, int], b: Tuple[int, int]) -> float:
 
 
 def _attribute(per_slot: Optional[np.ndarray], lo: int, hi: int,
-                temperature: Optional[float] = None) -> Dict[str, float]:
-    """Slot shares over the window, mirroring ``ProposalGenerator._attribute``.
-
-    Tolerant of a missing or malformed slot matrix: attribution is explanatory
-    metadata, so a caller that has no per-slot decomposition (a synthetic curve,
-    a stage run in isolation) should still get intervals rather than a crash.
-    """
+               temperature: Optional[float] = None) -> Dict[str, float]:
     if per_slot is None:
         return {}
     arr = np.asarray(per_slot, dtype=np.float64)
@@ -266,7 +210,6 @@ def localiser_diagnostics(
     truth: Sequence[Tuple[int, int]],
     iou_threshold: float = 0.5,
 ) -> Dict[str, float]:
-    """Per-video recall anatomy, so a caller can see *why* a score moved."""
     best = []
     for t in truth:
         best.append(max((_iou((i.t_on, i.t_off), t) for i in intervals), default=0.0))

@@ -1,27 +1,4 @@
-"""A hosted-API policy sampler for the QA-augmentation stage.
-
-**It scores what it samples.** The runner warns when every candidate carries reward 0.0,
-because an unscored pool makes the reward-spread diagnostic read "all low" no matter what
-the policy did. This sampler attaches a real :class:`~mewm.training.rewards.RewardBreakdown`
-to every candidate.
-
-**It never turns a missing component into a favourable one.** ``R_causal`` needs the
-frozen rollout engine's online quantities (``dc``, ``mni``, graph edit distance). In a
-QA-augmentation run there is no per-proposal subgraph, so those do not exist.
-:class:`~mewm.training.rewards.CompositeReward` correctly falls back to zero rather than
-guessing -- but zero carries the component's full 0.3 weight into the total, so an
-acceptance floor of 0.6 would be a floor of 0.6/0.7 on the components that *were*
-computable, and the run would look like a bad policy rather than a partial objective.
-The sampler therefore records ``available_components``, ``unavailable_components`` and
-``available_weight_mass`` on every candidate and reports the acceptance score as the
-total renormalised over the mass that was actually in play. The renormalisation is
-written into the manifest, not applied quietly.
-
-**A parse failure is a candidate, not an exception.** A generation that does not yield a
-JSON product is admitted to the pool with reward 0.0 and a format failure attached, so it
-appears in the rejection ledger. Dropping it would make the pass rate a rate over
-"generations that happened to parse", which flatters the policy.
-"""
+"""API-backed trajectory sampler for remote-model policy training."""
 
 from __future__ import annotations
 
@@ -42,26 +19,12 @@ from .rl_prompts import KIND_EVENT_REASONING, KIND_VIDEO_REASONING
 
 LOGGER = logging.getLogger(__name__)
 
-#: Components the composite reward can compute without a per-proposal subgraph.
 COMPUTABLE_WITHOUT_JUDGE = ("au", "emo", "fmt", "temp")
-#: Components that need the online world-model judge and are unavailable without it.
 NEEDS_JUDGE = ("causal",)
 
-#: Fields the format check requires of an event-anchored product.
 EVENT_REQUIRED_FIELDS = ("fine_label", "coarse_label", "interval", "answer")
-#: Fields the format check requires of a whole-video product. ``events`` is deliberately
-#: NOT here: most long videos contain no micro-expression at all, and ``check_format``
-#: reads an empty list as a missing field. Requiring it would fail every correct "this
-#: video contains none" answer -- which in CAS(ME)^2 is the majority of the corpus. The
-#: count is checked by ``evaluate_video_sample`` instead, where zero is a real claim.
 VIDEO_REQUIRED_FIELDS = ("answer",)
 
-#: The exact object an event-anchored answer must return. Restating the schema in the
-#: user turn is not redundant with ``SYSTEM_PROMPT``: given only a system-level
-#: description, the model reliably reorganises the contract into its own key names
-#: ("num_micro_expression_events", nested "event_id" records, no "answer" field), and
-#: every such generation is then scored as a format failure -- which measures the prompt,
-#: not the policy. A literal skeleton in the turn that carries the question fixes it.
 EVENT_SKELETON = """{
   "P": "...", "M": "...", "C": "...", "MC": "...",
   "k_crit": ["AU..", ".."],
@@ -113,14 +76,12 @@ For a whole-video question, additionally supply:
                   one per micro-expression event you claim; [] if you claim none
 
 The "answer" text describes the FACE. It must not mention this system's internals or any
-document cross-reference: no agent names, no stage names, no pipeline vocabulary, no
-"appendix ...", no "eq. (n)", no "section n.n". Write about brows, lids, lips, timing and
+document cross-reference: no agent names, no stage names, no pipeline vocabulary. Write about brows, lids, lips, timing and
 what they indicate. If the evidence is weak, say so as an observation about the evidence.
 """
 
 
 def extract_product(text: str) -> Optional[Dict[str, Any]]:
-    """The JSON object in a completion, or ``None`` when there is not one."""
     if not text:
         return None
     for candidate in ([m.group(1) for m in _JSON_BLOCK.finditer(text)] + [text]):
@@ -143,7 +104,6 @@ def extract_product(text: str) -> Optional[Dict[str, Any]]:
 
 
 def build_user_prompt(prompt: Dict[str, Any]) -> str:
-    """Evidence, question, and the literal object shape the answer must take."""
     kind = prompt.get("kind", KIND_EVENT_REASONING)
     skeleton = VIDEO_SKELETON if kind == KIND_VIDEO_REASONING else EVENT_SKELETON
     extra = ""
@@ -168,7 +128,6 @@ def build_user_prompt(prompt: Dict[str, Any]) -> str:
 
 @dataclass
 class SamplingStats:
-    """What the sampler did, for the manifest."""
 
     n_calls: int = 0
     n_failed_calls: int = 0
@@ -188,7 +147,6 @@ class SamplingStats:
 
 
 class APIPolicySampler:
-    """Draw and score ``n`` candidates per prompt from a hosted model."""
 
     def __init__(
         self,
@@ -214,10 +172,8 @@ class APIPolicySampler:
         self.stats = SamplingStats()
         self._lock = threading.Lock()
 
-    # -- weighting -------------------------------------------------------
 
     def weight_mass(self) -> Tuple[float, float]:
-        """``(available, total)`` weight mass under this configuration."""
         weights = {"au": self.reward.config.w_au, "emo": self.reward.config.w_emo,
                    "fmt": self.reward.config.w_fmt, "causal": self.reward.config.w_causal,
                    "temp": self.reward.config.w_temp}
@@ -226,7 +182,6 @@ class APIPolicySampler:
         return available, total
 
     def renormalisation(self) -> Dict[str, Any]:
-        """The statement that goes in the manifest beside every accepted pair."""
         available, total = self.weight_mass()
         return {
             "available_components": list(COMPUTABLE_WITHOUT_JUDGE),
@@ -248,7 +203,6 @@ class APIPolicySampler:
             ),
         }
 
-    # -- sampling --------------------------------------------------------
 
     def _one_call(self, prompt: Dict[str, Any], draw: int) -> Candidate:
         user_prompt = build_user_prompt(prompt)
@@ -270,7 +224,7 @@ class APIPolicySampler:
             )
             text = getattr(response, "text", str(response))
             latency = float(getattr(response, "latency_s", 0.0) or 0.0)
-        except Exception as exc:  # noqa: BLE001 - recorded on the candidate, not swallowed
+        except Exception as exc:
             with self._lock:
                 self.stats.n_calls += 1
                 self.stats.n_failed_calls += 1
@@ -320,7 +274,6 @@ class APIPolicySampler:
         return candidate
 
     def __call__(self, prompt: Dict[str, Any], n: int) -> List[Candidate]:
-        """``n`` scored candidates for one prompt."""
         draws = list(range(1, max(1, int(n)) + 1))
         if self.max_workers == 1 or len(draws) == 1:
             candidates = [self._one_call(prompt, d) for d in draws]
@@ -344,7 +297,6 @@ class APIPolicySampler:
 
 
 def video_truth(video: Any) -> Dict[str, Any]:
-    """The whole-video truth block :func:`evaluate_video_sample` expects."""
     events = [
         {"interval": list(e.interval), "fine": e.fine_label, "coarse": e.coarse_label}
         for e in video.micro_events()

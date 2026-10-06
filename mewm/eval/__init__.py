@@ -1,1 +1,1 @@
-"""MEWM-Agent eval subpackage."""
+"""Eval sub-package: metrics, diagnostics, and per-subject reports."""

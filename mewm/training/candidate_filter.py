@@ -1,12 +1,4 @@
-"""Reward-ranked candidate selection for stage 2 (RFT).
-
-* DPO consumes ``(chosen, rejected)`` pairs and updates the policy with a pairwise
-  objective. Removing it removes that objective.
-* What stage 2 actually needs is a *filter*: sample the policy several times, score every
-  candidate with the composite reward, keep only those that pass the shared criterion, and
-  fine-tune on the survivors with ordinary cross-entropy. The rejected candidates are
-  simply dropped -- they never enter a loss term at all.
-"""
+"""Candidate trajectory filter: removes low-quality samples before updates."""
 
 from __future__ import annotations
 
@@ -24,7 +16,6 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class Candidate:
-    """One sampled output with everything needed to judge and trace it."""
 
     prompt_id: str
     text: str
@@ -32,7 +23,6 @@ class Candidate:
     reward: float = 0.0
     reward_detail: Dict[str, Any] = field(default_factory=dict)
     outcome: Optional[PassOutcome] = None
-    #: Provenance, carried through to the augmented QA manifest.
     dataset: str = ""
     video: str = ""
     event_index: int = 0
@@ -54,7 +44,6 @@ class Candidate:
 
 @dataclass
 class FilterReport:
-    """What the filter admitted, and what it threw away and why."""
 
     n_candidates: int = 0
     n_passed: int = 0
@@ -86,7 +75,6 @@ def score_candidates(
     evaluation: Optional[EvaluationConfig] = None,
     required_fields: Sequence[str] = (),
 ) -> List[Candidate]:
-    """Attach a :class:`PassOutcome` to every candidate, in place."""
     evaluation = evaluation or EvaluationConfig()
     for candidate in candidates:
         truth = truth_by_prompt.get(candidate.prompt_id, {})
@@ -99,13 +87,6 @@ def select(
     candidates: Sequence[Candidate],
     config: Optional[TrainingConfig] = None,
 ) -> Tuple[List[Candidate], FilterReport]:
-    """Rank each prompt's candidates by reward and admit the qualifying ones.
-
-    Returns ``(accepted, report)``. Ordering inside a prompt is by reward descending, with
-    the pass flag as the primary key -- a passing candidate always outranks a
-    higher-reward failing one, so the cap on ``rft_accept_top_k`` can never spend its
-    budget on failures while a pass sits below the line.
-    """
     config = config or TrainingConfig()
     report = FilterReport(min_reward=config.rft_min_reward,
                           top_k=config.rft_accept_top_k)
@@ -155,7 +136,6 @@ def select(
 
 
 def group_rewards(candidates: Sequence[Candidate]) -> List[List[float]]:
-    """Per-prompt reward groups, in the shape the reward-spread diagnostic wants."""
     by_prompt: Dict[str, List[float]] = {}
     for candidate in candidates:
         by_prompt.setdefault(candidate.prompt_id, []).append(candidate.reward)
@@ -163,7 +143,6 @@ def group_rewards(candidates: Sequence[Candidate]) -> List[List[float]]:
 
 
 def group_outcomes(candidates: Sequence[Candidate]) -> Dict[str, List[PassOutcome]]:
-    """Per-prompt outcomes, in the shape the pass@k diagnostic wants."""
     by_prompt: Dict[str, List[PassOutcome]] = {}
     for candidate in candidates:
         if candidate.outcome is not None:

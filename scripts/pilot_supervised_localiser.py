@@ -1,13 +1,4 @@
-"""Pilot: does a supervised localiser beat the analytic curve on real casme_sq data?
-
-Stage I is by far the most expensive part of this and it does not depend on the fold, so
-features are extracted once for every annotated video and cached to a single npz. Every
-LOSO fold then trains off the cache. Re-running with the cache present skips extraction
-entirely.
-
-Baseline to beat, measured on the same 31 videos / 52 events:
-    pooled frame AUC 0.4301, 8/31 videos above 0.5, 0/31 above 0.7
-"""
+"""Supervised localiser pilot: quick sanity-check training on a single fold."""
 
 from __future__ import annotations
 
@@ -77,16 +68,8 @@ def load_cache():
 
 
 def analytic_baseline(samples):
-    """Frame AUC of the summed analytic slot error, recomputed from the cache.
-
-    The summed-error column is the last feature block appended by ``frame_features``
-    when a slot error is supplied, so the baseline is measured on exactly the same
-    frames and the same mask as the trained model -- otherwise the comparison would be
-    between two different denominators.
-    """
     aucs = []
     for s in samples:
-        # activations(K) + velocity(K) + acceleration(K) + err(K) + err_sum(1) + ...
         k = (s.features.shape[1] - 1 - 6 - 6 - 1) // 5
         col = 4 * k
         auc = _frame_auc(s.features[:, col], s.labels, ~s.ignore)
@@ -99,7 +82,6 @@ def analytic_baseline(samples):
 
 
 def loso(samples, epochs: int = 60):
-    """One fold per held-out subject. Trained on the rest, evaluated on the held-out."""
     subjects = sorted({s.subject for s in samples})
     LOGGER.info("LOSO over %d subject(s): %s", len(subjects), subjects)
 

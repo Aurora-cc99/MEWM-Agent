@@ -1,6 +1,4 @@
-"""Graph analytics over the AU dynamic graph.
-"""
-
+"""AU graph analytics: centrality and connectivity statistics for eval reports."""
 from __future__ import annotations
 
 import math
@@ -15,13 +13,12 @@ from ..schemas import AUDynGraph
 
 def _edge_weight(edge: Any) -> float:
     weight = getattr(edge, "weight", 0.0)
-    if weight != weight:            # NaN: a registered model/observation sign conflict
+    if weight != weight:
         return 0.0
     return abs(float(weight))
 
 
 def adjacency(graph: AUDynGraph) -> Tuple[List[str], np.ndarray]:
-    """``(node order, weighted adjacency)`` with edges directed source -> target."""
     nodes = sorted(graph.nodes, key=lambda a: int(a[2:]))
     index = {au: i for i, au in enumerate(nodes)}
     matrix = np.zeros((len(nodes), len(nodes)), dtype=np.float64)
@@ -32,12 +29,6 @@ def adjacency(graph: AUDynGraph) -> Tuple[List[str], np.ndarray]:
 
 
 def betweenness_centrality(graph: AUDynGraph) -> Dict[str, float]:
-    """Brandes betweenness on the unweighted directed graph, normalised to ``[0, 1]``.
-
-    Identifies the AU that most shortest paths run through -- the node whose removal
-    would most disconnect the causal reading, which is what "key causal node" means in
-    the answer.
-    """
     nodes, matrix = adjacency(graph)
     n = len(nodes)
     scores = {au: 0.0 for au in nodes}
@@ -72,7 +63,6 @@ def betweenness_centrality(graph: AUDynGraph) -> Dict[str, float]:
             if node != source:
                 scores[nodes[node]] += delta[node]
 
-    # Normalise by the number of ordered pairs excluding the node itself.
     scale = (n - 1) * (n - 2)
     if scale > 0:
         scores = {au: round(value / scale, 4) for au, value in scores.items()}
@@ -80,12 +70,6 @@ def betweenness_centrality(graph: AUDynGraph) -> Dict[str, float]:
 
 
 def acyclicity_score(graph: AUDynGraph) -> float:
-    """``tr(exp(A ∘ A)) - n`` -- the NOTEARS acyclicity functional.
-
-    Exactly zero for a DAG and positive when cycles carry weight, so a small value is a
-    quantitative statement that the causal reading is near-acyclic rather than an
-    assertion that it is.
-    """
     _nodes, matrix = adjacency(graph)
     n = matrix.shape[0]
     if n == 0:
@@ -93,7 +77,7 @@ def acyclicity_score(graph: AUDynGraph) -> float:
     try:
         from scipy.linalg import expm
         value = float(np.trace(expm(matrix * matrix)) - n)
-    except Exception:  # noqa: BLE001 - scipy optional; series expansion is enough here
+    except Exception:
         hadamard = matrix * matrix
         total = np.eye(n)
         term = np.eye(n)
@@ -107,12 +91,6 @@ def acyclicity_score(graph: AUDynGraph) -> float:
 def gcn_propagation(
     graph: AUDynGraph, node_features: Optional[Dict[str, float]] = None, steps: int = 2,
 ) -> Dict[str, Any]:
-    """Symmetric-normalised message passing over the AU graph.
-
-    A structural cross-check on the emotion reading: if the activation mass concentrates,
-    after propagation, on the AUs the causal path names, the graph and the conclusion
-    agree. ``consistency_gap`` measures how far apart they are.
-    """
     nodes, matrix = adjacency(graph)
     if not nodes:
         return {"propagated_response": 0.0, "top_nodes": [], "consistency_gap": 0.0,
@@ -122,7 +100,6 @@ def gcn_propagation(
         [float((node_features or {}).get(au, graph.nodes[au].peak)) for au in nodes],
         dtype=np.float64,
     )
-    # Symmetric normalisation with self-loops, as in a standard GCN layer.
     adjusted = matrix + matrix.T + np.eye(len(nodes))
     degree = adjusted.sum(axis=1)
     inverse_sqrt = np.diag(1.0 / np.sqrt(np.maximum(degree, 1e-9)))
@@ -135,8 +112,6 @@ def gcn_propagation(
     order = np.argsort(state)[::-1]
     top = [nodes[i] for i in order[:2]]
     response = float(np.mean(np.abs(state)))
-    # Gap between the propagated ranking and the raw activation ranking: large means the
-    # graph structure disagrees with the measured intensities.
     raw_order = list(np.argsort(features)[::-1])
     propagated_order = list(order)
     gap = sum(abs(raw_order.index(i) - propagated_order.index(i))
@@ -151,7 +126,6 @@ def gcn_propagation(
 
 
 def main_path(graph: AUDynGraph, emotion: str = "", max_len: int = 4) -> List[str]:
-    """Dominant activation path: follow onset order along the strongest edges."""
     if not graph.nodes:
         return []
     order = graph.onset_order()
@@ -186,12 +160,6 @@ def authenticity_score(
     es: Dict[str, float], dc: Dict[str, float], emotion: str,
     prototype_completeness: float = 0.0,
 ) -> Tuple[float, float]:
-    """``(Score_auth, normalised confidence)`` for the named emotion.
-
-    The product form is deliberate: a hypothesis needs static evidence, dynamics
-    agreement *and* prototype coverage together. A sum would let one strong term carry a
-    reading that the other two contradict.
-    """
     static = float(es.get(emotion, 0.0))
     dynamic = float(dc.get(emotion, 0.0))
     raw = static * dynamic * max(prototype_completeness, 1e-3)
@@ -206,7 +174,6 @@ def authenticity_score(
 def confidence_bands(
     cfi: Dict[str, float], high: float = 0.25, low: float = 0.02,
 ) -> Dict[str, List[str]]:
-    """Split the claimed AUs by masking necessity into high / medium / low bands."""
     bands: Dict[str, List[str]] = {"high": [], "medium": [], "low": []}
     for au, value in sorted(cfi.items(), key=lambda kv: -kv[1]):
         if value >= high:

@@ -1,23 +1,4 @@
-"""R-Agent -- causal chain of thought, adjudication and narration (paper 3.4.4).
-
-* **reason** -- the five-layer causal chain carrying the forward AU->Emotion pathway.
-  Hypotheses are scored on two separate axes that are deliberately *not* merged into one
-  number before being reported: ``ES(e)`` static evidence sufficiency and ``DC(e)``
-  dynamics consistency (eq. 8, computed by the ``score`` primitive). A hypothesis whose
-  static AU combination holds but whose activation order and phases violate that
-  emotion's dynamics gets demoted by the second term -- which is the whole reason for
-  having a dynamics model behind the reasoning.
-
-* **respond** -- answer the critic's challenges with new evidence, re-reasoning, or an
-  explicit concession.
-
-* **adjudicate** -- prototype completeness, suppression and masquerade rules, and the
-  four-signal confidence fusion. Challenge outcomes enter as *monotone decrements*: an
-  upheld challenge can only lower confidence, never raise it.
-
-* **narrate** -- video-level account with whole-curve read access, covering the baseline
-  outside every proposal.
-"""
+"""Reasoning agent: generates causal chain-of-thought and emotion labels."""
 
 from __future__ import annotations
 
@@ -48,39 +29,24 @@ from .base import (
 
 LOGGER = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Scoring helpers (also the R3 recomputation source)
-# ---------------------------------------------------------------------------
-
-
 def compute_es(active: Sequence[str], weak: Sequence[str],
                candidates: Sequence[str],
                intensities: Optional[Dict[str, float]] = None) -> Dict[str, float]:
-    """``ES(e)`` for each candidate hypothesis."""
     return {
         emotion: evidence_sufficiency(emotion, active, weak, intensities)
         for emotion in candidates
     }
 
-
 def joint_score(es: Dict[str, float], dc: Dict[str, float], alpha: float = 0.5) -> Dict[str, float]:
-    """``alpha * ES + (1 - alpha) * DC`` over the shared candidate set."""
     return {
         emotion: round(alpha * es.get(emotion, 0.0) + (1.0 - alpha) * dc.get(emotion, 0.0), 4)
         for emotion in set(es) | set(dc)
     }
 
-
 def leave_one_out_critical(
     active: Sequence[str], weak: Sequence[str], candidates: Sequence[str],
     dc: Dict[str, float], alpha: float = 0.5,
 ) -> List[str]:
-    """``K_crit``: AUs whose removal flips the hypothesis ranking.
-
-    "Critical" is defined operationally -- a claim that an AU matters is a claim that
-    removing it changes the answer, and that is checkable.
-    """
     base = joint_score(compute_es(active, weak, candidates), dc, alpha)
     if not base:
         return []
@@ -93,12 +59,10 @@ def leave_one_out_critical(
             critical.append(au)
     return critical
 
-
 def fuse_confidence(
     evidence_quality: float, margin: float, challenge_grade: float,
     prototype_score: float, weights: Sequence[float] = (0.35, 0.25, 0.20, 0.20),
 ) -> Tuple[float, Dict[str, float]]:
-    """Four-signal convex combination (appendix H.6)."""
     terms = {
         "q_ev": round(float(evidence_quality), 4),
         "margin": round(float(margin), 4),
@@ -108,22 +72,13 @@ def fuse_confidence(
     total = sum(w * v for w, v in zip(weights, terms.values()))
     return round(float(np.clip(total, 0.0, 1.0)), 4), terms
 
-
 def challenge_grade(challenges: Sequence[ChallengeRecord]) -> float:
-    """Monotone challenge factor in ``[0, 1]``; upheld challenges only ever subtract."""
     factor = 1.0
     for challenge in challenges:
         factor += FINAL_VERDICT_STEP.get(challenge.final, 0.0)
     return round(max(0.0, factor), 4)
 
-
-# ---------------------------------------------------------------------------
-# Agent
-# ---------------------------------------------------------------------------
-
-
 class ReasoningAgent(BaseAgent):
-    """The policy model: argumentation, response, adjudication and narration."""
 
     role_files = {
         PHASE_R_REASON: "r_agent_reason",
@@ -137,8 +92,6 @@ class ReasoningAgent(BaseAgent):
 
     def phases(self) -> Tuple[str, ...]:
         return (PHASE_R_REASON, PHASE_R_RESPOND, PHASE_R_ADJUDICATE, PHASE_R_NARRATE)
-
-    # -- prompts ------------------------------------------------------------
 
     def build_user_prompt(self, phase: str, projection: Projection,
                           state: MEWMState, **kwargs: Any) -> str:
@@ -315,8 +268,6 @@ class ReasoningAgent(BaseAgent):
         lines.append("Produce the two-part answer.")
         return "\n".join(lines)
 
-    # -- parsing ------------------------------------------------------------
-
     def parse(self, phase: str, payload: Dict[str, Any], projection: Projection,
               state: MEWMState, **kwargs: Any) -> AgentResult:
         parsers = {
@@ -331,8 +282,6 @@ class ReasoningAgent(BaseAgent):
                       state: MEWMState, **kwargs: Any) -> AgentResult:
         result = AgentResult(phase=PHASE_R_REASON)
         cid = projection.cid
-        # Tool-computed scores are authoritative: R3 checks the product against them, so
-        # a model that omits or paraphrases them must not silently blank the field.
         es = coerce_float_map(payload.get("es")) or dict(kwargs.get("es") or {})
         dc = coerce_float_map(payload.get("dc")) or dict(kwargs.get("dc") or {})
         alpha = self.config.es_dc_alpha
@@ -341,8 +290,6 @@ class ReasoningAgent(BaseAgent):
         raw_fine = str(payload.get("fine_label", "") or "")
         fine, recognised = canonical_fine_label(raw_fine)
         if not recognised and joint:
-            # An unrecognised label carries no ranking information, so fall back to the
-            # tool-scored leader rather than to an invented category.
             fine = max(joint, key=lambda e: joint[e])
         if raw_fine and not recognised:
             result.notes.append(
@@ -355,8 +302,6 @@ class ReasoningAgent(BaseAgent):
                 cid=cid))
         coarse = str(payload.get("coarse_label", "") or "")
         if not coarse or not labels_consistent(fine, coarse):
-            # Mapping consistency is a hard rule (R5); derive rather than emit a
-            # violation the gate would only bounce back.
             coarse = coarse_of(fine)
 
         cot = state.causal_cots.get(cid)
@@ -369,7 +314,7 @@ class ReasoningAgent(BaseAgent):
             P=as_dict(payload.get("P")),
             M=as_dict(payload.get("M")),
             C=as_dict(payload.get("C")),
-            cf_mhv={},                    # critic-owned; never filled here
+            cf_mhv={},
             MC=as_dict(payload.get("MC")),
             es=es, dc=dc, joint=dict(joint),
             k_crit=k_crit_claimed,
@@ -410,9 +355,6 @@ class ReasoningAgent(BaseAgent):
             challenge = by_id.get(str(response.get("ch_id", "")))
             if challenge is not None:
                 challenge.response = str(response.get("text", ""))
-            # A response is an emotion-level entry, so it may only cite strictly lower
-            # levels. Models happily cite sibling R-level entries; filtering here keeps
-            # the reference graph acyclic instead of failing the gate on every round.
             chain = state.chain(cid)
             legal_refs = [
                 ref for ref in (response.get("refs") or [])
@@ -434,9 +376,6 @@ class ReasoningAgent(BaseAgent):
             raw = str(revised_labels.get("fine_label", cot.fine_label))
             fine, recognised = canonical_fine_label(raw)
             if raw and not recognised:
-                # Without this the response phase can write an AU code or a free-text
-                # verdict straight into the label field, bypassing the canonicalisation
-                # the argumentation phase applies.
                 result.notes.append(
                     f"revised label {raw!r} is outside the emotion vocabulary; "
                     f"resolved to {fine!r}")
@@ -487,7 +426,6 @@ class ReasoningAgent(BaseAgent):
             payload.get("suppression"))
         rationale = str(payload.get("rationale", ""))
         if suppression_prose and suppression_prose not in rationale:
-            # Keep the reasoning, but as rationale rather than as a state value.
             rationale = (rationale + " " + suppression_prose).strip()
 
         verdict = Verdict(
@@ -547,11 +485,8 @@ class ReasoningAgent(BaseAgent):
         }
         return result
 
-    # -- fallback -----------------------------------------------------------
-
     def fallback(self, phase: str, projection: Projection, state: MEWMState,
                  reason: str, **kwargs: Any) -> AgentResult:
-        """Degradation per appendix D.3: take the best tool-scored hypothesis."""
         result = AgentResult(phase=phase, degraded=True, parsed=False)
         result.notes.append(f"degraded: {reason}")
         cid = projection.cid
@@ -619,9 +554,7 @@ class ReasoningAgent(BaseAgent):
                           "new_open_questions": []}
         return result
 
-
 def _template_narrative(state: MEWMState, baseline: Sequence[Dict[str, Any]]) -> str:
-    """Deterministic narrative used when the policy model is unavailable."""
     if not state.proposals:
         return (f"Across video {state.video_id} the detection statistic stayed at "
                 f"baseline and no micro-expression proposal was raised.")
@@ -638,9 +571,6 @@ def _template_narrative(state: MEWMState, baseline: Sequence[Dict[str, Any]]) ->
     if baseline:
         segment = baseline[0]
         mean = float(segment.get("mean", 0.0))
-        # Describe what the curve says rather than asserting calm over a noisy baseline:
-        # a mean S_t of 14 is not a neutral face, and calling it one would be a claim
-        # contradicted by the evidence cited in the same sentence.
         character = ("a quiet baseline" if mean < 1.0 else
                      "an elevated, unsettled baseline" if mean < 5.0 else
                      "a baseline too noisy to call neutral (which on an untrained "
@@ -652,7 +582,6 @@ def _template_narrative(state: MEWMState, baseline: Sequence[Dict[str, Any]]) ->
             f"S = {mean:.2f}."
         )
     return " ".join(parts)
-
 
 __all__ = [
     "compute_es", "joint_score", "leave_one_out_critical", "fuse_confidence",

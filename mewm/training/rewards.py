@@ -1,12 +1,4 @@
-"""The five-dimensional composite reward of eq. (11) that drives GRPO.
-
-* the judge engine is frozen and heterogeneous with respect to the policy;
-* ``mean`` MNI (not sum) penalises AU padding -- adding low-necessity units lowers the
-  average monotonically, so listing more units can only hurt;
-* the graph edit distance penalises structural padding the same way;
-* ``R_temp`` optimises the eq. (2) TP criterion directly, so temporal quality cannot be
-  traded away for fluent prose.
-"""
+"""Hierarchical process reward computation for WAEPO policy updates."""
 
 from __future__ import annotations
 
@@ -24,11 +16,6 @@ from ..knowledge.emotion_prototypes import coarse_of, emotion_similarity, labels
 LOGGER = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Weight curriculum
-# ---------------------------------------------------------------------------
-
-#: (progress upper bound, {component: weight}) -- appendix F.3.
 WEIGHT_CURRICULUM: Tuple[Tuple[float, Dict[str, float]], ...] = (
     (0.20, {"fmt": 0.40, "au": 0.30, "emo": 0.20, "causal": 0.05, "temp": 0.05}),
     (0.60, {"fmt": 0.15, "au": 0.35, "emo": 0.20, "causal": 0.20, "temp": 0.10}),
@@ -37,11 +24,6 @@ WEIGHT_CURRICULUM: Tuple[Tuple[float, Dict[str, float]], ...] = (
 
 
 def curriculum_weights(progress: float, smooth: bool = True) -> Dict[str, float]:
-    """Weights at training ``progress`` in ``[0, 1]``.
-
-    Cosine-interpolated across stage boundaries by default: a hard switch would inject a
-    discontinuity into the advantage estimate exactly when the policy is mid-update.
-    """
     progress = float(np.clip(progress, 0.0, 1.0))
     stages = list(WEIGHT_CURRICULUM)
     for index, (upper, weights) in enumerate(stages):
@@ -57,9 +39,6 @@ def curriculum_weights(progress: float, smooth: bool = True) -> Dict[str, float]
             key: previous[key] + blend * (weights[key] - previous[key])
             for key in weights
         }
-        # Eq. (11) requires a convex combination. Normalise, then absorb the residual
-        # left by rounding into the largest weight, so the sum is exactly one rather
-        # than one plus a rounding artefact.
         total = sum(blended.values()) or 1.0
         rounded = {key: round(value / total, 5) for key, value in blended.items()}
         residual = 1.0 - sum(rounded.values())
@@ -70,14 +49,8 @@ def curriculum_weights(progress: float, smooth: bool = True) -> Dict[str, float]
     return dict(stages[-1][1])
 
 
-# ---------------------------------------------------------------------------
-# Components
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class RewardBreakdown:
-    """Per-component reward, kept separable for the ablation of paper 4.5(c)."""
 
     r_au: float = 0.0
     r_emo: float = 0.0
@@ -97,10 +70,20 @@ class RewardBreakdown:
         }
 
 
+def _as_token_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value]
+    return []
+
+
 def reward_au(claimed: Sequence[str], truth: Sequence[str],
               hallucination_penalty: float = 0.5,
               evidenced: Optional[Sequence[str]] = None) -> Tuple[float, Dict[str, Any]]:
-    """Set F1 over AUs, minus a penalty for units claimed without evidence."""
+    claimed = _as_token_list(claimed)
+    truth = _as_token_list(truth)
+    evidenced = _as_token_list(evidenced) if evidenced is not None else None
     claimed_set, truth_set = set(claimed), set(truth)
     if not claimed_set and not truth_set:
         return 1.0, {"f1": 1.0, "hallucinated": 0}
@@ -119,12 +102,6 @@ def reward_au(claimed: Sequence[str], truth: Sequence[str],
 
 def reward_emotion(fine_pred: str, fine_true: str,
                    coarse_pred: str = "", coarse_true: str = "") -> Tuple[float, Dict[str, Any]]:
-    """Coarse plus fine match, with wheel-similarity partial credit on the fine label.
-
-    Exact-match-only would treat "anger instead of disgust" and "happiness instead of
-    disgust" as the same error, which they are not -- the first is a plausible confusion
-    between adjacent negative states, the second is a sign error.
-    """
     coarse_pred = coarse_pred or coarse_of(fine_pred)
     coarse_true = coarse_true or coarse_of(fine_true)
     fine_score = 1.0 if fine_pred == fine_true else emotion_similarity(fine_pred, fine_true)
@@ -132,7 +109,7 @@ def reward_emotion(fine_pred: str, fine_true: str,
     consistent = labels_consistent(fine_pred, coarse_pred)
     score = 0.6 * fine_score + 0.4 * coarse_score
     if not consistent:
-        score *= 0.5           # an internally inconsistent label pair is half-credit
+        score *= 0.5
     return round(float(np.clip(score, 0.0, 1.0)), 5), {
         "fine_exact": fine_pred == fine_true, "fine_similarity": round(fine_score, 4),
         "coarse_match": coarse_score == 1.0, "mapping_consistent": consistent,
@@ -143,7 +120,6 @@ REQUIRED_COT_FIELDS = ("P", "M", "C", "MC")
 
 
 def reward_format(product: Dict[str, Any], chain_ids: Sequence[str] = ()) -> Tuple[float, Dict[str, Any]]:
-    """Field completeness and citation legality."""
     present = sum(1 for key in REQUIRED_COT_FIELDS if product.get(key))
     completeness = present / len(REQUIRED_COT_FIELDS)
 
@@ -151,7 +127,7 @@ def reward_format(product: Dict[str, Any], chain_ids: Sequence[str] = ()) -> Tup
     has_scores = bool(product.get("es")) and bool(product.get("dc"))
     has_kcrit = bool(product.get("k_crit"))
 
-    refs = list(product.get("refs") or [])
+    refs = _as_token_list(product.get("refs"))
     legal = sum(1 for ref in refs if ref in set(chain_ids)) if chain_ids else len(refs)
     citation_rate = legal / len(refs) if refs else (1.0 if not chain_ids else 0.5)
 
@@ -168,14 +144,7 @@ def reward_causal(
     dc: float, mni_values: Dict[str, float], graph_edit_distance: float,
     lambda_graph: float = 0.35,
 ) -> Tuple[float, Dict[str, Any]]:
-    """World-model judge score: mean of ``DC``, mean ``MNI``, and the structure term.
-
-    Mean MNI rather than sum is what makes AU padding self-defeating: each additional
-    low-necessity unit drags the average down.
-    """
     mean_mni = float(np.mean(list(mni_values.values()))) if mni_values else 0.0
-    # MNI is a KL divergence in nats and unbounded above; squash to [0, 1] so it cannot
-    # dominate the other two terms on a single extreme sample.
     mni_term = float(1.0 - math.exp(-2.0 * max(0.0, mean_mni)))
     structure_term = float(math.exp(-lambda_graph * max(0.0, graph_edit_distance)))
     dc_term = float(np.clip(dc, 0.0, 1.0))
@@ -195,10 +164,12 @@ def reward_temporal(
     rescue_scale: float = 0.5,
     rescue_min_iou: float = 0.0,
 ) -> Tuple[float, Dict[str, Any]]:
-    """Temporal IoU combined with the eq. (2) TP criterion.
-    """
     from ..eval.metrics import iou as interval_iou, tp_decision
 
+    if not (isinstance(proposal, (list, tuple)) and len(proposal) == 2):
+        proposal = (0, 0)
+    if truth is not None and not (isinstance(truth, (list, tuple)) and len(truth) == 2):
+        truth = None
     if truth is None:
         return 0.0, {"iou": 0.0, "tp": False, "rescued": False,
                      "iou_threshold": iou_threshold}
@@ -210,27 +181,15 @@ def reward_temporal(
     if verdict.is_tp and not verdict.rescued:
         return round(float(overlap), 5), detail
     if verdict.rescued:
-        # Credited, but capped below any genuine temporal hit -- otherwise the policy
-        # could stop caring about boundaries as long as the label is right. The floor
-        # keeps a correct label from scoring exactly zero when the overlap is tiny,
-        # which is a scoring choice and not a change to the verdict above.
         return round(float(rescue_scale * max(overlap, 0.2)), 5), detail
     return round(float(0.2 * overlap), 5), detail
 
 
-# ---------------------------------------------------------------------------
-# Composite
-# ---------------------------------------------------------------------------
-
-
 class CompositeReward:
-    """Assembles eq. (11) from the five components."""
 
     def __init__(self, config: Optional[RewardConfig] = None,
                  evaluation: Optional[Any] = None) -> None:
         self.config = config or RewardConfig()
-        # The reward's temporal term must use the same IoU criterion the evaluation
-        # does; training against a different threshold optimises the wrong objective.
         if evaluation is None:
             from ..config import EvaluationConfig
             evaluation = EvaluationConfig()
@@ -244,13 +203,6 @@ class CompositeReward:
         chain_ids: Sequence[str] = (),
         progress: Optional[float] = None,
     ) -> RewardBreakdown:
-        """Score one policy output.
-
-        ``judge`` carries the frozen engine's online quantities (``dc``, ``mni``,
-        ``graph_edit_distance``); absent them the causal term falls back to zero rather
-        than to a guess, so a missing judge shows up as a missing reward rather than a
-        fabricated one.
-        """
         judge = judge or {}
         weights = (curriculum_weights(progress) if progress is not None
                    else {"au": self.config.w_au, "emo": self.config.w_emo,
@@ -295,13 +247,7 @@ class CompositeReward:
         )
 
 
-# ---------------------------------------------------------------------------
-# Online judge
-# ---------------------------------------------------------------------------
-
-
 class WorldModelJudge:
-    """Computes ``R_causal``'s inputs online from the frozen rollout engine."""
 
     def __init__(self, service: Any, lambda_graph: float = 0.35) -> None:
         self.service = service
@@ -317,7 +263,6 @@ class WorldModelJudge:
         reference_graph: Optional[Any] = None,
         cid: str = "",
     ) -> Dict[str, Any]:
-        """Run ``score`` and ``mask`` and parse the reference graph."""
         from ..agents.structure import graph_edit_distance
 
         scores = self.service.score(observed, list(candidates), caller="judge", cid=cid)
@@ -339,12 +284,6 @@ class WorldModelJudge:
                 "model_version": self.service.model_version}
 
 
-# ---------------------------------------------------------------------------
-# Team reward (MAPPO, formwork.md 第 V 条 / 完整执行方案 第 5.3 节, 2026-09-03)
-# ---------------------------------------------------------------------------
-
-#: w1..w5 of R_team = w1*IoU + w2*EmotionAcc + w3*(1-Hallucination) + w4*CriticSurvival
-#: + w5*STRS_proxy (方案第 5.3 节). Sums to 1; overridable per call.
 DEFAULT_TEAM_REWARD_WEIGHTS: Dict[str, float] = {
     "iou": 0.30, "emotion": 0.30, "evidence": 0.15, "critic": 0.15, "strs": 0.10,
 }
@@ -352,8 +291,6 @@ DEFAULT_TEAM_REWARD_WEIGHTS: Dict[str, float] = {
 
 @dataclass
 class TeamRewardBreakdown:
-    """The five-term shared reward every agent's MAPPO advantage is computed from.
-    """
 
     r_iou: float = 0.0
     r_emotion_acc: float = 0.0
@@ -381,8 +318,6 @@ def team_reward_components(
     evaluation: Optional[Any] = None,
     weights: Optional[Dict[str, float]] = None,
 ) -> TeamRewardBreakdown:
-    """``R_team`` for one candidate region, shared by all four agents' advantages.
-    """
     if evaluation is None:
         from ..config import EvaluationConfig
         evaluation = EvaluationConfig()
@@ -401,7 +336,7 @@ def team_reward_components(
         str(product.get("fine_label", "")), str(truth.get("fine", "")),
         str(product.get("coarse_label", "")), str(truth.get("coarse", "")),
     )
-    claimed_aus = list(product.get("k_crit") or product.get("active_aus") or [])
+    claimed_aus = _as_token_list(product.get("k_crit") or product.get("active_aus") or [])
     _, detail_au = reward_au(
         claimed_aus, list(truth.get("aus") or []),
         hallucination_penalty=1.0, evidenced=truth.get("evidenced_aus"),

@@ -1,11 +1,4 @@
-"""V2 -- AU object-slot encoding (paper 3.2.2, eq. 4).
-
-* ``mask(traj, K_m)`` needs "remove one AU's evidence" to have a bounded blast radius.
-  With entangled whole-face features, masking one AU perturbs unrelated regions and the
-  necessity index measures nothing.
-* AU->AU interaction modelling needs both endpoints to be semantically definite.
-* Error attribution needs the residual to decompose *per AU*.
-"""
+"""V2 slot encoder: AU-centered object-slot representation of facial regions."""
 
 from __future__ import annotations
 
@@ -24,51 +17,35 @@ from ..schemas import ROIMeasurement
 
 LOGGER = logging.getLogger(__name__)
 
-try:  # torch is required for the learned path, optional for the analytic one
+try:
     import torch
     import torch.nn as nn
     _TORCH = True
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
-    nn = object  # type: ignore
+except ImportError:
+    torch = None
+    nn = object
     _TORCH = False
 
-
-# ---------------------------------------------------------------------------
-# Routing mask
-# ---------------------------------------------------------------------------
-
-
 def build_routing_mask() -> np.ndarray:
-    """``(K, n_roi)`` binary mask -- slot ``k`` may read region ``r`` iff ``M[k, r] = 1``."""
     mask = np.zeros((K_SLOTS, N_ROI), dtype=np.float32)
     for au in SLOT_AUS:
         for roi in regions_of(au):
             mask[SLOT_INDEX[au], ROI_INDEX[roi] - 1] = 1.0
     return mask
 
-
 ROUTING_MASK: np.ndarray = build_routing_mask()
-
 
 def slot_region_counts() -> Dict[str, int]:
     return {au: int(ROUTING_MASK[SLOT_INDEX[au]].sum()) for au in SLOT_AUS}
 
-
-# ---------------------------------------------------------------------------
-# Analytic read-out -- the untrained fallback and the cross-check path
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class SlotReadout:
-    """One slot's state at one frame."""
 
     au: str
-    activation: float                  # sigma_hat_{k,t}
-    magnitude: float                   # mean |F| over R_k
-    coherence: float                   # mean directional coherence over R_k
-    fit_score: float                   # direction agreement with the AU's pull priors
+    activation: float
+    magnitude: float
+    coherence: float
+    fit_score: float
     n_salient: int = 0
 
     def to_dict(self) -> Dict[str, float | str | int]:
@@ -78,13 +55,10 @@ class SlotReadout:
             "fit_score": round(self.fit_score, 4), "n_salient": self.n_salient,
         }
 
-
 def analytic_slot_readout(
     measurements: Sequence[ROIMeasurement],
     magnitude_scale: float = 0.25,
 ) -> Dict[str, SlotReadout]:
-    """Rule-based ``sigma_hat`` from the measurement triples alone.
-    """
     from ..knowledge.au_anatomy import AU_ROI_PRIOR, direction_fit_score
 
     by_roi = {m.roi_name: m for m in measurements}
@@ -111,26 +85,20 @@ def analytic_slot_readout(
         magnitude = float(np.mean(magnitudes))
         coherence = float(np.mean(coherences))
         fit = float(np.mean(fits))
-        # Product form: an AU needs displacement AND agreement AND the right direction.
-        # A sum would let a large but incoherent or wrongly-directed motion fake it.
         strength = (1.0 - math.exp(-magnitude / magnitude_scale)) * coherence * fit
         out[au] = SlotReadout(au, round(float(np.clip(strength, 0.0, 1.0)), 5),
                               magnitude, coherence, fit, salient)
     return out
 
-
 def coherence_is_saturated(
     measurements: Sequence[ROIMeasurement], median_floor: float = 0.90,
     spread_floor: float = 0.15,
 ) -> bool:
-    """Whether the coherence channel has collapsed and carries no information.
-    """
     if len(measurements) < 4:
         return False
     values = np.array([m.coherence for m in measurements], dtype=np.float64)
     return bool(np.median(values) >= median_floor
                 and (values.max() - values.min()) <= spread_floor + (1.0 - median_floor))
-
 
 def select_active_slots(
     readout: Dict[str, SlotReadout],
@@ -139,8 +107,6 @@ def select_active_slots(
     relative_margin: float = 0.75,
     weak_threshold: float = 0.20,
 ) -> Tuple[List[str], List[str]]:
-    """Competitive activation selection; returns ``(active, weak)``.
-    """
     scored = sorted(((r.activation, au) for au, r in readout.items()), reverse=True)
     if not scored:
         return [], []
@@ -159,20 +125,9 @@ def select_active_slots(
     return (sorted(active, key=lambda a: int(a[2:])),
             sorted(weak, key=lambda a: int(a[2:])))
 
-
-# ---------------------------------------------------------------------------
-# Learned encoder
-# ---------------------------------------------------------------------------
-
 if _TORCH:
 
     class SlotEncoder(nn.Module):
-        """Per-AU encoder with hard mask routing (eq. 4).
-
-        One small MLP per slot rather than a shared one: the slots describe
-        anatomically different things, and per-slot parameters are what make a slot's
-        read-out interpretable as *that AU's* evidence.
-        """
 
         def __init__(self, config: Optional[RepresentationConfig] = None) -> None:
             super().__init__()
@@ -184,7 +139,6 @@ if _TORCH:
             self.register_buffer("routing_mask", mask)
             self.register_buffer("region_counts", mask.sum(dim=1).clamp(min=1.0))
 
-            # 4 measurement channels (m, sin, cos, c) x n_roi, gated by the mask.
             in_dim = N_ROI * 4 + self.appearance_dim
             self.encoders = nn.ModuleList([
                 nn.Sequential(
@@ -205,14 +159,8 @@ if _TORCH:
             appearance: Optional["torch.Tensor"] = None,
             slot_dropout: float = 0.0,
         ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
-            """``(B, n_roi, 4) -> slots (B, K, d_a), activations (B, K), observed (B, K)``.
-
-            ``slot_dropout`` marks slots as *unobserved* (not zeroed): the same operation
-            ``mask()`` performs at inference, so the inference-time masking stays inside
-            the training distribution (appendix B.2).
-            """
             batch = measurements.shape[0]
-            flat = measurements.reshape(batch, -1)                       # (B, n_roi*4)
+            flat = measurements.reshape(batch, -1)
             if appearance is None:
                 appearance = measurements.new_zeros((batch, K_SLOTS, self.appearance_dim))
 
@@ -222,7 +170,7 @@ if _TORCH:
 
             slots, activations = [], []
             for k in range(K_SLOTS):
-                gate = self.routing_mask[k].repeat_interleave(4).unsqueeze(0)  # (1, n_roi*4)
+                gate = self.routing_mask[k].repeat_interleave(4).unsqueeze(0)
                 routed = flat * gate
                 encoded = self.encoders[k](torch.cat([routed, appearance[:, k]], dim=-1))
                 encoded = encoded * observed[:, k : k + 1]
@@ -231,15 +179,14 @@ if _TORCH:
                     (encoded * self.readout[k]).sum(-1) + self.readout_bias[k]
                 )
 
-            slot_tensor = torch.stack(slots, dim=1)                       # (B, K, d_a)
-            activation = torch.sigmoid(torch.stack(activations, dim=1))   # (B, K)
+            slot_tensor = torch.stack(slots, dim=1)
+            activation = torch.sigmoid(torch.stack(activations, dim=1))
             return slot_tensor, activation * observed, observed
 
         @torch.no_grad()
         def encode_frame(
             self, measurement_matrix: np.ndarray, appearance: Optional[np.ndarray] = None
         ) -> Tuple[np.ndarray, Dict[str, float]]:
-            """Single-frame convenience wrapper returning numpy + a named activation dict."""
             self.eval()
             tensor = torch.from_numpy(np.asarray(measurement_matrix, dtype=np.float32))[None]
             appearance_tensor = (
@@ -252,10 +199,9 @@ if _TORCH:
                 {au: float(activation[0, SLOT_INDEX[au]]) for au in SLOT_AUS},
             )
 
-else:  # pragma: no cover - torch missing
+else:
 
-    class SlotEncoder:  # type: ignore[no-redef]
-        """Placeholder raising a clear error when torch is absent."""
+    class SlotEncoder:
 
         def __init__(self, *_args, **_kwargs) -> None:
             raise ImportError(
@@ -263,18 +209,7 @@ else:  # pragma: no cover - torch missing
                 "(analytic_slot_readout / SlotBank) works without it."
             )
 
-
-# ---------------------------------------------------------------------------
-# Slot bank -- trajectory storage over a video
-# ---------------------------------------------------------------------------
-
-
 class SlotBank:
-    """Per-video slot activation trajectories, the input to the AU dynamic graph.
-
-    Node phases, rise/decay slopes and the lagged cross-correlations of appendix C.5 are
-    all read off these trajectories, so this is the object the A-Agent reasons over.
-    """
 
     def __init__(self, video_id: str, fps: float = 30.0) -> None:
         self.video_id = video_id
@@ -296,7 +231,6 @@ class SlotBank:
 
     def trajectory(self, au: str, t_on: Optional[int] = None,
                    t_off: Optional[int] = None) -> np.ndarray:
-        """``sigma_hat_{k,t}`` over an interval (inclusive), as a 1-D array."""
         series = self._activations.get(au, [])
         if not series:
             return np.zeros(0, dtype=np.float32)
@@ -307,13 +241,11 @@ class SlotBank:
         return np.asarray(series[lo:hi], dtype=np.float32)
 
     def matrix(self, t_on: Optional[int] = None, t_off: Optional[int] = None) -> np.ndarray:
-        """``(T, K)`` activation matrix -- ``A^obs`` for score/rollout/compare."""
         return np.stack(
             [self.trajectory(au, t_on, t_off) for au in SLOT_AUS], axis=-1
         ) if self.frames else np.zeros((0, K_SLOTS), dtype=np.float32)
 
     def vectors(self, t_on: int, t_off: int) -> np.ndarray:
-        """``(T, K, d_a)`` slot vectors over an interval, when they were stored."""
         rows = [self._vectors[t] for t in range(t_on, t_off + 1) if t in self._vectors]
         return np.stack(rows) if rows else np.zeros((0, K_SLOTS, 0), dtype=np.float32)
 
@@ -327,7 +259,6 @@ class SlotBank:
                 if idx < len(self._activations[au]) and self._activations[au][idx] >= threshold]
 
     def _locate(self, t: int) -> int:
-        """Index of frame ``t``; falls back to the nearest earlier frame."""
         if not self.frames:
             return 0
         import bisect
@@ -343,20 +274,12 @@ class SlotBank:
             "peaks": {au: round(self.peak(au), 4) for au in SLOT_AUS},
         }
 
-
 def phase_profile(
     trajectory: np.ndarray,
     frames: Sequence[int],
     hi: float = 0.5,
     lo: float = 0.25,
 ) -> Optional[Tuple[int, int, int, float, float, float]]:
-    """``(t_on, t_apex, t_off, peak, rise_slope, decay_slope)`` -- ``Phi_j(k)`` of C.5.
-
-    Onset and offset come from a two-threshold hysteresis on the activation trajectory
-    (same rule shape as the proposal detector, one level down), and the slopes are
-    linear fits on the rising and falling segments.  ``kappa_rise`` is what rule
-    C.4(iii) tests to tell a transient micro-expression from a slow social ramp.
-    """
     if trajectory.size == 0 or len(frames) != trajectory.size:
         return None
     peak_idx = int(np.argmax(trajectory))
@@ -382,7 +305,6 @@ def phase_profile(
         _slope(trajectory[start : peak_idx + 1]),
         _slope(trajectory[peak_idx : end + 1]),
     )
-
 
 __all__ = [
     "build_routing_mask", "ROUTING_MASK", "slot_region_counts", "SlotReadout",

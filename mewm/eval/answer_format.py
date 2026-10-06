@@ -1,24 +1,11 @@
-"""Output format for the final answer.
-
-**Paper-internal citations.** "appendix C.4", "eq. (10)", "gate rule R5". These identify
-where a rule is written down, which is meaningless to anyone not holding the manuscript,
-and they say nothing about the face.
-
-**Implementation internals.** How optical flow was stored, which agent phase failed to
-parse, what a token regulator admitted. These describe the machinery, not the finding.
-"""
-
+"""Answer formatting and serialisation helpers for eval output."""
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence, Tuple
 
-# ---------------------------------------------------------------------------
-# Forbidden vocabulary
-# ---------------------------------------------------------------------------
 
-#: Paper-internal cross-references.
 CITATION_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\bappendix\s+[A-Z](?:\.\d+)*", re.IGNORECASE),
     re.compile(r"\beq(?:uation)?\.?\s*\(\s*\d+\s*\)", re.IGNORECASE),
@@ -29,7 +16,6 @@ CITATION_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\bproposition\s+[A-Z]\.\d", re.IGNORECASE),
 )
 
-#: Implementation detail that describes the machinery rather than the face.
 INTERNAL_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"HSV[- ]rendered|HSV image|raw vector field", re.IGNORECASE),
     re.compile(r"\boptical flow (?:is|was) read back", re.IGNORECASE),
@@ -46,7 +32,6 @@ INTERNAL_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\bcompetitive ranking\b|\bpre-selection\b", re.IGNORECASE),
 )
 
-#: Sections that must appear, in this order. Matching is on the leading marker text.
 REQUIRED_SECTIONS: Tuple[Tuple[str, str], ...] = (
     ("count", "This video contains"),
     ("localisation", "micro-expression: frames"),
@@ -62,7 +47,6 @@ REQUIRED_SECTIONS: Tuple[Tuple[str, str], ...] = (
     ("au_cot", "AU-change CoT:"),
 )
 
-#: Sections allowed but not required (they depend on what was found).
 OPTIONAL_SECTIONS: Tuple[str, ...] = (
     "Confidence band", "Suppression", "Reliability",
 )
@@ -70,8 +54,6 @@ OPTIONAL_SECTIONS: Tuple[str, ...] = (
 
 @dataclass
 class FormatReport:
-    """Outcome of validating one composed answer."""
-
     ok: bool = True
     citations: List[str] = field(default_factory=list)
     internals: List[str] = field(default_factory=list)
@@ -95,7 +77,6 @@ class FormatReport:
 
 
 def validate_answer(text: str, require_sections: bool = True) -> FormatReport:
-    """Check a composed answer against the output contract."""
     report = FormatReport()
     if not text:
         report.ok = False
@@ -110,7 +91,6 @@ def validate_answer(text: str, require_sections: bool = True) -> FormatReport:
             report.internals.extend(sorted({str(f) for f in found})[:3])
 
     if require_sections:
-        # "0 micro-expression events" is a legitimate answer with no per-event sections.
         detected = "This video contains 0 micro-expression" not in text
         positions: List[Tuple[str, int]] = []
         for name, marker in REQUIRED_SECTIONS:
@@ -133,13 +113,6 @@ def validate_answer(text: str, require_sections: bool = True) -> FormatReport:
 
 
 def scrub(text: str) -> str:
-    """Remove forbidden vocabulary from a model-authored fragment.
-
-    Applied to prose the agents wrote (static and dynamic descriptions), which is where
-    citations leak in: the role files quote rule names, and models echo them back. The
-    composer's own sentences do not need scrubbing -- they are written not to contain
-    these in the first place.
-    """
     if not text:
         return text
     cleaned = text
@@ -147,7 +120,6 @@ def scrub(text: str) -> str:
         cleaned = pattern.sub("", cleaned)
     for pattern in INTERNAL_PATTERNS:
         cleaned = pattern.sub("", cleaned)
-    # Tidy the punctuation the removals leave behind.
     cleaned = re.sub(r"\(\s*[,;]?\s*\)", "", cleaned)
     cleaned = re.sub(r"\s+([,.;])", r"\1", cleaned)
     cleaned = re.sub(r"([,;])\s*([,.;])", r"\2", cleaned)

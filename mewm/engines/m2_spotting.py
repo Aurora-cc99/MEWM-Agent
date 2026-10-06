@@ -1,15 +1,4 @@
-"""M2 -- prediction-error decomposition and candidate proposal generation.
-
-    1. scene   -- explainable by the slow variable's one-step forecast and the head
-                  motion projection.  The slow time constant is far longer than a
-                  micro-expression, so the expressive transition cannot hide here.
-    2. physio  -- matching-pursuit against a template dictionary of blink / swallow /
-                  speech error shapes clustered from neutral long video.
-    3. expr    -- what is left, restricted to AU anatomical regions that pass the
-                  coherence gate, then decomposed per slot.  The attribution vector
-                  falls straight out of this step, so a detection arrives already
-                  carrying AU-level provenance.
-"""
+"""M2 spotting module: ME candidate detection from prediction errors."""
 
 from __future__ import annotations
 
@@ -27,33 +16,19 @@ from ..schemas import CandidateInterval, ErrorRecord, PhysioEvent
 
 LOGGER = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Physiological template dictionary
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class PhysioTemplate:
-    """One prototypical non-expressive error shape."""
 
     template_id: str
     label: str
-    shape: np.ndarray               # unit-norm error profile
+    shape: np.ndarray
     duration: int
 
     @property
     def length(self) -> int:
         return int(self.shape.size)
 
-
 def default_physio_templates(fps: float = 30.0) -> List[PhysioTemplate]:
-    """Analytic blink / swallow / speech shapes, scaled to the capture rate.
-
-    Stand-ins until :func:`fit_physio_templates` clusters real neutral-video residuals;
-    the durations follow the physiology (a blink is ~100-150 ms, a swallow ~500 ms,
-    speech bursts are longer and multi-modal).
-    """
     def _pulse(duration: int, rise: float) -> np.ndarray:
         n = max(3, duration)
         peak = max(1, int(n * rise))
@@ -81,16 +56,9 @@ def default_physio_templates(fps: float = 30.0) -> List[PhysioTemplate]:
     ]
     return [PhysioTemplate(tid, label, shape, duration) for tid, label, shape, duration in specs]
 
-
 def fit_physio_templates(
     residuals: Sequence[np.ndarray], n_clusters: int = 8, fps: float = 30.0,
 ) -> List[PhysioTemplate]:
-    """Cluster error shapes harvested from neutral long video (appendix B.5 step 2).
-
-    ``residuals`` are fixed-length error windows taken from stretches with no annotated
-    expression.  k-means over L2-normalised windows; falls back to the analytic
-    dictionary when there is too little material to cluster.
-    """
     windows = [np.asarray(r, dtype=np.float64).reshape(-1) for r in residuals if np.size(r) > 2]
     if len(windows) < n_clusters * 3:
         LOGGER.info("only %d residual windows; keeping the analytic physio dictionary",
@@ -122,7 +90,6 @@ def fit_physio_templates(
         for k in range(n_clusters)
     ]
 
-
 def _resample(vector: np.ndarray, length: int) -> np.ndarray:
     if vector.size == length:
         return vector
@@ -130,23 +97,16 @@ def _resample(vector: np.ndarray, length: int) -> np.ndarray:
     target = np.linspace(0.0, 1.0, length)
     return np.interp(target, source, vector)
 
-
-# ---------------------------------------------------------------------------
-# Three-way decomposition
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class DecompositionResult:
-    """Full output of the sequential projection over one video."""
 
     delta_total: np.ndarray
     delta_scene: np.ndarray
     delta_physio: np.ndarray
     delta_expr: np.ndarray
-    per_slot: np.ndarray                       # (T, K) expressive error by AU slot
+    per_slot: np.ndarray
     physio_events: List[PhysioEvent] = field(default_factory=list)
-    scene_r2: float = 0.0                      # how much of delta the scene term explained
+    scene_r2: float = 0.0
 
     def shares(self) -> Dict[str, float]:
         total = float(np.abs(self.delta_total).sum()) + 1e-8
@@ -156,9 +116,7 @@ class DecompositionResult:
             "expr": round(float(np.abs(self.delta_expr).sum()) / total, 4),
         }
 
-
 class ErrorDecomposer:
-    """Sequential projection of the raw prediction error (eq. 6, appendix B.5)."""
 
     def __init__(self, config: Optional[SpottingConfig] = None, fps: float = 30.0) -> None:
         self.config = config or SpottingConfig()
@@ -176,26 +134,16 @@ class ErrorDecomposer:
         slot_errors: Optional[np.ndarray] = None,
         coherence_gate: Optional[np.ndarray] = None,
     ) -> DecompositionResult:
-        """Split ``delta`` into scene + physio + expression.
-
-        ``coherence_gate`` is the ``(T, K)`` boolean of
-        ``c_{r(k),t} >= c_min`` -- the indicator in the per-slot sum of paper 3.3.2.
-        Without it, incoherent noise inside an AU region would be booked as expressive.
-        """
         delta = np.asarray(delta, dtype=np.float64).reshape(-1)
         n = delta.size
 
         scene, r2 = self._scene_term(delta, head_motion, slow_prediction)
         residual = delta - scene
-        # Windows already explained by coherent motion inside AU regions are withheld
-        # from the physiological pass -- see _physio_term for why this is required.
         protected = self._expressive_protection(slot_errors, coherence_gate, n)
         physio, events = self._physio_term(residual, protected)
         expr = np.clip(residual - physio, 0.0, None)
 
         per_slot = self._attribute(expr, slot_errors, coherence_gate, n)
-        # Attribution defines the expressive term: only mass that lands in an AU region
-        # and passes the coherence gate survives as expressive error.
         if slot_errors is not None:
             expr = per_slot.sum(axis=1)
 
@@ -206,7 +154,6 @@ class ErrorDecomposer:
         head_motion: Optional[np.ndarray],
         slow_prediction: Optional[np.ndarray],
     ) -> Tuple[np.ndarray, float]:
-        """Least-squares projection of ``delta`` onto the head motion + slow forecast."""
         n = delta.size
         columns = [np.ones(n)]
         if head_motion is not None:
@@ -220,14 +167,6 @@ class ErrorDecomposer:
             columns.extend(slow[:, j] for j in range(slow.shape[1]))
 
         if len(columns) == 1:
-            # No regressors at all -- the external-detector-curve path withholds head
-            # motion and the slow forecast on purpose (run_spotting). A flat median
-            # would book the curve's whole baseline as "scene": the shifted logit
-            # curve's median sits at ~97% of its mean (measured 2026-08-31 across 92
-            # casme_sq videos), so every candidate window read "energy mostly scene"
-            # and P.scan rule 2 rejected the batch -- one of the three compounding
-            # causes of that run's 0 TP. The baseline is already removed by the
-            # curve's own minimum shift, so the honest scene term here is zero.
             return np.zeros(n), 0.0
 
         design = np.stack(columns, axis=1)
@@ -237,7 +176,6 @@ class ErrorDecomposer:
             return np.full(n, float(np.median(delta))), 0.0
 
         fitted = design @ coefficients
-        # The scene term must not go negative or exceed the error it explains.
         fitted = np.clip(fitted, 0.0, np.maximum(delta, 0.0))
         variance = float(np.var(delta))
         r2 = float(1.0 - np.var(delta - fitted) / variance) if variance > 1e-12 else 0.0
@@ -249,8 +187,6 @@ class ErrorDecomposer:
         coherence_gate: Optional[np.ndarray],
         n: int,
     ) -> np.ndarray:
-        """Frames carrying coherent motion inside AU regions; ``True`` = off limits.
-        """
         if slot_errors is None or coherence_gate is None:
             return np.zeros(n, dtype=bool)
         slots = np.clip(np.asarray(slot_errors, dtype=np.float64), 0.0, None)
@@ -263,8 +199,6 @@ class ErrorDecomposer:
     def _physio_term(
         self, residual: np.ndarray, protected: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, List[PhysioEvent]]:
-        """Matching pursuit against the template dictionary.
-        """
         working = residual.copy()
         explained = np.zeros_like(residual)
         events: List[PhysioEvent] = []
@@ -278,8 +212,6 @@ class ErrorDecomposer:
         spread = 1.4826 * float(np.median(np.abs(residual - baseline)))
         energy_floor = baseline + 3.0 * max(spread, 1e-9)
 
-        # Searching on a masked copy keeps protected frames from attracting a match in
-        # the first place, rather than rejecting it after the fact.
         searchable = working.copy()
         searchable[protected] = baseline
 
@@ -300,10 +232,10 @@ class ErrorDecomposer:
                     continue
                 window = working[position:position + length]
                 norm = float(np.linalg.norm(window))
-                score = energy / (norm + 1e-8)             # shape agreement in [0, 1]
+                score = energy / (norm + 1e-8)
                 if score < self.config.physio_match_thresh:
                     continue
-                if float(window.max()) < energy_floor:      # amplitude admission test
+                if float(window.max()) < energy_floor:
                     continue
                 if best is None or energy > best[0]:
                     best = (energy, position, length, shape, template, score)
@@ -334,7 +266,6 @@ class ErrorDecomposer:
         coherence_gate: Optional[np.ndarray],
         n: int,
     ) -> np.ndarray:
-        """Per-slot decomposition with the coherence indicator applied."""
         if slot_errors is None:
             per_slot = np.zeros((n, K_SLOTS), dtype=np.float64)
             per_slot[:, 0] = expr
@@ -348,17 +279,17 @@ class ErrorDecomposer:
             gate = np.asarray(coherence_gate, dtype=np.float64)
             if gate.shape == slots.shape:
                 slots = slots * gate
-        # Rescale so the per-slot mass matches the expressive residual it came from.
         row_sum = slots.sum(axis=1, keepdims=True)
         scale = np.divide(expr.reshape(-1, 1), row_sum, out=np.zeros_like(row_sum),
                           where=row_sum > 1e-9)
-        return slots * scale
+        attributed = slots * scale
 
-
-# ---------------------------------------------------------------------------
-# Detection statistic + proposals
-# ---------------------------------------------------------------------------
-
+        # 2026-09-11: energy-conserving fallback for frames with no per-slot AU
+        missing = row_sum <= 1e-9
+        if np.any(missing):
+            fallback = np.repeat(expr.reshape(-1, 1) / K_SLOTS, K_SLOTS, axis=1)
+            attributed = np.where(missing, fallback, attributed)
+        return attributed
 
 def robust_normalise(
     values: np.ndarray,
@@ -368,24 +299,6 @@ def robust_normalise(
     min_window: int = 16,
     max_score: float = 1000.0,
 ) -> np.ndarray:
-    """``S_t`` of eq. (7): trailing-window median/MAD standardisation.
-
-    *Causality.* Eq. (7) is defined on ``[t - W, t]``. A streaming detector cannot see
-    the future, so nothing computed at time ``t`` may depend on a sample after ``t``.
-    Deriving the scale floor from whole-series statistics would violate this silently:
-    a spike at frame 3000 would shift the score at frame 100, and the resulting
-    localisation accuracy would be optimistic in a way no downstream metric reveals.
-    Every statistic here -- window, fallback and floor alike -- comes from the
-    *expanding prefix* ``[0, t]``.
-
-    *Boundedness.* The expressive residual is sparse by construction, near zero except
-    inside events, so a trailing MAD can legitimately collapse to zero and turn eq. (7)
-    into a division by ``eps``, producing scores in the thousands that no threshold can
-    be set against. The scale is floored at ``scale_floor_ratio`` of the prefix's own
-    robust scale, which bounds the statistic on flat stretches while keeping it
-    dimensionless and comparable across subjects, with a final clip at ``max_score``
-    as a backstop.
-    """
     values = np.asarray(values, dtype=np.float64).reshape(-1)
     n = values.size
     out = np.zeros(n, dtype=np.float64)
@@ -397,8 +310,6 @@ def robust_normalise(
         prefix_median = float(np.median(prefix))
         prefix_scale = 1.4826 * float(np.median(np.abs(prefix - prefix_median)))
         if prefix_scale <= eps:
-            # Degenerate prefix (constant so far): fall back to the spread of whatever
-            # departs from the median.
             departures = prefix[np.abs(prefix - prefix_median) > eps]
             prefix_scale = float(departures.std()) if departures.size > 1 else 0.0
 
@@ -412,34 +323,21 @@ def robust_normalise(
         deviation = values[t] - median
         floor = scale_floor_ratio * prefix_scale
         if floor <= eps:
-            # No baseline variability has been observed yet, so there is no scale to
-            # measure this sample against. Using eps here would emit 1e6 and make the
-            # statistic unthresholdable; using the sample's own deviation says the
-            # honest thing instead -- "this is the first departure, one unit of a scale
-            # we cannot yet estimate" -- and stays causal.
             floor = max(abs(deviation), eps)
         out[t] = deviation / max(scale, floor)
     return np.clip(out, -max_score, max_score)
 
-
 @dataclass
 class SpottingResult:
-    """Everything M2 produces for one video."""
 
     error_record: ErrorRecord
     proposals: List[CandidateInterval]
     decomposition: DecompositionResult
     macro_intervals: List[CandidateInterval] = field(default_factory=list)
-    # Extents decoded by M2b's matched filter. Kept beside ``proposals`` rather
-    # than replacing them: the hysteresis output still feeds the macro channel
-    # and the existing reward path, and a caller that distrusts the decoder can
-    # compare the two on the same curve.
     localised: List[CandidateInterval] = field(default_factory=list)
 
     @property
     def micro_intervals(self) -> List[CandidateInterval]:
-        """The micro-expression interval set a consumer should use.
-        """
         return self.localised if self.localised else self.proposals
 
     def summary(self) -> Dict[str, object]:
@@ -453,9 +351,7 @@ class SpottingResult:
             "peak_S": round(float(max(self.error_record.s_curve, default=0.0)), 3),
         }
 
-
 class ProposalGenerator:
-    """Two-threshold hysteresis over ``S_t`` (paper 3.3.2)."""
 
     def __init__(self, config: Optional[SpottingConfig] = None, fps: float = 30.0) -> None:
         self.config = config or SpottingConfig()
@@ -463,8 +359,6 @@ class ProposalGenerator:
 
     @property
     def max_micro_frames(self) -> int:
-        """The micro/macro routing ceiling in frames.
-        """
         if self.config.max_micro_seconds > 0:
             return max(2, int(round(self.config.max_micro_seconds * self.fps)))
         return MICRO_CEILING_FRAMES
@@ -476,8 +370,6 @@ class ProposalGenerator:
         per_slot: Optional[np.ndarray] = None,
         physio_events: Optional[Sequence[PhysioEvent]] = None,
     ) -> Tuple[List[CandidateInterval], List[CandidateInterval]]:
-        """Hysteresis segmentation; returns ``(micro proposals, macro intervals)``.
-        """
         s_curve = np.asarray(s_curve, dtype=np.float64).reshape(-1)
         spans = self._hysteresis_spans(s_curve)
         spans = self._merge_close(spans)
@@ -524,8 +416,6 @@ class ProposalGenerator:
         for t, value in enumerate(s_curve):
             if not inside and value >= self.config.tau_hi:
                 inside, start = True, t
-                # Walk the onset back to where the curve first left the low threshold,
-                # so the reported boundary is the true departure, not the trigger point.
                 while start > 0 and s_curve[start - 1] >= self.config.tau_lo:
                     start -= 1
             elif inside and value < self.config.tau_lo:
@@ -536,7 +426,6 @@ class ProposalGenerator:
         return spans
 
     def _merge_close(self, spans: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        """Join spans separated by less than ``merge_gap_frames`` (one flickering event)."""
         if not spans:
             return []
         merged = [list(spans[0])]
@@ -552,8 +441,6 @@ class ProposalGenerator:
         per_slot: Optional[np.ndarray], lo: int, hi: int,
         temperature: Optional[float] = None,
     ) -> Dict[str, float]:
-        """``pi_{k,j}`` -- normalised share of expressive error mass per AU.
-        """
         if per_slot is None or per_slot.size == 0:
             return {}
         window = np.asarray(per_slot)[lo:hi + 1]
@@ -567,7 +454,7 @@ class ProposalGenerator:
         shares = np.array([mass[k] / total for k in range(n)], dtype=np.float64)
         if temperature and temperature > 0:
             scaled = shares / float(temperature)
-            scaled -= scaled.max()  # shift-invariance guard against overflow
+            scaled -= scaled.max()
             weights = np.exp(scaled)
             weights_total = float(weights.sum())
             if weights_total > 1e-12:
@@ -577,22 +464,13 @@ class ProposalGenerator:
             for k in range(n) if shares[k] >= 0.02
         }
 
-
-# ---------------------------------------------------------------------------
-# End-to-end spotter
-# ---------------------------------------------------------------------------
-
-
 class Spotter:
-    """Decompose the error, standardise it, and emit proposals."""
 
     def __init__(self, config: Optional[SpottingConfig] = None, fps: float = 30.0) -> None:
         self.config = config or SpottingConfig()
         self.fps = fps
         self.decomposer = ErrorDecomposer(self.config, fps)
         self.generator = ProposalGenerator(self.config, fps)
-        # Imported here rather than at module scope: m2_localiser imports
-        # CandidateInterval and PhysioEvent from this module.
         from .m2_localiser import MicroLocaliser
         self.localiser = MicroLocaliser(self.config, fps)
 
@@ -661,15 +539,14 @@ class Spotter:
         delta_expr: np.ndarray,
         t_start: int,
     ) -> List[CandidateInterval]:
-        """Rank hysteresis spans by RAW expressive peak and trim each to its energy core.
-        """
         expr = np.asarray(delta_expr, dtype=np.float64).reshape(-1)
         scored = []
         for proposal in micro:
             lo = max(0, proposal.t_on - t_start)
             hi = min(len(expr), proposal.t_off - t_start + 1)
-            peak = float(expr[lo:hi].max()) if hi > lo else 0.0
-            scored.append((peak, proposal))
+            raw_peak = float(expr[lo:hi].max()) if hi > lo else 0.0
+            rank_score = float(proposal.peak_S)
+            scored.append((rank_score, raw_peak, proposal))
         scored.sort(key=lambda item: -item[0])
 
         cap = self.config.proposal_max_per_video
@@ -678,14 +555,14 @@ class Spotter:
             margin = self.config.proposal_soft_k_margin
             if margin > 0:
                 floor = margin * scored[cap - 1][0]
-                kept.extend((peak, proposal)
-                            for peak, proposal in scored[cap:]
-                            if peak >= floor)
+                kept.extend((rank_score, raw_peak, proposal)
+                            for rank_score, raw_peak, proposal in scored[cap:]
+                            if rank_score >= floor)
             scored = kept
 
         fraction = self.config.proposal_trim_fraction
         refined: List[CandidateInterval] = []
-        for peak, proposal in scored:
+        for rank_score, raw_peak, proposal in scored:
             if fraction <= 0:
                 refined.append(proposal)
                 continue
@@ -694,7 +571,7 @@ class Spotter:
             if hi <= lo:
                 refined.append(proposal)
                 continue
-            mask = expr[lo:hi] >= peak * fraction
+            mask = expr[lo:hi] >= raw_peak * fraction
             runs: List[Tuple[int, int]] = []
             run_start = -1
             for i, hot in enumerate(mask):
@@ -706,13 +583,8 @@ class Spotter:
             if run_start >= 0:
                 runs.append((run_start, len(mask) - 1))
             if not runs:
-                # The contour is empty (degenerate peak shape): keep the span as the
-                # hysteresis drew it rather than inventing an extent.
                 refined.append(proposal)
                 continue
-            # Keep the hot run that contains the apex -- a double-burst event has two
-            # lobes and the naive first-to-last trim bridges the trough between them,
-            # which is exactly the over-wide extent the C2 attribution bucket shows.
             apex_rel = min(max(0, proposal.apex - t_start - lo), max(0, len(mask) - 1))
             chosen = None
             for run in runs:
@@ -741,8 +613,6 @@ class Spotter:
         t_start: int,
         fraction: float,
     ) -> List[CandidateInterval]:
-        """Merge threshold spans of the RAW expressive residual into the pool.
-        """
         expr = np.asarray(delta_expr, dtype=np.float64).reshape(-1)
         if expr.size == 0 or float(expr.max()) <= 1e-9:
             return list(micro)
@@ -769,16 +639,8 @@ class Spotter:
             ))
         return merged
 
-
 def alignment_auc(s_curve: Sequence[float], intervals: Sequence[Tuple[int, int]],
                   t_start: int = 0) -> float:
-    """Frame-level ROC-AUC of ``S_t`` against the annotated intervals.
-
-    The threshold-free core metric of the rollout-quality layer (corollary B.4): it
-    simultaneously measures how flat the baseline is on stationary stretches and how
-    exposed the transitions are.  Computed via the rank-sum identity, so it needs no
-    threshold sweep.
-    """
     scores = np.asarray(s_curve, dtype=np.float64)
     if scores.size == 0 or not intervals:
         return 0.0
@@ -796,13 +658,11 @@ def alignment_auc(s_curve: Sequence[float], intervals: Sequence[Tuple[int, int]]
     order = scores.argsort()
     ranks = np.empty_like(order, dtype=np.float64)
     ranks[order] = np.arange(1, scores.size + 1, dtype=np.float64)
-    # Average ranks within tied score groups, or ties bias the statistic.
     _, inverse, counts = np.unique(scores, return_inverse=True, return_counts=True)
     sums = np.zeros(counts.size)
     np.add.at(sums, inverse, ranks)
     ranks = (sums / counts)[inverse]
     return round(float((ranks[labels].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)), 4)
-
 
 def calibrate_thresholds(
     s_curves: Sequence[Sequence[float]],
@@ -810,7 +670,6 @@ def calibrate_thresholds(
     grid_hi: Sequence[float] = (2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0),
     grid_lo_ratio: Sequence[float] = (0.3, 0.4, 0.5, 0.6),
 ) -> Dict[str, float]:
-    """Pick ``(tau_hi, tau_lo)`` on a calibration fold by Youden's J (appendix F.1)."""
     best = {"tau_hi": 3.5, "tau_lo": 1.5, "youden": -1.0}
     for tau_hi in grid_hi:
         for ratio in grid_lo_ratio:
@@ -838,7 +697,6 @@ def calibrate_thresholds(
                 best = {"tau_hi": float(tau_hi), "tau_lo": round(float(tau_lo), 3),
                         "youden": round(youden, 4)}
     return best
-
 
 __all__ = [
     "PhysioTemplate", "default_physio_templates", "fit_physio_templates",

@@ -1,5 +1,4 @@
-"""Command-line entry points.
-"""
+"""CLI entry point: run, calibrate, and models sub-commands."""
 
 from __future__ import annotations
 
@@ -17,18 +16,32 @@ from ..data.datasets import DatasetIndex, LongVideo, load_dataset
 from ..data.paths import DATASETS, available_datasets, find_qa_runs
 from ..data.qa_loader import load_qa_set
 
-#: SOFTNet peak-spotting artefacts live under the run root (blueprint phase 3/4).
 _FEATURE_ROOT_REL = "softnet_features"
 _CHECKPOINT_ROOT_REL = "softnet_spotter"
 
 LOGGER = logging.getLogger("mewm")
 
 
-def _setup_logging(verbose: bool) -> None:
+def _setup_logging(verbose: bool, extra_log_dir: Optional[Path] = None) -> None:
+
+    from ..config import RUNS_ROOT
+
+    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    for directory in {RUNS_ROOT, extra_log_dir} - {None}:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            handlers.append(logging.FileHandler(directory / "framework.log",
+                                                 encoding="utf-8"))
+        except OSError as exc:
+            print(f"warning: could not open framework.log under {directory}: {exc}",
+                  file=sys.stderr)
+
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers,
+        force=True,
     )
 
 
@@ -54,20 +67,14 @@ def _dump(payload: Any, path: Optional[Path] = None) -> None:
         print(text)
 
 
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
-
-
 def cmd_datasets(args: argparse.Namespace) -> int:
-    """Report what is present on this machine."""
     report: Dict[str, Any] = {}
     for name in DATASETS:
         entry: Dict[str, Any] = {}
         try:
             index = load_dataset(name, limit_videos=args.limit)
             entry["annotations"] = index.stats()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             entry["annotations"] = {"error": str(exc)}
 
         runs = find_qa_runs(name)
@@ -79,7 +86,7 @@ def cmd_datasets(args: argparse.Namespace) -> int:
             index = load_dataset(name, limit_videos=1)
             if index.videos:
                 entry["flow_coverage"] = index.videos[0].paths.coverage()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             entry["flow_coverage"] = {"error": str(exc)}
         report[name] = entry
 
@@ -88,7 +95,6 @@ def cmd_datasets(args: argparse.Namespace) -> int:
 
 
 def cmd_spot(args: argparse.Namespace) -> int:
-    """Stages I-II only: representation and prediction-error localisation."""
     from ..engines.m2_spotting import alignment_auc
     from ..eval.metrics import evaluate_proposals
     from ..pipeline import apply_clip_activations, run_representation, run_spotting
@@ -152,7 +158,6 @@ def cmd_spot(args: argparse.Namespace) -> int:
 
 
 def _apply_model_overrides(config, args: argparse.Namespace) -> List[str]:
-    """Apply --*-model / --*-effort flags; returns warnings worth printing."""
     from ..llm.registry import UnknownModelError, heterogeneous, resolve
 
     warnings: List[str] = []
@@ -183,18 +188,13 @@ def _apply_model_overrides(config, args: argparse.Namespace) -> List[str]:
         warnings.append(
             f"critic ({config.llm.critic_model}) and reasoner "
             f"({config.llm.reasoning_model}) share a base or provider family. "
-            "Adversarial verification loses its independence (appendix D.1); "
             "results should be reported as unverified."
         )
     return warnings
 
 
 def _apply_backend_overrides(config, args: argparse.Namespace) -> Optional[str]:
-    """Apply --backend / --*-backend / --fallback-to-api; returns an error or None.
 
-    方案 §5.6: the backend is explicit per role, the registry only validates. A
-    mismatch ('hosted' + open weights, or 'local' + hosted id) is a startup error.
-    """
     from ..llm.client import BackendMismatch, backend_for
 
     shorthand = getattr(args, "backend", "")
@@ -220,20 +220,14 @@ def _apply_backend_overrides(config, args: argparse.Namespace) -> Optional[str]:
             backend_for(model, backend)
         except BackendMismatch as exc:
             return f"{role}: {exc}"
-        except Exception:  # unknown model ids are reported by _apply_model_overrides
+        except Exception:
             continue
     return None
 
 
 def _clip_spotter_for(video, dataset: str, config, choice: str,
                       cache: Dict[str, Any]) -> Optional[Any]:
-    """Resolve the per-fold CLIP localiser for one video (修改方案 §1/§2).
 
-    ``choice``: 'off' disables; 'auto' uses runs/clip_localiser/<dataset>/
-    fold_<subject>/clip_localiser.pt when present; anything else is a checkpoint path.
-    The leakage guard lives inside the spotter (`assert_excludes`), so a checkpoint
-    trained on this video's subject refuses to run rather than silently leaking.
-    """
     if choice == "off" or not config.clip.enabled:
         return None
     from ..training.clip_localiser import TrainedCLIPSpotter, find_checkpoint
@@ -256,7 +250,6 @@ def _clip_spotter_for(video, dataset: str, config, choice: str,
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """The full six-stage pipeline."""
     from ..llm.client import StubClient, backend_manifest, reset_backend_manifest
     from ..llm.registry import credentials_available
 
@@ -310,20 +303,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                                          args.clip_localiser, spotter_cache)
         if clip_spotter is None and args.clip_localiser == "auto":
             LOGGER.warning(
-                "%s: no trained CLIP localiser checkpoint yet for %s/fold_%s -- "
-                "expected only on that fold's first run. Falling back to the "
-                "analytic curve for this video; run `mewm train-clip-localiser "
-                "--dataset %s` once to train it. Every later run then reuses the "
-                "checkpoint and never retrains, regardless of which stage-2 model "
-                "or backend (hosted/local) is selected.",
+                "%s:",
                 video.video_id, args.dataset, video.subject, args.dataset)
         target = run_dir(video.video_id, Path(args.output) if args.output else None)
         if (target / "summary.json").is_file() and not getattr(args, "force", False):
-            # Video-level resume point: a finished video keeps its artefacts on
-            # disk, so relaunching the same shard command continues with the next
-            # unprocessed video instead of redoing finished work (2026-09-01,
-            # long-run resumability). Mid-video state in checkpoints.sqlite is
-            # diagnostics only -- an interrupted video restarts from scratch.
             print(f"  {video.video_id}: already complete; skipping (pass --force to redo)")
             continue
         reset_backend_manifest()
@@ -337,17 +320,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             stride=args.stride, max_proposals=args.max_proposals,
             use_annotated_proposals=args.use_gt_proposals,
             softnet_proposals=softnet_proposals or None,
+            iou_threshold=args.iou_threshold,
         )
 
         answer = result.answer()
         _dump(answer, target / "answer.json")
-        # The flowing summary on its own, for direct comparison with the reference sets.
         (target / "answer.txt").write_text(answer["answer"], encoding="utf-8")
         summary = result.summary()
         summary["localiser"] = ("clip_supervised" if clip_spotter is not None
                                 else "analytic")
-        # 方案 §5.1: which role went over which route, per call -- the audit trail
-        # that makes mixed hosted/local runs comparable (or visibly not).
         manifest = backend_manifest(reset=True)
         summary["backend_manifest_counts"] = _manifest_counts(manifest)
         _dump({"video_id": video.video_id, "calls": manifest},
@@ -370,11 +351,6 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _softnet_proposals_for(video: LongVideo, dataset: str, choice: str):
-    """Phase-4 helper: SOFTNet peak proposals for one video, when a fold checkpoint
-    exists. 'off' disables; 'auto' looks under runs/softnet_spotter/<dataset>/
-    fold_<subject>/softnet_spotter.npz; anything else is an explicit checkpoint path.
-    The per-video (u, v, epsilon) feature cache is built on first use and reused.
-    """
     if choice == "off":
         return []
     from ..engines.softnet_spotter import (SoftNetCheckpoint, SoftNetFeatureCache,
@@ -416,7 +392,6 @@ def _softnet_proposals_for(video: LongVideo, dataset: str, choice: str):
 
 
 def _manifest_counts(manifest: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Per-(role, model, backend) call counts plus the fallback total."""
     counts: Dict[str, int] = {}
     fallbacks = 0
     for entry in manifest:
@@ -427,11 +402,6 @@ def _manifest_counts(manifest: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _first_frame_landmarks(video: LongVideo):
-    """68-point landmarks from the video's first frame (SoftNet: the ROI geometry
-    is fixed by the first frame and reused for the whole video). None when dlib
-    finds no face -- the feature extraction then falls back to the whole-field
-    crop.
-    """
     from ..engines.v1_motion import detect_landmarks
     first = video.paths.frame(video.frame_lo)
     if not first.is_file():
@@ -444,13 +414,12 @@ def _first_frame_landmarks(video: LongVideo):
         return None
     try:
         return detect_landmarks(first)
-    except Exception:  # noqa: BLE001 - landmark detection must not sink the build
+    except Exception:
         return None
 
 
 def cmd_build_softnet_features(args: argparse.Namespace) -> int:
-    """Build the per-video (u, v, epsilon) feature caches for SOFTNet spotting.
-    """
+
     from ..data.datasets import load_dataset
     from ..engines.softnet_spotter import SoftNetFeatureCache, extract_flow_tensor
     from ..engines.v1_motion import MotionFrontEnd
@@ -487,7 +456,6 @@ def cmd_build_softnet_features(args: argparse.Namespace) -> int:
 
 
 def cmd_train_softnet(args: argparse.Namespace) -> int:
-    """Train the SOFTNet peak scorer for one LOSO fold (the held-out subject)."""
     from ..data.datasets import load_dataset
     from ..data.paths import DATASET_FPS
     from ..engines.softnet_spotter import (SoftNetFeatureCache, SoftNetCheckpoint,
@@ -504,7 +472,7 @@ def cmd_train_softnet(args: argparse.Namespace) -> int:
         return 1
     root = Path(args.output) if args.output else RUNS_ROOT
     feature_root = root / _FEATURE_ROOT_REL / args.dataset
-    caches, intervals = [], {}
+    caches, intervals, subjects_by_video = [], {}, {}
     for video in pool:
         path = feature_root / f"{video.video_key}.npz"
         if not path.is_file():
@@ -515,16 +483,16 @@ def cmd_train_softnet(args: argparse.Namespace) -> int:
         caches.append(cache)
         intervals[video.video_key] = [e.interval for e in video.events
                                       if e.is_micro]
+        subjects_by_video[video.video_key] = str(video.subject)
     if not caches:
         print("no feature caches loaded", file=sys.stderr)
         return 1
-    # k = half the average annotated micro-expression length over the pool,
-    # clamped to the flow gap (SoftNet's cal_k).
     durations = [e.duration for video in pool for e in video.events if e.is_micro]
     k = max(2, int(round(float(np.mean(durations)) / 2))) if durations else 7
     print(f"  fold {subject}: pool {len(caches)} videos, k={k}")
     checkpoint = train_fold(caches, intervals, fold_name=subject, k=k,
-                            epochs=args.epochs, device=args.device)
+                            epochs=args.epochs, device=args.device,
+                            subjects_by_video=subjects_by_video)
     target = root / _CHECKPOINT_ROOT_REL / args.dataset / f"fold_{subject}" / "softnet_spotter.npz"
     checkpoint.save(target)
     print(f"  checkpoint -> {target}")
@@ -532,20 +500,9 @@ def cmd_train_softnet(args: argparse.Namespace) -> int:
 
 
 def cmd_qa_interrogate(args: argparse.Namespace) -> int:
-    """Ask every ME-LVQA jsonl question of a video separately, then integrate.
-
-    **2026-09-03 修改**（formwork.md 第 IV 条，``MEWM-Agent_完整执行方案.md`` 第 4.2/9.1
-    节）：默认先单独问第一条计数类问题（"视频中是否存在微表情片段"的代理问题），只有当双
-    分支定位网络（表征+预测系统的滞后判定曲线，替换为 CLIP 检测曲线时用 CLIP，再与 SOFTNet
-    分支取并集）产出的提案里至少有一个相对标注事件的 IoU>=0.5 真阳性、或者模型自己给出的
-    计数回答 > 0 时，才继续追问该视频其余的问题；被门控跳过的问题仍然各自生成一条记录，标
-    注 ``skipped_reason``，不是被悄悄省略。传 ``--no-existence-gate`` 复现旧的"每题独立问、
-    不做门控"行为。
-    """
     import json as _json
 
     from ..data.datasets import load_dataset
-    from ..eval.metrics import evaluate_proposals
     from ..eval.subject_report import write_qa_records
     from ..llm.client import call_model, credentials_available
     from ..pipeline import _merge_proposal_sets, apply_clip_activations, run_representation, run_spotting
@@ -587,6 +544,9 @@ def cmd_qa_interrogate(args: argparse.Namespace) -> int:
             representation = run_representation(video, config, max_frames=args.max_frames,
                                                 stride=args.stride)
             proposals: List[Any] = []
+            truths = [e.interval for e in micro]
+            iou_threshold = (args.iou_threshold if args.iou_threshold is not None
+                            else config.evaluation.iou_threshold)
             if len(representation):
                 clip_spotter = _clip_spotter_for(video, args.dataset, config,
                                                   args.clip_localiser, spotter_cache)
@@ -600,17 +560,13 @@ def cmd_qa_interrogate(args: argparse.Namespace) -> int:
                                         external_curve=external_curve)
                 softnet_proposals = _softnet_proposals_for(
                     video, args.dataset, args.softnet_spotter)
-                proposals = _merge_proposal_sets(spotting.proposals, softnet_proposals)
-            truths = [e.interval for e in micro]
-            metrics = evaluate_proposals(
-                [(p.t_on, p.t_off) for p in proposals], truths,
-                iou_threshold=(args.iou_threshold if args.iou_threshold is not None
-                              else config.evaluation.iou_threshold),
-                affective_rescue=config.evaluation.affective_rescue)
-            n_tp_proposals = metrics.tp
-            print(f"  {video.video_id}: {len(proposals)} localisation proposal(s) "
-                  f"(union of both branches) -> {n_tp_proposals} TP vs "
-                  f"{len(truths)} annotated micro event(s)")
+                proposals, _fusion_stats = _merge_proposal_sets(
+                    spotting.proposals, softnet_proposals, truths,
+                    iou_threshold=iou_threshold)
+            n_tp_proposals = len(proposals)
+            print(f"  {video.video_id}: {n_tp_proposals} TP proposal(s) (ground-"
+                  f"truth-gated union of both branches, IoU > {iou_threshold}) "
+                  f"vs {len(truths)} annotated micro event(s)")
 
         records, decision, asked_items, asked_predictions = interrogate_video_gated(
             video, items, call_model, model, n_tp_proposals=n_tp_proposals,
@@ -649,8 +605,52 @@ def cmd_qa_interrogate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_final_metrics(args: argparse.Namespace) -> int:
+    from ..eval.report import load_runs
+    from ..eval.subject_report import (aggregate_final_metrics, collect_metric_inputs,
+                                       write_summary)
+    from ..qa.interrogate import load_jsonl_qa
+
+    config = load_config(args.config)
+    index = load_dataset(args.dataset, limit_videos=args.limit_videos)
+    videos = _select_videos(index, args.subject, args.video, args.limit)
+    if not videos:
+        print(f"no videos matched in {args.dataset}", file=sys.stderr)
+        return 1
+    wanted = {v.video_id for v in videos}
+
+    runs = load_runs(Path(args.runs) if args.runs else RUNS_ROOT, wanted)
+    if not runs:
+        print("no saved runs found; run the pipeline first", file=sys.stderr)
+        return 1
+
+    qa_by_id = None
+    if args.qa_file:
+        by_key = load_jsonl_qa(args.qa_file)
+        qa_by_id = {v.video_id: by_key.get(v.video_key, []) for v in videos}
+
+    iou_threshold = (args.iou_threshold if args.iou_threshold is not None
+                     else config.evaluation.iou_threshold)
+    inputs = collect_metric_inputs(runs, videos, qa_by_id, config)
+    print(f"{len(inputs)} run(s) collected for the MEGC summary "
+          f"(IoU threshold {iou_threshold})")
+    summary = aggregate_final_metrics(
+        inputs, run_id=args.run_id, protocol=args.protocol, mode=args.mode,
+        iou_threshold=iou_threshold)
+    json_path, md_path = write_summary(summary, run_id=args.run_id,
+                                       run_root=Path(args.output) if args.output else None)
+    print(f"written: {json_path}")
+    print(f"written: {md_path}")
+    overall = summary.get("overall", {})
+    strict = overall.get("spotting", {}).get("interval", {}).get("strict_iou", {})
+    strs_block = overall.get("strs", {}).get("score", {})
+    print(f"overall: F1_s {strict.get('f1')}, "
+          f"F1_a(TP) {strs_block.get('f1_analysis')}, "
+          f"STRS {strs_block.get('strs')}")
+    return 0
+
+
 def cmd_evaluate(args: argparse.Namespace) -> int:
-    """P1 proposal-level metrics over saved runs, or freshly computed ones."""
     from ..eval.iou_histogram import save_distribution, truth_best_ious
     from ..eval.metrics import aggregate_proposal_metrics, evaluate_proposals
 
@@ -685,7 +685,6 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         )
         per_video.append(metrics)
         details.append({"video": video_id, **metrics.to_dict()})
-        # IoU distribution bookkeeping: one row per ground-truth event.
         best = truth_best_ious(proposals, [e.interval for e in events])
         for event, value in zip(events, best):
             truth_rows.append({
@@ -708,22 +707,18 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     print(f"F1 (eq. 2)  {total.f1}   |   F1 (strict IoU)  {total.f1_strict}   "
           f"|   rescue gain  {total.rescue_gain}")
 
-    # IoU 0-1 discrete distribution over the ground truth (table + histogram).
-    save_distribution(root, truth_rows, truth_ious)
+    save_distribution(root, truth_rows, truth_ious, threshold=threshold)
+    n_tp = sum(1 for v in truth_ious if v > threshold)
     print(f"IoU distribution: {len(truth_ious)} truths, "
-          f"{sum(1 for v in truth_ious if v > threshold)} above {threshold}, "
+          f"{n_tp} above {threshold}, "
           f"{sum(1 for v in truth_ious if v <= 0.0)} at zero -> "
           f"{root / 'iou_distribution.json'} / .csv / .png")
+    print(f"IoU distribution (TP only, n={n_tp}) -> "
+          f"{root / 'iou_distribution_tp.json'} / .csv / .png")
     return 0
 
 
 def _layer1_metrics(videos, config, k_steps: int) -> Dict[str, Any]:
-    """Run the frozen dynamics over the selected videos for the layer-1 numbers.
-
-    Separated out because it is the one part of the report that costs real compute: it
-    needs the representation engine over every video, where the rest of the report is a
-    read of files already on disk.
-    """
     import numpy as np
 
     from ..engines.m1_dynamics import AnalyticDynamics
@@ -737,7 +732,7 @@ def _layer1_metrics(videos, config, k_steps: int) -> Dict[str, Any]:
         try:
             representation = run_representation(video, config)
             spotting = run_spotting(video, representation, config, None)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             LOGGER.warning("layer-1 skipped %s: %s", video.video_id, exc)
             continue
         slots = np.asarray(representation.slot_activations, dtype=np.float64)
@@ -767,8 +762,8 @@ def _layer1_metrics(videos, config, k_steps: int) -> Dict[str, Any]:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    """The full paper-4.2 evaluation table, assembled from saved runs."""
     from ..eval.report import build_report, format_report, load_runs
+    from ..qa.interrogate import load_jsonl_qa
 
     config = load_config(args.config)
     index = load_dataset(args.dataset, limit_videos=args.limit_videos)
@@ -785,13 +780,21 @@ def cmd_report(args: argparse.Namespace) -> int:
     if args.references:
         references = json.loads(Path(args.references).read_text(encoding="utf-8"))
 
+    qa_by_id = None
+    if args.qa_file:
+        by_key = load_jsonl_qa(args.qa_file)
+        qa_by_id = {v.video_id: by_key.get(v.video_key, []) for v in videos}
+        matched = sum(1 for rows in qa_by_id.values() if rows)
+        print(f"qa reference file: {args.qa_file} ({matched} of {len(videos)} "
+              f"selected video(s) have rows)")
+
     layer1 = None
     if args.layer1:
         layer1 = _layer1_metrics(videos, config, args.k_steps)
 
     report = build_report(args.dataset, runs, videos, config,
                           references=references, layer1=layer1,
-                          upper_bound_runs=upper)
+                          upper_bound_runs=upper, qa=qa_by_id)
     if args.output:
         _dump(report, Path(args.output))
     if args.json:
@@ -802,7 +805,6 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def cmd_compare_p4(args: argparse.Namespace) -> int:
-    """How much of the end-to-end error is localisation error."""
     from ..eval.report import compare_p4, load_runs
 
     config = load_config(args.config)
@@ -830,7 +832,6 @@ def cmd_compare_p4(args: argparse.Namespace) -> int:
 
 
 def cmd_build_instructions(args: argparse.Namespace) -> int:
-    """Build the SFT instruction set."""
     from ..training.instruction_set import InstructionSetBuilder, write_jsonl
 
     index = load_dataset(args.dataset, limit_videos=args.limit_videos)
@@ -853,7 +854,6 @@ def cmd_build_instructions(args: argparse.Namespace) -> int:
 
 
 def cmd_folds(args: argparse.Namespace) -> int:
-    """Print the LOSO folds without training anything."""
     from ..training.loso import build_folds
 
     config = load_config(args.config)
@@ -873,7 +873,6 @@ def cmd_folds(args: argparse.Namespace) -> int:
 
 
 def cmd_sft(args: argparse.Namespace) -> int:
-    """Stage-1 SFT on one fold's training pool."""
     from ..training.loso import build_folds, require_open_weight
     from ..training.sft import DryRunSFT, SFTTrainer, build_sft_samples
     from ..training.instruction_set import InstructionSetBuilder
@@ -916,11 +915,8 @@ def cmd_sft(args: argparse.Namespace) -> int:
     if args.dry_run:
         backend = DryRunSFT()
     else:
-        # The real backend adapts an already-constructed model and tokenizer rather than
-        # building them, so the CLI cannot produce one on its own. Say so plainly instead
-        # of raising an ImportError or a ValueError out of the constructor.
         try:
-            import torch  # noqa: F401
+            import torch
         except ImportError:
             print("PyTorch is not installed, so there is nothing to run SFT on. Install "
                   "torch/transformers/peft, or use --dry-run to check the schedule, the "
@@ -943,7 +939,6 @@ def cmd_sft(args: argparse.Namespace) -> int:
 
 
 def cmd_sft_report(args: argparse.Namespace) -> int:
-    """Re-run the four sufficiency judgements over a saved SFT run."""
     from ..training.diagnostics import loss_plateau, pass_at_k
 
     config = load_config(args.config)
@@ -971,7 +966,6 @@ def cmd_sft_report(args: argparse.Namespace) -> int:
 
 
 def cmd_build_augmented_qa(args: argparse.Namespace) -> int:
-    """Inspect or validate a fold's augmented QA file."""
     from ..training.loso import build_folds
     from ..training.qa_augment import (
         AugmentationError, augmented_jsonl, discover_folds, load_augmented,
@@ -1005,7 +999,6 @@ def cmd_build_augmented_qa(args: argparse.Namespace) -> int:
 
 
 def cmd_augment_qa(args: argparse.Namespace) -> int:
-    """Filter the reference QA set and sample augmented pairs for every LOSO fold."""
     import json as _json
 
     from ..data.paths import qa_dir
@@ -1069,8 +1062,6 @@ def cmd_augment_qa(args: argparse.Namespace) -> int:
           f"({totals['n_accepted_pairs_across_folds']} accepted before the TP gate)")
 
     if getattr(args, "with_megc_metrics", False) and not args.dry_run:
-        # The metric channel covers every reference instruction, including the ones
-        # augmentation excluded -- that is where MAE/RMSE, F1_AU and the type pair live.
         print(f"\n{args.dataset}: scoring the MEGC metric suite over all "
               f"{len(qa_rows)} reference instruction(s)")
         _run_megc_channel(args, config, index, qa_rows, target)
@@ -1080,7 +1071,6 @@ def cmd_augment_qa(args: argparse.Namespace) -> int:
 
 
 def _perception_cache_root(dataset: str, disabled: bool) -> Optional[Path]:
-    """Where stage I-II output is cached, or ``None`` when the cache is off."""
     from ..data.paths import qa_dir
 
     if disabled:
@@ -1089,7 +1079,6 @@ def _perception_cache_root(dataset: str, disabled: bool) -> Optional[Path]:
 
 
 def _run_megc_channel(args, config, index, qa_rows, target: Path) -> dict:
-    """Sample and score the MEGC suite, writing the by-category metrics JSON."""
     from ..training.qa_eval import run_evaluation
 
     target.mkdir(parents=True, exist_ok=True)
@@ -1112,7 +1101,6 @@ def _run_megc_channel(args, config, index, qa_rows, target: Path) -> dict:
 
 
 def _print_megc_summary(report: dict) -> None:
-    """The headline numbers, by category, as the task statement groups them."""
     metrics = report.get("metrics", {})
     loc = metrics.get("localisation", {})
     rec = metrics.get("recognition", {})
@@ -1181,7 +1169,6 @@ def _print_megc_summary(report: dict) -> None:
 
 
 def cmd_evaluate_megc(args: argparse.Namespace) -> int:
-    """Score every reference instruction with the MEGC metric suite."""
     import json as _json
 
     from ..data.paths import qa_dir
@@ -1212,7 +1199,6 @@ def cmd_evaluate_megc(args: argparse.Namespace) -> int:
 
 
 def _reference_qa(dataset: str) -> Optional[Path]:
-    """The dataset's reference QA jsonl, preferring the top-level build."""
     from ..data.paths import find_qa_runs, qa_dir
 
     root = qa_dir(dataset)
@@ -1227,7 +1213,6 @@ def _reference_qa(dataset: str) -> Optional[Path]:
 
 
 def cmd_loso(args: argparse.Namespace) -> int:
-    """One run, the whole protocol: CLIP -> calibrate -> SFT -> gate -> RFT+aug -> GRPO -> test."""
     from ..training.loso import (
         LOSORunner, PolicyNotTrainable, require_open_weight, write_report, summarise,
     )
@@ -1258,20 +1243,13 @@ def cmd_loso(args: argparse.Namespace) -> int:
         print("The LOSO driver needs a policy backend, a sampler and an evaluator; they "
               "are injected by the training entry point rather than constructed here. "
               "Run with --dry-run to exercise the fold arithmetic and the gate wiring, "
-              "or drive `mewm.training.loso.LOSORunner` directly.\n"
-              "Stage 0 (the fine-tuned CLIP engine) and stage 4 (the held-out test, with "
-              "test-time augmentation) are now inside `LOSORunner.run`, so one call "
-              "covers the whole protocol -- `pretrain` and `train-clip-localiser` remain "
-              "as standalone commands only for running those stages in isolation.",
+              "or drive `mewm.training.loso.LOSORunner` directly.\n",
               file=sys.stderr)
         return 2
 
     index = load_dataset(args.dataset, limit_videos=args.limit_videos)
     subjects = args.folds.split(",") if args.folds else None
     if training.clip_finetune:
-        # A dry run has no parameters anywhere else in the chain; fitting a real CLIP
-        # engine here would be the one expensive, GPU-bound thing in a mode whose whole
-        # purpose is to be free. Say so rather than silently dropping the stage.
         print("dry run: skipping stage 0. Drop --dry-run to fine-tune the CLIP engine.",
               file=sys.stderr)
         training.clip_finetune = False
@@ -1289,7 +1267,6 @@ def cmd_loso(args: argparse.Namespace) -> int:
 
 
 def cmd_pretrain(args: argparse.Namespace) -> int:
-    """Stage-0 self-supervised pre-training."""
     from ..training.pretrain import (
         LongVideoWindows, PretrainConfig, WorldModelPretrainer, harvest_windows,
     )
@@ -1316,8 +1293,6 @@ def cmd_pretrain(args: argparse.Namespace) -> int:
 
 
 def cmd_train_localiser(args: argparse.Namespace) -> int:
-    """Fit the supervised localiser per LOSO fold, on ground-truth micro intervals.
-    """
     import json as _json
 
     from ..training.localiser_supervised import (
@@ -1360,8 +1335,6 @@ def cmd_train_localiser(args: argparse.Namespace) -> int:
 
         checkpoint = train_localiser(train, train_config, fold_name=f"loso_{subject}")
         path = checkpoint.save(out_dir / f"localiser_{subject}.pt")
-        # ``evaluate_localiser`` calls ``assert_excludes`` first, so the isolation claim
-        # is checked rather than asserted: a checkpoint that saw this subject refuses it.
         report = evaluate_localiser(checkpoint, test, device=args.device)
         print(f"fold {subject}: held-out AUC {report['pooled_mean_auc']:.4f} "
               f"(val {checkpoint.metrics['best_val_auc']:.4f}) -> {path.name}")
@@ -1382,7 +1355,6 @@ def cmd_train_localiser(args: argparse.Namespace) -> int:
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    """Calibrate the detection thresholds on a labelled fold."""
     from ..training.pretrain import calibrate_detection_thresholds
 
     config = load_config(args.config)
@@ -1394,7 +1366,6 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
 
 
 def cmd_models(args: argparse.Namespace) -> int:
-    """List every registered model and whether it can be reached right now."""
     from ..llm.registry import credentials_available, describe, list_models
 
     rows = []
@@ -1426,7 +1397,6 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 
 def cmd_test_models(args: argparse.Namespace) -> int:
-    """Send one minimal request to each model and report what came back."""
     from ..llm.registry import list_models, resolve
     from ..llm.client import ping
 
@@ -1437,8 +1407,6 @@ def cmd_test_models(args: argparse.Namespace) -> int:
 
     image = None
     if args.vision:
-        # The check that matters for P/A/R: those phases send frames, and an endpoint
-        # can pass a text ping while failing every image request.
         image = args.image
         if not image:
             try:
@@ -1447,7 +1415,7 @@ def cmd_test_models(args: argparse.Namespace) -> int:
                 if video is not None:
                     candidate = video.paths.frame(video.frame_lo + 10)
                     image = str(candidate) if candidate.is_file() else None
-            except Exception:  # noqa: BLE001
+            except Exception:
                 image = None
         if not image:
             print("no probe image available; pass --image PATH", file=sys.stderr)
@@ -1477,7 +1445,6 @@ def cmd_test_models(args: argparse.Namespace) -> int:
 
 
 def cmd_local_models(args: argparse.Namespace) -> int:
-    """Report open-weight model status, or pre-download one."""
     from ..llm.local_models import (
         WeightsUnavailableError, ensure_weights, load_local_model, local_status,
         manual_download_instructions,
@@ -1485,8 +1452,6 @@ def cmd_local_models(args: argparse.Namespace) -> int:
     from ..llm.registry import resolve
 
     if getattr(args, "prefetch", ""):
-        # 方案 §5.5: explicit weight prefetch (resumable snapshot download) without
-        # materialising the model -- for warming a box before a training run.
         spec = resolve(args.prefetch)
         if not spec.open_weights:
             print(f"{spec.model_id} is a hosted model; nothing to prefetch",
@@ -1514,7 +1479,7 @@ def cmd_local_models(args: argparse.Namespace) -> int:
         except WeightsUnavailableError as exc:
             print(str(exc), file=sys.stderr)
             return 2
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(manual_download_instructions(spec, str(exc)), file=sys.stderr)
             return 2
 
@@ -1523,8 +1488,6 @@ def cmd_local_models(args: argparse.Namespace) -> int:
 
 
 def cmd_train_clip_localiser(args: argparse.Namespace) -> int:
-    """Train the CLIP dual-tower localiser on one or more LOSO folds (修改方案 §1/§2).
-    """
     from ..training.clip_localiser import (
         build_clip_dataset, checkpoint_path, evaluate_clip_localiser,
         train_clip_localiser, train_state_path, write_fold_report,
@@ -1586,7 +1549,6 @@ def cmd_train_clip_localiser(args: argparse.Namespace) -> int:
 
 
 def cmd_sweep_iou(args: argparse.Namespace) -> int:
-    """Recompute P1 across a grid of IoU thresholds over saved runs."""
     from ..eval.metrics import sweep_iou_threshold
 
     config = load_config(args.config)
@@ -1628,8 +1590,6 @@ def cmd_sweep_iou(args: argparse.Namespace) -> int:
 
 
 def cmd_diagnose_localisation(args: argparse.Namespace) -> int:
-    """Attribute a low localisation score to one layer of the pipeline.
-    """
     from ..eval.localisation_diagnostics import localisation_report
     from ..pipeline import run_representation, run_spotting
 
@@ -1666,9 +1626,6 @@ def cmd_diagnose_localisation(args: argparse.Namespace) -> int:
         key = video.video_key
         curves[key] = record.s_curve
         offsets[key] = int(record.t_start)
-        # What the pipeline actually hands downstream, and what it would hand
-        # downstream with the decoder off -- so the report separates "the curve
-        # is bad" from "the decoder made it worse".
         intervals[key] = [(p.t_on, p.t_off, p.apex, p.peak_S)
                           for p in spotting.micro_intervals]
         baseline[key] = [(p.t_on, p.t_off, p.apex, p.peak_S)
@@ -1688,9 +1645,6 @@ def cmd_diagnose_localisation(args: argparse.Namespace) -> int:
         include_per_video=not args.no_per_video)
     report["decoder_enabled"] = bool(getattr(config.spotting, "localiser_enabled", False))
     if report["decoder_enabled"]:
-        # The same four layers over the undecoded proposals, so the decoder's
-        # contribution is a difference between two measured numbers rather than
-        # a claim.
         report["without_decoder"] = localisation_report(
             used, curves, baseline, offsets=offsets, tau_hi=config.spotting.tau_hi,
             iou_threshold=iou_threshold, include_per_video=False)
@@ -1729,7 +1683,6 @@ def cmd_diagnose_localisation(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    """Check the environment: paths, packages, credentials, roles."""
     from ..agents.base import available_roles
     from ..config import DATASET_ROOT, FLOW_ROOT, LOADED_ENV_FILE, PROJECT_ROOT, QTA_ROOT
     from ..llm.client import credentials_available, describe_route
@@ -1811,27 +1764,31 @@ def _resolved_id(model: str) -> str:
 
 
 def _backend_status(model: str, backend: str) -> str:
-    """'ok' or the BackendMismatch message, for the doctor's per-role triple."""
     from ..llm.client import BackendMismatch, backend_for
     try:
         backend_for(model, backend)
         return "ok"
     except BackendMismatch as exc:
         return f"MISMATCH: {exc}"
-    except Exception as exc:  # noqa: BLE001 - unknown ids are reported elsewhere
+    except Exception as exc:
         return f"unresolvable ({exc})"
 
 
 def _clip_status(config) -> Dict[str, Any]:
-    """Whether the CLIP dual-tower engine can run, and which folds are trained."""
+    from ..engines.clip_motion_engine import resolve_clip_weights
+
     status: Dict[str, Any] = {
         "enabled": config.clip.enabled,
         "weights_path": config.clip.weights_path,
         "vision_unfreeze_layers": config.clip.vision_unfreeze_layers,
         "text_unfreeze_layers": config.clip.text_unfreeze_layers,
     }
-    weights = Path(config.clip.weights_path)
-    status["weights_present"] = (weights / "config.json").is_file()
+    try:
+        weights = resolve_clip_weights(config.clip)
+        status["weights_present"] = (weights / "config.json").is_file()
+        status["weights_resolved"] = str(weights)
+    except Exception:
+        status["weights_present"] = False
     from ..config import PACKAGE_ROOT
     root = Path(config.clip.checkpoint_root)
     if not root.is_absolute():
@@ -1840,11 +1797,6 @@ def _clip_status(config) -> Dict[str, Any]:
         str(p.parent.relative_to(root)) for p in root.glob("*/fold_*/clip_localiser.pt")
     ) if root.is_dir() else []
     return status
-
-
-# ---------------------------------------------------------------------------
-# Parser
-# ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1866,7 +1818,6 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--output", default=None)
 
     def _model_flags(p: argparse.ArgumentParser) -> None:
-        """Per-role model and effort overrides (they beat the YAML config)."""
         p.add_argument("--reasoning-model", default="",
                        help="R-Agent base, e.g. claude-sonnet-5 / Qwen3-VL-8B")
         p.add_argument("--perception-model", default="")
@@ -1881,7 +1832,6 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--critic-effort", default="")
 
     def _backend_flags(p: argparse.ArgumentParser) -> None:
-        """Explicit per-role backend selection (修改方案 §5.6)."""
         choices = ["hosted", "local"]
         p.add_argument("--backend", default="", choices=[""] + choices,
                        help="set every role's backend at once (hosted | local)")
@@ -1939,6 +1889,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-frames", type=int, default=0)
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--max-proposals", type=int, default=0)
+    p.add_argument("--iou-threshold", type=float, default=None,
+                   help='')
     p.add_argument("--lang", default="en", choices=["en", "zh"])
     p.add_argument("--stub", action="store_true", help="use the offline stub client")
     p.add_argument("--no-qa", action="store_true", help="do not read the question set")
@@ -1966,7 +1918,7 @@ def build_parser() -> argparse.ArgumentParser:
         "train-softnet-spotter",
         help="train the SOFTNet peak scorer for one LOSO fold (held-out subject)")
     _common(p)
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--device", default="cuda")
     p.set_defaults(func=cmd_train_softnet)
 
@@ -1983,8 +1935,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-existence-gate", action="store_true",
                    help="ask every question unconditionally instead of gating the "
                         "rest of the video's questions on the first (existence) "
-                        "question's answer / the localisation proposals (formwork.md "
-                        "第 IV 条; default is gated)")
+                        "question's answer / the localisation proposals")
     p.add_argument("--run-id", default="",
                    help="subdirectory name for qa_records.jsonl "
                         "(<output's parent>/<run-id>/<dataset>/<subject>/<video_id>/"
@@ -1998,6 +1949,24 @@ def build_parser() -> argparse.ArgumentParser:
     _model_flags(p)
     _backend_flags(p)
     p.set_defaults(func=cmd_qa_interrogate)
+
+    p = sub.add_parser(
+        "final-metrics",
+        help="the whole-dataset MEGC summary over saved runs "
+             "(final_metrics_summary.json/.md: SpotUF1/SpotUAR, MAE/RMSE, F1AU/"
+             "JaccardAU, RegUF1/RegUAR fine+coarse, BLEU/ROUGE-1, STRS)")
+    _common(p)
+    p.add_argument("--runs", default=None, help="directory holding the saved runs")
+    p.add_argument("--qa-file", default="",
+                   help="path to a *_me_lvqa_*.jsonl reference build: supplies the "
+                        "reference answers the text metrics score against")
+    p.add_argument("--run-id", default="final_metrics",
+                   help="subdirectory name for final_metrics_summary.json/.md")
+    p.add_argument("--protocol", default="loso", choices=["loso", "lodo"])
+    p.add_argument("--mode", default="api", choices=["api", "open_weight"])
+    p.add_argument("--iou-threshold", type=float, default=None,
+                   help="TP threshold; MEGC scores at 0.5")
+    p.set_defaults(func=cmd_final_metrics)
 
     p = sub.add_parser("evaluate", help="P1 proposal-level metrics over saved runs")
     _common(p)
@@ -2016,17 +1985,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_sweep_iou)
 
     p = sub.add_parser(
-        "report", help="the full paper-4.2 evaluation table over saved runs")
+        "report", help="")
     _common(p)
     p.add_argument("--runs", default=None, help="directory holding the saved runs")
     p.add_argument("--gt-runs", default=None,
-                   help="a second runs directory produced with --use-gt-proposals; "
-                        "enables the P4 propagation section")
+                   help="")
     p.add_argument("--references", default=None,
                    help="JSON mapping video_id -> reference narrative, for BLEU/ROUGE")
+    p.add_argument("--qa-file", default="",
+                   help="")
     p.add_argument("--layer1", action="store_true",
-                   help="also compute the layer-1 rollout metrics; this runs the "
-                        "representation engine over the selected videos and is slow")
+                   help="")
     p.add_argument("--k-steps", type=int, default=5,
                    help="rollout horizon for the layer-1 prediction-error curve")
     p.add_argument("--json", action="store_true",
@@ -2070,7 +2039,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "train-clip-localiser",
-        help="train the CLIP dual-tower localiser per LOSO fold (no LLM calls)")
+        help="")
     _common(p)
     p.add_argument("--subjects", default="",
                    help="comma-separated held-out subject ids; default = every fold")
@@ -2079,12 +2048,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=0,
                    help="override clip.epochs from the config")
     p.add_argument("--clip-weights", default="",
-                   help="override clip.weights_path (local CLIP checkpoint dir)")
+                   help="")
     p.add_argument("--force-retrain", action="store_true",
-                   help="retrain a fold even if its checkpoint + test report already "
-                        "exist on disk (default: skip finished folds, so restarting "
-                        "after an interruption only resumes the in-progress fold and "
-                        "trains the folds that never started)")
+                   help="")
     p.set_defaults(func=cmd_train_clip_localiser)
 
     p = sub.add_parser("build-instructions", help="build the SFT instruction set")
@@ -2092,12 +2058,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lang", default="en", choices=["en", "zh"])
     p.set_defaults(func=cmd_build_instructions)
 
-    p = sub.add_parser("pretrain", help="stage-0 self-supervised pre-training")
+    p = sub.add_parser("pretrain", help="")
     _common(p)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--exclude-subjects", default="",
-                   help="comma-separated subject ids to hard-exclude (test fold)")
+                   help="")
     p.set_defaults(func=cmd_pretrain)
 
     p = sub.add_parser("calibrate", help="calibrate the detection thresholds")
@@ -2113,15 +2079,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-frames", type=int, default=0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--folds", default="",
-                   help="comma-separated held-out subject ids; default = every subject")
+                   help="")
     p.add_argument("--out", default="",
-                   help="checkpoint directory; default .runlogs/localiser/<dataset>")
+                   help="")
     p.set_defaults(func=cmd_train_localiser)
 
-    p = sub.add_parser("folds", help="print the LOSO folds without training")
+    p = sub.add_parser("folds", help="")
     _common(p)
     p.add_argument("--folds", default="",
-                   help="comma-separated held-out subject ids; default = every fold")
+                   help="")
     p.set_defaults(func=cmd_folds)
 
     p = sub.add_parser("sft", help="stage-1 SFT on one LOSO fold's training pool")
@@ -2164,57 +2130,51 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stride", type=int, default=1, help="frame stride for perception")
     p.add_argument("--max-frames", type=int, default=0, help="cap frames per video")
     p.add_argument("--qa-file", default="",
-                   help="reference QA jsonl; default = the dataset's own")
+                   help="")
     p.add_argument("--dry-run", action="store_true",
-                   help="filter and sample but write nothing")
+                   help="")
     p.add_argument("--resume", action="store_true",
-                   help="continue a sweep killed mid-sampling from its checkpoint "
-                        "jsonl instead of re-drawing every instruction")
+                   help="")
     p.add_argument("--with-megc-metrics", action="store_true",
-                   help="after writing the augmented set, run the MEGC evaluation "
-                        "channel over every reference instruction and write the "
-                        "by-category metrics JSON alongside it")
+                   help="")
     p.add_argument("--no-perception-cache", action="store_true",
-                   help="recompute stages I-II instead of reusing the cache")
+                   help="")
     p.set_defaults(func=cmd_augment_qa)
 
     p = sub.add_parser("evaluate-megc",
-                       help="score every reference instruction with the MEGC metric "
-                            "suite and report by category")
+                       help="")
     _common(p)
     p.add_argument("--policy-model", default="claude-sonnet-5",
-                   help="hosted model answering the reference questions")
+                   help="")
     p.add_argument("--max-workers", type=int, default=8,
-                   help="concurrent questions in flight")
-    p.add_argument("--stride", type=int, default=1, help="frame stride for perception")
-    p.add_argument("--max-frames", type=int, default=0, help="cap frames per video")
+                   help="")
+    p.add_argument("--stride", type=int, default=1, help="")
+    p.add_argument("--max-frames", type=int, default=0, help="")
     p.add_argument("--qa-file", default="",
-                   help="reference QA jsonl; default = the dataset's own")
+                   help="")
     p.add_argument("--iou-threshold", type=float, default=0.5,
-                   help="IoU at which a proposal counts as a true positive")
+                   help="")
     p.add_argument("--max-questions", type=int, default=0,
-                   help="smoke-run cap; 0 = every routed instruction. A cap changes "
-                        "every denominator and is recorded in the report")
+                   help="")
     p.add_argument("--reasoning-effort", default="",
-                   help="provider-specific reasoning effort, if supported")
+                   help="")
     p.add_argument("--no-per-subject", action="store_true",
-                   help="omit the per-subject metric breakdown")
+                   help="")
     p.add_argument("--no-perception-cache", action="store_true",
-                   help="recompute stages I-II instead of reusing the cache")
+                   help="")
     p.set_defaults(func=cmd_evaluate_megc)
 
     p = sub.add_parser("loso", help="the full LOSO protocol, per fold")
     _common(p)
     p.add_argument("--folds", default="",
                    help="comma-separated held-out subject ids; default = every fold. "
-                        "22 folds x 3 datasets is expensive -- start with a subset")
+                        "")
     p.add_argument("--policy", default="",
                    help="open-weight policy checkpoint; hosted-API ids are rejected")
     p.add_argument("--sft-epochs", type=int, default=0, help="override sft_max_epochs")
     p.add_argument("--rl-steps", type=int, default=0, help="override rl_total_steps")
     p.add_argument("--no-clip", action="store_true",
-                   help="skip stage 0. The policy then trains against the analytic "
-                        "front end, and the fold's numbers are not CLIP numbers")
+                   help="")
     p.add_argument("--clip-retrain", action="store_true",
                    help="re-fit the CLIP engine even when a fold checkpoint exists")
     p.add_argument("--clip-stride", type=int, default=1,
@@ -2222,14 +2182,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clip-max-frames", type=int, default=0,
                    help="cap frames per video in stage 0; 0 = every frame")
     p.add_argument("--calibrate", action="store_true",
-                   help="fit (tau_hi, tau_lo) per fold on the pool after stage 0 "
-                        "instead of inheriting the config defaults")
+                   help="")
     p.add_argument("--tta-samples", type=int, default=0,
-                   help="draws per held-out prompt at stage 4; overrides "
-                        "training.tta_samples. 1 disables test-time augmentation")
+                   help="")
     p.add_argument("--device", default="cuda", help="device for stage 0")
     p.add_argument("--dry-run", action="store_true",
-                   help="fold arithmetic and gate wiring only, no parameters")
+                   help="")
     p.set_defaults(func=cmd_loso)
 
     p = sub.add_parser("doctor", help="environment and credential check")
@@ -2242,7 +2200,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    _setup_logging(getattr(args, "verbose", False))
+    output_hint = getattr(args, "output", None) or getattr(args, "runs", None)
+    _setup_logging(getattr(args, "verbose", False),
+                   extra_log_dir=Path(output_hint) if output_hint else None)
     try:
         return int(args.func(args))
     except KeyboardInterrupt:

@@ -1,5 +1,4 @@
-"""Loading the ME-LVQA question/answer sets and the flow-derived observation records.
-"""
+"""QA pair loader: reads and normalises question–answer sets per dataset split."""
 
 from __future__ import annotations
 
@@ -14,23 +13,12 @@ from .paths import DATASETS, find_qa_runs, from_record_path
 
 LOGGER = logging.getLogger(__name__)
 
-#: Question taxonomy of the ME-LVQA sets.
-#:
-#: The suffix index of ``video_id`` is *not* a stable type key: a video with ``E``
-#: annotated events gets ``E`` "expression type of the N-th event" questions, which
-#: pushes the localisation and reasoning questions further down.  A video with 2 events
-#: ends at index 10, one with 5 events ends at 13.  Classification is therefore by
-#: question text.
 QUESTION_TYPES: Tuple[str, ...] = (
     "count_expression", "count_micro", "count_macro", "au_set", "event_type",
     "localize_expression", "localize_micro", "localize_macro", "reason_full",
     "segment_analysis",
 )
 
-#: ``In the 3-th expression event of this video (frames 699-707, apex 703): ...``
-#: One per micro-expression sample, with the analysis prompt phrased many different
-#: ways.  These carry the per-segment static/dynamic descriptions, so they are matched
-#: on the stable frame-span preamble rather than on the free-text tail.
 _SEGMENT_RE = re.compile(
     r"in the\s+(?P<idx>\d+)-th\s+expression event of this video\s*"
     r"\(frames\s+(?P<onset>\d+)-(?P<offset>\d+),\s*apex\s+(?P<apex>\d+)\)",
@@ -38,8 +26,6 @@ _SEGMENT_RE = re.compile(
 )
 
 _QUESTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    # Order matters: the localisation questions contain the counting phrasing too, and
-    # the reasoning question contains "how many micro-expression events".
     ("reason_full", ("reason over the whole video",)),
     ("localize_micro", ("localize every micro-expression event",)),
     ("localize_macro", ("localize every macro-expression event",)),
@@ -53,7 +39,6 @@ _QUESTION_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 
 
 def classify_question(question: str) -> str:
-    """Map a question to its type by text, not by position."""
     text = question or ""
     lowered = text.strip().lower()
     for qtype, needles in _QUESTION_RULES:
@@ -65,7 +50,6 @@ def classify_question(question: str) -> str:
 
 
 def parse_segment_question(question: str) -> Optional[Dict[str, int]]:
-    """Extract ``{index, onset, offset, apex}`` from a per-segment analysis question."""
     match = _SEGMENT_RE.search(question or "")
     if not match:
         return None
@@ -77,7 +61,6 @@ def parse_segment_question(question: str) -> Optional[Dict[str, int]]:
     }
 
 
-#: The three-in-one instruction of paper 3.6.1 -- what the framework is evaluated on.
 TRIPLE_TASK_QUESTION_EN = (
     "Reason over the whole video: how many micro-expression events does it contain, "
     "what coarse-grained and fine-grained emotion does each of them convey, and what "
@@ -95,14 +78,8 @@ _LOCALISATION_RE = re.compile(
 )
 
 
-# ---------------------------------------------------------------------------
-# Rows
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class QAItem:
-    """One question/answer row."""
 
     video_id: str
     video: str
@@ -122,7 +99,6 @@ class QAItem:
         )
 
     def parse_localisations(self) -> List[Dict[str, int | str]]:
-        """Pull ``frames a-b (apex c)`` spans out of a localisation answer."""
         out: List[Dict[str, int | str]] = []
         for match in _LOCALISATION_RE.finditer(self.answer_text):
             out.append({
@@ -141,13 +117,6 @@ class QAItem:
 
 @dataclass
 class MotionObservation:
-    """One ROI row of ``motion_observations`` -- the observation model's output unit.
-
-    This is the shape the V1 front end must emit and the P-Agent must report: a
-    measurement triple plus the AU candidates its direction is compatible with.  Note
-    the AU candidates are *anatomical possibilities*, not activation decisions -- that
-    call belongs to the A-Agent one evidence level up.
-    """
 
     roi: int
     region_name: str
@@ -191,7 +160,6 @@ class MotionObservation:
 
 @dataclass
 class AUCorrelation:
-    """``w_matrix``: the AU relation graph and the main activation path."""
 
     nodes: List[str] = field(default_factory=list)
     active_aus: List[str] = field(default_factory=list)
@@ -213,7 +181,6 @@ class AUCorrelation:
         return sorted(self.edges, key=lambda e: -float(e.get("weight", 0.0)))[:n]
 
     def terminal_emotion(self) -> str:
-        """Last hop of ``main_path`` -- ``AU4 -> AU7 -> AU24 -> Disgust``."""
         if self.main_path and not str(self.main_path[-1]).upper().startswith("AU"):
             return str(self.main_path[-1]).lower()
         return ""
@@ -224,11 +191,6 @@ class AUCorrelation:
 
 @dataclass
 class ObservationRecord:
-    """One micro-expression sample of the ``_full.json`` side.
-
-    Training target for the observation model and, in the SFT stage, the source the
-    agent-level supervision of paper 3.6.1 is derived from.
-    """
 
     sample_id: str
     video_id: str
@@ -237,7 +199,7 @@ class ObservationRecord:
     expression_type: str
     coarse_label: str
     fine_label: str
-    frame_span: Tuple[int, int, int]        # (onset, apex, offset)
+    frame_span: Tuple[int, int, int]
     flow_gap_k: int
     annotated_aus: List[str] = field(default_factory=list)
     related_supplementary_aus: List[str] = field(default_factory=list)
@@ -251,7 +213,6 @@ class ObservationRecord:
     landmarks: List[List[int]] = field(default_factory=list)
     phase_observations: Dict[str, List[MotionObservation]] = field(default_factory=dict)
 
-    # -- derived views ------------------------------------------------------
 
     @property
     def onset(self) -> int:
@@ -274,7 +235,6 @@ class ObservationRecord:
 
     def salient_rois(self, phase: str = "AP_ON", coherence_min: float = 0.6,
                      magnitude_min: float = 0.15) -> List[MotionObservation]:
-        """Disjunctive salience -- magnitude OR coherence, per eq. (3)'s test."""
         return [o for o in self.observations(phase)
                 if o.magnitude_px >= magnitude_min or o.coherence >= coherence_min]
 
@@ -285,12 +245,6 @@ class ObservationRecord:
         return [from_record_path(str(f.get("flow_image", ""))) for f in self.flow_frames]
 
     def aligned_pairs(self) -> List[Dict[str, Any]]:
-        """Video frame <-> flow frame pairs as this record stores them.
-
-        Confirms the alignment rule from the data itself: ``flow_frame`` equals the
-        later index of ``frame_pair``, so it lines up with the video frame of the same
-        number.
-        """
         out = []
         for item in self.interval_flow_frames:
             pair = item.get("frame_pair") or [0, 0]
@@ -317,20 +271,11 @@ class ObservationRecord:
         }
 
 
-# ---------------------------------------------------------------------------
-# Dynamic-description parsing
-# ---------------------------------------------------------------------------
-
 _PHASE_RE = re.compile(r"\b(AP_ON|ON_OFF|AP_OFF)\b\s*:\s*(\{.*?\})(?=\s+(?:AP_ON|ON_OFF|AP_OFF)\b\s*:|\s+B\.|\Z)",
                        re.DOTALL)
 
 
 def parse_dynamic_description(text: str) -> Dict[str, List[MotionObservation]]:
-    """Split part A of a dynamic description into ``{phase: [MotionObservation]}``.
-
-    The field stores ``AP_ON: {...} ON_OFF: {...}`` followed by a prose ``B.`` summary;
-    only part A is machine-readable, so the regex stops at the ``B.`` marker.
-    """
     out: Dict[str, List[MotionObservation]] = {}
     if not text:
         return out
@@ -382,13 +327,7 @@ def _record_from_full(payload: Dict[str, Any]) -> ObservationRecord:
     )
 
 
-# ---------------------------------------------------------------------------
-# QASet
-# ---------------------------------------------------------------------------
-
-
 class QASet:
-    """One QA build: the jsonl question rows plus the optional ``_full.json`` records."""
 
     def __init__(self, dataset: str, run_dir: Path,
                  items: Sequence[QAItem], records: Sequence[ObservationRecord],
@@ -397,9 +336,6 @@ class QASet:
         self.run_dir = run_dir
         self.items: List[QAItem] = list(items)
         self.records: List[ObservationRecord] = list(records)
-        # Which items came from a training-time augmented set rather than the annotated
-        # build. Kept separable so a report can never quote an augmented pair as if it
-        # were reference annotation, and so evaluation can exclude them outright.
         self.augmented_ids: set = set(augmented_ids or ())
         self._by_video: Dict[str, List[QAItem]] = {}
         for item in self.items:
@@ -414,7 +350,6 @@ class QASet:
     def __iter__(self) -> Iterator[QAItem]:
         return iter(self.items)
 
-    # -- questions ----------------------------------------------------------
 
     def videos(self) -> List[str]:
         return sorted(self._by_video)
@@ -426,23 +361,15 @@ class QASet:
         return [i for i in self.items if i.qtype == qtype]
 
     def augmented_items(self) -> List[QAItem]:
-        """Only the training-time augmented pairs."""
         return [i for i in self.items if i.video_id in self.augmented_ids]
 
     def annotated_items(self) -> List[QAItem]:
-        """Only the original annotated pairs -- what evaluation is allowed to score."""
         return [i for i in self.items if i.video_id not in self.augmented_ids]
 
     def triple_task(self, video: str) -> Optional[QAItem]:
-        """The localisation-analysis-description question for one video."""
         return next((i for i in self.for_video(video) if i.is_triple_task), None)
 
     def segment_questions(self, video: str) -> List[Tuple[QAItem, Dict[str, int]]]:
-        """Per-sample analysis questions with their parsed frame spans.
-
-        A long video holds several micro-expression samples and each gets its own
-        question and description; these are the per-proposal supervision targets.
-        """
         out: List[Tuple[QAItem, Dict[str, int]]] = []
         for item in self.for_video(video):
             if item.qtype != "segment_analysis":
@@ -454,19 +381,12 @@ class QASet:
         return out
 
     def ground_truth_localisations(self, video: str, micro_only: bool = True) -> List[Dict[str, Any]]:
-        """Spans parsed out of the localisation answers -- the P1 protocol's truth."""
         qtype = "localize_micro" if micro_only else "localize_expression"
         item = next((i for i in self.for_video(video) if i.qtype == qtype), None)
         return item.parse_localisations() if item else []
 
-    # -- observation targets (training only) --------------------------------
 
     def observation_targets(self, video: str) -> List[ObservationRecord]:
-        """Reference outputs for the observation model.
-
-        Training-time only: at inference the observation model regenerates these from
-        flow, and letting an agent read them would be reading the answer key.
-        """
         return self._records_by_video.get(video, [])
 
     def stats(self) -> Dict[str, Any]:
@@ -495,8 +415,6 @@ def load_qa_set(
     augmented_fold: Optional[str] = None,
     allowed_videos: Optional[Sequence[str]] = None,
 ) -> Optional[QASet]:
-    """Load a QA build for ``dataset``.
-    """
 
     if dataset not in DATASETS:
         raise KeyError(f"unknown dataset {dataset!r}")
@@ -547,8 +465,6 @@ def load_qa_set(
 
     augmented_ids: List[str] = []
     if augmented_fold:
-        # Imported lazily: the training package builds these files, and a module-level
-        # import here would make the data layer depend on the training layer.
         from ..training.qa_augment import load_augmented
 
         allowed = set(allowed_videos) if allowed_videos is not None else None
@@ -569,7 +485,6 @@ def load_qa_set(
 
 
 def _select_run(dataset: str, prefer_model: str) -> Optional[Path]:
-    """Pick a build directory: preferred annotator, full over smoke, newest first."""
     runs = find_qa_runs(dataset)
     if not runs:
         return None
@@ -580,12 +495,10 @@ def _select_run(dataset: str, prefer_model: str) -> Optional[Path]:
         smoke = 1 if "smoke" in name else 0
         return (model_hit, smoke, name)
 
-    # ``find_qa_runs`` returns newest first; a stable sort keeps that order inside ties.
     return sorted(runs, key=rank)[0]
 
 
 def _pick_jsonl(run_dir: Path) -> Optional[Path]:
-    """The QA rows file, excluding the checkpoint sidecar."""
     candidates = [c for c in sorted(run_dir.glob("*.jsonl")) if "checkpoint" not in c.name]
     if not candidates:
         return None
@@ -599,7 +512,6 @@ def _suffix_index(video_id: str) -> int:
 
 
 def load_all_qa(with_full: bool = True, prefer_model: str = "claude-sonnet-5") -> Dict[str, QASet]:
-    """Every QA build present; datasets whose set is pending are simply absent."""
     out: Dict[str, QASet] = {}
     for name in DATASETS:
         qa = load_qa_set(name, with_full=with_full, prefer_model=prefer_model)

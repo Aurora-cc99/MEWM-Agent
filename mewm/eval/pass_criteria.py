@@ -1,12 +1,4 @@
-"""What counts as a *passing* sample.
-
-* **format** -- the output parses as the declared contract and, where it carries a
-  composed answer, satisfies :mod:`mewm.eval.answer_format`;
-* **temporal** -- the proposal clears the eq. (2) criterion at the *configured*
-  ``iou_threshold``, including the affective-rescue clause when it is enabled;
-* **semantic** -- the fine label matches, with the coarse label consistent with it.
-"""
-
+"""Pass/fail criteria definitions for evidence verification gating."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -20,8 +12,6 @@ from .metrics import iou as interval_iou, tp_decision
 
 @dataclass
 class PassOutcome:
-    """Per-sample verdict, with the reason it failed when it did."""
-
     passed: bool = False
     format_ok: bool = False
     temporal_ok: bool = False
@@ -40,7 +30,6 @@ class PassOutcome:
 
 
 def _as_interval(value: Any) -> Optional[Tuple[int, int]]:
-    """Coerce a proposal to ``(onset, offset)``; ``None`` when it is not one."""
     if value is None:
         return None
     if isinstance(value, dict):
@@ -58,12 +47,6 @@ def _as_interval(value: Any) -> Optional[Tuple[int, int]]:
 
 
 def check_format(product: Dict[str, Any], required_fields: Sequence[str] = ()) -> Tuple[bool, List[str]]:
-    """Contract fields present, and any composed answer clean.
-
-    The two halves are distinct failures: a model can emit perfectly valid JSON whose
-    narrative still cites the paper, and it can write clean prose inside a malformed
-    object. Both are format failures here.
-    """
     reasons: List[str] = []
     if not isinstance(product, dict) or not product:
         return False, ["output did not parse as a JSON object"]
@@ -85,13 +68,6 @@ def check_temporal(
     proposal: Any, truth: Any, fine_pred: str = "", fine_true: str = "",
     evaluation: Optional[EvaluationConfig] = None,
 ) -> Tuple[bool, float, bool, List[str]]:
-    """The eq. (2) criterion at the configured threshold.
-
-    Returns ``(ok, iou, rescued, reasons)``. The verdict itself comes from
-    :func:`~mewm.eval.metrics.tp_decision`, which the training reward and the final
-    evaluation also call -- this function's own job is only to turn the two inputs into
-    an IoU and the verdict into this module's tuple.
-    """
     evaluation = evaluation or EvaluationConfig()
     predicted = _as_interval(proposal)
     reference = _as_interval(truth)
@@ -109,11 +85,6 @@ def check_temporal(
 
 def check_label(fine_pred: str, fine_true: str,
                 coarse_pred: str = "") -> Tuple[bool, List[str]]:
-    """Fine label exact after canonicalisation, coarse label consistent with it.
-
-    Canonicalisation first, because an out-of-vocabulary string is a different failure
-    from a wrong-but-real emotion and the two should not be scored alike.
-    """
     reasons: List[str] = []
     predicted, recognised = canonical_fine_label(fine_pred)
     reference, _ = canonical_fine_label(fine_true)
@@ -138,7 +109,6 @@ def evaluate_sample(
     evaluation: Optional[EvaluationConfig] = None,
     required_fields: Sequence[str] = (),
 ) -> PassOutcome:
-    """Full verdict for one sampled output."""
     outcome = PassOutcome()
 
     outcome.format_ok, format_reasons = check_format(product, required_fields)
@@ -166,8 +136,6 @@ def evaluate_video_sample(
     evaluation: Optional[EvaluationConfig] = None,
     required_fields: Sequence[str] = (),
 ) -> PassOutcome:
-    """Verdict for a *whole-video* answer rather than a single proposal.
-    """
     evaluation = evaluation or EvaluationConfig()
     outcome = PassOutcome()
 
@@ -184,7 +152,6 @@ def evaluate_video_sample(
             f"claims {count} micro-expression event(s), annotation has {len(reference)}")
 
     if not reference and not claimed:
-        # Nothing to localise and nothing claimed: the count is the whole criterion.
         outcome.temporal_ok = count == 0
         outcome.label_ok = count == 0
         outcome.passed = outcome.format_ok and outcome.temporal_ok
@@ -242,9 +209,6 @@ def evaluate_video_sample(
         if fine or coarse:
             ok, reasons = check_label(fine, fine, coarse)
             if not ok:
-                # Self-consistency only: whether the fine label is *correct* is already
-                # decided by the rescue clause above, so re-scoring it here would count
-                # the same error twice.
                 label_reasons.extend(f"claimed event {index + 1}: {r}" for r in reasons
                                      if "inconsistent" in r or "outside the label set" in r)
     outcome.label_ok = not label_reasons
@@ -255,7 +219,6 @@ def evaluate_video_sample(
 
 
 def stage_rates(outcomes: Sequence[PassOutcome]) -> Dict[str, float]:
-    """Per-stage pass rates, so the bottleneck is visible rather than aggregated away."""
     total = len(outcomes)
     if not total:
         return {"n": 0, "format": 0.0, "temporal": 0.0, "label": 0.0, "joint": 0.0}

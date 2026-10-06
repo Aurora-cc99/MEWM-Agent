@@ -1,6 +1,4 @@
-"""V3 -- two-timescale latent state decomposition (paper 3.2.3, appendix B.3).
-"""
-
+"""V3 latent encoder: subject-specific latent facial-dynamics baseline."""
 from __future__ import annotations
 
 import logging
@@ -19,26 +17,13 @@ try:
     import torch
     import torch.nn as nn
     _TORCH = True
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
-    nn = object  # type: ignore
+except ImportError:
+    torch = None
+    nn = object
     _TORCH = False
 
 
-# ---------------------------------------------------------------------------
-# Slow variable: random walk + Kalman correction
-# ---------------------------------------------------------------------------
-
-
 class SlowStateTracker:
-    """Scalar-covariance Kalman filter over the slow latent (appendix B.3).
-
-    Cost is ``O(d_s)`` per update and storage does not grow with video length, which is
-    what lets this run over tens of thousands of frames.  A change point resets the
-    covariance and flags the following window as low-confidence recovery rather than
-    letting the filter quietly mis-track a scene cut.
-    """
-
     def __init__(self, dim: int = 256, config: Optional[RepresentationConfig] = None) -> None:
         self.config = config or RepresentationConfig()
         self.dim = dim
@@ -53,12 +38,6 @@ class SlowStateTracker:
         self._last_gain = 0.0
 
     def update(self, observation: np.ndarray, t: int, n_samples: int = 1) -> Tuple[np.ndarray, float, bool]:
-        """One discrete update; returns ``(mu, kalman_gain, reset_flag)``.
-
-        ``n_samples`` is the number of frames the observation summarises: a small
-        segment yields a conservative update, which is the point of quantifying scene
-        drift uncertainty explicitly.
-        """
         observation = np.asarray(observation, dtype=np.float64).reshape(-1)
         if observation.shape[0] != self.dim:
             observation = _resize(observation, self.dim)
@@ -71,12 +50,12 @@ class SlowStateTracker:
 
         prior_var = self.sigma + self.Q
         obs_var = self.obs_noise / max(1, n_samples)
-        gain = prior_var / (prior_var + obs_var)          # H_k
+        gain = prior_var / (prior_var + obs_var)
         innovation = observation - self.mu
 
         reset = self._check_changepoint(innovation, prior_var + obs_var, t)
-        self.mu = self.mu + gain * innovation             # mu_k
-        self.sigma = (1.0 - gain) * prior_var             # sigma_k
+        self.mu = self.mu + gain * innovation
+        self.sigma = (1.0 - gain) * prior_var
         self._last_gain = float(gain)
 
         self.log.append(SlowDigest(t=t, summary=_digest(self.mu),
@@ -84,11 +63,9 @@ class SlowStateTracker:
         return self.mu.copy(), float(gain), reset
 
     def predict(self) -> np.ndarray:
-        """One-step forecast ``z^s_{t|t-1}``; the random walk leaves the mean unchanged."""
         return self.mu.copy()
 
     def _check_changepoint(self, innovation: np.ndarray, variance: float, t: int) -> bool:
-        """Sustained observation-likelihood collapse means the scene actually changed."""
         nll = 0.5 * float(innovation @ innovation) / max(variance, 1e-8)
         nll = nll / max(1, self.dim)
         if nll > self.config.changepoint_nll:
@@ -107,11 +84,6 @@ class SlowStateTracker:
         return self._last_gain
 
     def absorption_ratio(self) -> float:
-        """``h`` of proposition B.3 -- how much of a step the slow term can absorb.
-
-        In a stationary stretch the gain converges to a small value, so ``h << 1`` and a
-        micro-expression transition survives into the expression residual.
-        """
         return self._last_gain
 
     def reset_spans(self, window: int) -> List[Tuple[int, int]]:
@@ -119,7 +91,6 @@ class SlowStateTracker:
 
 
 def _digest(vector: np.ndarray, size: int = 8) -> List[float]:
-    """Small fixed-width summary of a latent vector, for the slow-variable log."""
     if vector.size == 0:
         return [0.0] * size
     chunks = np.array_split(vector, min(size, vector.size))
@@ -135,18 +106,11 @@ def _resize(vector: np.ndarray, dim: int) -> np.ndarray:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Belief variable: rolling posterior over emotions
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class BeliefState:
-    """``q(z^e_t | o_{<=t})`` as a categorical posterior over the fine emotion set."""
-
     labels: List[str]
     logits: np.ndarray
-    decay: float = 0.92                # evidence half-life; prevents unbounded certainty
+    decay: float = 0.92
 
     @classmethod
     def uniform(cls, labels: Sequence[str], decay: float = 0.92) -> "BeliefState":
@@ -170,24 +134,20 @@ class BeliefState:
 
     @property
     def variance(self) -> float:
-        """Normalised entropy in ``[0, 1]`` -- ``Var[z^e]`` for the M4 routing signal."""
         return round(self.entropy / math.log(max(2, len(self.labels))), 5)
 
     @property
     def margin(self) -> float:
-        """Gap between the top two hypotheses -- the ``Delta`` of the fast-path test."""
         ordered = np.sort(self.probabilities)[::-1]
         return float(ordered[0] - ordered[1]) if ordered.size >= 2 else 1.0
 
     def update(self, log_evidence: Dict[str, float], weight: float = 1.0) -> "BeliefState":
-        """Accumulate per-emotion log evidence with geometric forgetting."""
         self.logits *= self.decay
         for i, label in enumerate(self.labels):
             self.logits[i] += weight * float(log_evidence.get(label, 0.0))
         return self
 
     def kl_to(self, other: "BeliefState") -> float:
-        """``D_KL(self || other)`` -- the quantity ``MNI_k`` reports (eq. 10)."""
         p, q = self.probabilities, other.probabilities
         return float((p * (np.log(p + 1e-12) - np.log(q + 1e-12))).sum())
 
@@ -207,19 +167,9 @@ class BeliefState:
         }
 
 
-# ---------------------------------------------------------------------------
-# Learned encoder
-# ---------------------------------------------------------------------------
-
 if _TORCH:
 
     class LatentEncoder(nn.Module):
-        """Maps measurements + flow summary to ``(z^s, z^m, z^e)``.
-
-        The fast head predicts a *velocity* rather than a position so that the flow
-        constraint ``L_flow`` has something to bind to directly.
-        """
-
         def __init__(self, config: Optional[RepresentationConfig] = None) -> None:
             super().__init__()
             self.config = config or RepresentationConfig()
@@ -234,7 +184,6 @@ if _TORCH:
             self.slow_head = nn.Linear(hidden, self.config.slow_dim)
             self.fast_head = nn.Linear(hidden, self.config.fast_dim)
             self.belief_head = nn.Linear(hidden, self.config.belief_dim)
-            # g_phi: optical flow -> latent velocity (the anchor of L_flow)
             self.flow_to_velocity = nn.Sequential(
                 nn.Linear(in_dim, hidden), nn.GELU(), nn.Linear(hidden, self.config.fast_dim),
             )
@@ -253,7 +202,6 @@ if _TORCH:
         def flow_constraint_loss(
             self, z_fast: "torch.Tensor", flow_velocity: "torch.Tensor"
         ) -> "torch.Tensor":
-            """``L_flow = sum_t ||(z^m_{t+1} - z^m_t) - g_phi(F_t)||^2`` (appendix B.2)."""
             if z_fast.shape[0] < 2:
                 return z_fast.new_zeros(())
             delta = z_fast[1:] - z_fast[:-1]
@@ -264,29 +212,17 @@ if _TORCH:
             observation: "torch.Tensor", prior_mean: "torch.Tensor",
             prior_var: "torch.Tensor",
         ) -> "torch.Tensor":
-            """``L_slow`` -- the Gaussian-marginal soft constraint of appendix B.2."""
             residual = observation - prior_mean
             return (residual ** 2 / prior_var.clamp(min=1e-6)).sum(dim=-1).mean()
 
-else:  # pragma: no cover
+else:
 
-    class LatentEncoder:  # type: ignore[no-redef]
+    class LatentEncoder:
         def __init__(self, *_args, **_kwargs) -> None:
             raise ImportError("LatentEncoder needs PyTorch.")
 
 
-# ---------------------------------------------------------------------------
-# Streaming composer
-# ---------------------------------------------------------------------------
-
-
 class LatentComposer:
-    """Per-frame recursion that assembles ``z_t`` and the slow-variable log.
-
-    Analytic by default (no trained weights required), so the spotting path can run on a
-    fresh checkout; when a :class:`LatentEncoder` is supplied its heads take over.
-    """
-
     def __init__(
         self,
         config: Optional[RepresentationConfig] = None,
@@ -308,7 +244,6 @@ class LatentComposer:
         t: int,
         segment_size: int = 30,
     ) -> Dict[str, np.ndarray | float | bool]:
-        """Advance one frame; the slow state updates once per ``segment_size`` frames."""
         features = np.asarray(measurement_matrix, dtype=np.float64).reshape(-1)
 
         if self.encoder is not None and _TORCH:
@@ -348,7 +283,6 @@ class LatentComposer:
         return list(self.slow.log)
 
     def low_confidence_spans(self, window: int) -> List[Tuple[int, int]]:
-        """Post-change-point recovery windows -- flagged, never silently trusted."""
         return self.slow.reset_spans(window)
 
 

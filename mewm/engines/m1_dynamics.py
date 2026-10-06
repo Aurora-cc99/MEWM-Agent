@@ -1,5 +1,4 @@
-"""M1 -- emotion-conditioned AU object dynamics (paper 3.3.1, eq. 5).
-"""
+"""M1 dynamics model: AU-centered dual-timescale state prediction."""
 
 from __future__ import annotations
 
@@ -22,23 +21,12 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     _TORCH = True
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
-    nn = object  # type: ignore
+except ImportError:
+    torch = None
+    nn = object
     _TORCH = False
 
-
-# ---------------------------------------------------------------------------
-# Analytic prior -- interaction structure available before any training
-# ---------------------------------------------------------------------------
-
-
 def prior_interaction_matrix() -> np.ndarray:
-    """``(K, K)`` signed AU->AU prior from anatomical co-occurrence knowledge.
-
-    Used to initialise the learned attention and as the ``w_model`` term of the graph
-    edge weight (appendix C.5) whenever the transition model is untrained.
-    """
     matrix = np.zeros((K_SLOTS, K_SLOTS), dtype=np.float32)
     for a in SLOT_AUS:
         for b in SLOT_AUS:
@@ -49,7 +37,6 @@ def prior_interaction_matrix() -> np.ndarray:
                 matrix[SLOT_INDEX[a], SLOT_INDEX[b]] = 0.6
             elif polarity == "-":
                 matrix[SLOT_INDEX[a], SLOT_INDEX[b]] = -0.6
-    # Emotion co-membership adds a weaker positive prior between AUs of one prototype.
     for emotion in FINE_EMOTIONS:
         members = [au for au in core_aus(emotion) if au in SLOT_INDEX]
         for a in members:
@@ -61,9 +48,7 @@ def prior_interaction_matrix() -> np.ndarray:
                     matrix[i, j] = 0.3
     return matrix
 
-
 PRIOR_INTERACTION: np.ndarray = prior_interaction_matrix()
-
 
 def emotion_one_hot(emotion: str) -> np.ndarray:
     vector = np.zeros(len(FINE_EMOTIONS), dtype=np.float32)
@@ -71,15 +56,9 @@ def emotion_one_hot(emotion: str) -> np.ndarray:
         vector[FINE_EMOTIONS.index(emotion)] = 1.0
     return vector
 
-
-# ---------------------------------------------------------------------------
-# Learned model
-# ---------------------------------------------------------------------------
-
 if _TORCH:
 
     class SlotGraphAttention(nn.Module):
-        """One message-passing layer over the AU slot graph, biased by the prior."""
 
         def __init__(self, dim: int, n_heads: int = 4, dropout: float = 0.1) -> None:
             super().__init__()
@@ -93,12 +72,9 @@ if _TORCH:
             self.out = nn.Linear(dim, dim)
             self.norm = nn.LayerNorm(dim)
             self.dropout = nn.Dropout(dropout)
-            # Learnable bias seeded from anatomy, so the model starts with the known
-            # structure and spends its capacity on what the data adds to it.
             self.edge_bias = nn.Parameter(torch.from_numpy(PRIOR_INTERACTION).clone())
 
         def forward(self, slots: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:
-            """``(B, K, d) -> (updated slots, attention (B, heads, K, K))``."""
             batch, n_slots, dim = slots.shape
             residual = slots
 
@@ -113,11 +89,6 @@ if _TORCH:
             return self.norm(residual + self.out(context)), attention
 
     class MixtureDensityHead(nn.Module):
-        """Mixture-of-Gaussians output -- the transition's uncertainty quantifier.
-
-        A point head would give no usable predictive variance, and M2/M4 both need one:
-        the spotting statistic is a normalised *surprise*, and routing keys on variance.
-        """
 
         def __init__(self, in_dim: int, out_dim: int, n_components: int = 5) -> None:
             super().__init__()
@@ -138,7 +109,6 @@ if _TORCH:
             }
 
         def log_prob(self, params: Dict[str, "torch.Tensor"], target: "torch.Tensor") -> "torch.Tensor":
-            """Per-sample log density of ``target`` under the mixture."""
             mu, log_sigma = params["mu"], params["log_sigma"]
             weights = torch.log_softmax(params["logits"], dim=-1)
             target = target.unsqueeze(-2)
@@ -150,23 +120,17 @@ if _TORCH:
             return torch.logsumexp(weights + component, dim=-1)
 
         def mode(self, params: Dict[str, "torch.Tensor"]) -> "torch.Tensor":
-            """Highest-weight component mean -- the trajectory ``rollout`` returns."""
             best = params["logits"].argmax(dim=-1, keepdim=True)
             index = best.unsqueeze(-1).expand(*best.shape, params["mu"].shape[-1])
             return params["mu"].gather(-2, index).squeeze(-2)
 
         def variance(self, params: Dict[str, "torch.Tensor"]) -> "torch.Tensor":
-            """Mixture variance: within-component spread plus between-component spread."""
             weights = torch.softmax(params["logits"], dim=-1).unsqueeze(-1)
             mu, sigma_sq = params["mu"], (2.0 * params["log_sigma"]).exp()
             mean = (weights * mu).sum(-2, keepdim=True)
             return ((weights * (sigma_sq + (mu - mean) ** 2)).sum(-2)).mean(-1)
 
     class SlowFastRouter(nn.Module):
-        """Learns the EMA adaptation rate that splits ``A_t`` into slow/fast variables
-        (formwork.md 第 16-19 条, ``MEWM-Agent_完整执行方案.md`` 第 3.2.4 节, 2026-09-03
-        新增).
-        """
 
         def __init__(self, confound_dim: int = 2, hidden: int = 32,
                     alpha_min: float = 0.01, alpha_max: float = 0.5) -> None:
@@ -179,20 +143,12 @@ if _TORCH:
                 nn.Conv1d(hidden, hidden, 5, padding=2), nn.GELU(),
                 nn.Conv1d(hidden, 1, 1),
             )
-            # Start near the middle of the admissible range rather than at an extreme,
-            # so an untrained router does not immediately freeze the baseline solid or
-            # make it track every frame -- both extremes destroy gradient signal for
-            # very different reasons (a frozen baseline never varies with the confound
-            # input; a baseline that tracks every frame leaves no fast residual to
-            # explain anything through).
             nn.init.zeros_(self.net[-1].weight)
             nn.init.zeros_(self.net[-1].bias)
 
         def alpha(self, confounds: "torch.Tensor") -> "torch.Tensor":
-            """``(B, T, confound_dim) -> (B, T)`` adaptation rate in
-            ``(alpha_min, alpha_max)``."""
-            x = confounds.transpose(1, 2)          # (B, confound_dim, T)
-            logits = self.net(x).squeeze(1)        # (B, T)
+            x = confounds.transpose(1, 2)
+            logits = self.net(x).squeeze(1)
             return self.alpha_min + (self.alpha_max - self.alpha_min) * torch.sigmoid(logits)
 
         def split(
@@ -201,9 +157,6 @@ if _TORCH:
             confounds: "torch.Tensor",
             z_slow_init: Optional["torch.Tensor"] = None,
         ) -> Dict[str, "torch.Tensor"]:
-            """``(B, T, K)`` activations, ``(B, T, confound_dim)`` confound proxies ->
-            ``{"slow", "fast", "alpha"}``, each ``(B, T[, K])``.
-            """
             if confounds.shape[-1] != self.confound_dim:
                 raise ValueError(
                     f"SlowFastRouter configured for {self.confound_dim} confound "
@@ -214,14 +167,13 @@ if _TORCH:
             current = (z_slow_init if z_slow_init is not None
                       else activations[:, 0, :].clone())
             for t in range(length):
-                weight = alpha[:, t].unsqueeze(-1)              # (B, 1)
+                weight = alpha[:, t].unsqueeze(-1)
                 current = (1.0 - weight) * current + weight * activations[:, t, :]
                 slow[:, t, :] = current
             fast = activations - slow
             return {"slow": slow, "fast": fast, "alpha": alpha}
 
     class AUDynamicsModel(nn.Module):
-        """The three-factor transition of eq. (5)."""
 
         def __init__(
             self,
@@ -236,11 +188,9 @@ if _TORCH:
             slot_dim = self.representation.slot_dim
             hidden = self.config.hidden_dim
 
-            # -- factor 1: affective belief transition
             self.belief_rnn = nn.GRUCell(slot_dim * 2 + self.representation.slow_dim, hidden)
             self.belief_head = nn.Linear(hidden, n_emotions)
 
-            # -- factor 2: AU object interaction, conditioned on (z^e, z^s)
             self.slot_in = nn.Linear(slot_dim, hidden)
             self.condition = nn.Linear(n_emotions + self.representation.slow_dim, hidden)
             self.layers = nn.ModuleList([
@@ -250,13 +200,11 @@ if _TORCH:
             self.slot_head = MixtureDensityHead(hidden, slot_dim, self.config.n_mixture)
             self.activation_head = nn.Linear(hidden, 1)
 
-            # -- factor 3: motion realisation
             self.motion_head = MixtureDensityHead(
                 hidden + self.representation.fast_dim,
                 self.representation.fast_dim, self.config.n_mixture,
             )
 
-            # -- multi-step imagination: N_s learnable future queries
             self.future_queries = nn.Parameter(
                 torch.randn(self.config.future_queries, hidden) * 0.02
             )
@@ -266,13 +214,10 @@ if _TORCH:
             self.imagine_attention = nn.MultiheadAttention(hidden, self.config.n_heads,
                                                            batch_first=True)
 
-        # -- factors ---------------------------------------------------------
-
         def transition_belief(
             self, slots: "torch.Tensor", z_slow: "torch.Tensor",
             hidden: Optional["torch.Tensor"] = None,
         ) -> Tuple["torch.Tensor", "torch.Tensor"]:
-            """``p(z^e_{t+1} | z_{<=t}, A_{<=t})`` -- returns (logits, hidden)."""
             pooled = torch.cat([slots.mean(dim=1), slots.max(dim=1).values, z_slow], dim=-1)
             hidden = self.belief_rnn(pooled, hidden)
             return self.belief_head(hidden), hidden
@@ -280,7 +225,6 @@ if _TORCH:
         def transition_slots(
             self, slots: "torch.Tensor", emotion: "torch.Tensor", z_slow: "torch.Tensor",
         ) -> Dict[str, "torch.Tensor"]:
-            """``p(A_{t+1} | A_{<=t}, z^e_{t+1}, z^s_t)`` -- the interaction factor."""
             features = self.slot_in(slots)
             features = features + self.condition(
                 torch.cat([emotion, z_slow], dim=-1)
@@ -291,14 +235,13 @@ if _TORCH:
                 attentions.append(attention)
             params = self.slot_head(features)
             params["activation"] = torch.sigmoid(self.activation_head(features)).squeeze(-1)
-            params["attention"] = torch.stack(attentions, dim=1)   # (B, L, H, K, K)
+            params["attention"] = torch.stack(attentions, dim=1)
             params["features"] = features
             return params
 
         def transition_motion(
             self, features: "torch.Tensor", z_fast: "torch.Tensor",
         ) -> Dict[str, "torch.Tensor"]:
-            """``p(z^m_{t+1} | z^m_t, A_{t+1})``."""
             pooled = features.mean(dim=1)
             return self.motion_head(torch.cat([pooled, z_fast], dim=-1))
 
@@ -310,11 +253,6 @@ if _TORCH:
             emotion: Optional["torch.Tensor"] = None,
             belief_hidden: Optional["torch.Tensor"] = None,
         ) -> Dict[str, object]:
-            """One transition step.  ``emotion`` overrides the predicted belief.
-
-            Passing ``emotion`` is what makes hypothesis-conditioned rollout and scoring
-            the *same* forward pass with a different conditioning input.
-            """
             belief_logits, hidden = self.transition_belief(slots, z_slow, belief_hidden)
             conditioning = (
                 emotion if emotion is not None else torch.softmax(belief_logits, dim=-1)
@@ -329,10 +267,8 @@ if _TORCH:
                 "next_slots": self.slot_head.mode(slot_params),
                 "next_activation": slot_params["activation"],
                 "predictive_variance": self.slot_head.variance(slot_params),
-                "interaction": slot_params["attention"].mean(dim=(1, 2)),   # (B, K, K)
+                "interaction": slot_params["attention"].mean(dim=(1, 2)),
             }
-
-        # -- multi-step imagination -----------------------------------------
 
         def imagine(
             self,
@@ -342,12 +278,6 @@ if _TORCH:
             steps: Optional[int] = None,
             emotion: Optional["torch.Tensor"] = None,
         ) -> Dict[str, "torch.Tensor"]:
-            """Roll ``S`` steps forward, feeding each output back into the context.
-
-            Parameters are shared across steps and a step embedding distinguishes them,
-            which is what keeps the ``S``-step rollout from collapsing into ``S`` copies
-            of a one-step prediction.
-            """
             steps = steps or self.config.rollout_steps
             batch = slots.shape[0]
             current, hidden = slots, None
@@ -371,22 +301,15 @@ if _TORCH:
                 queries.append(attended)
 
             return {
-                "trajectory": torch.stack(trajectory, dim=1),        # (B, S, K, d_a)
-                "activations": torch.stack(activations, dim=1),      # (B, S, K)
-                "variance": torch.stack(variances, dim=1),           # (B, S)
-                "queries": torch.stack(queries, dim=1),              # (B, S, N_s, hidden)
+                "trajectory": torch.stack(trajectory, dim=1),
+                "activations": torch.stack(activations, dim=1),
+                "variance": torch.stack(variances, dim=1),
+                "queries": torch.stack(queries, dim=1),
             }
-
-        # -- losses ----------------------------------------------------------
 
         def imagination_loss(
             self, predicted_queries: "torch.Tensor", future_target: "torch.Tensor",
         ) -> "torch.Tensor":
-            """``L_imagine`` -- MSE plus cosine, per appendix B.2.
-
-            Both terms are needed: MSE alone lets the prediction collapse to the mean
-            (small error, no direction), cosine alone fixes direction but not amplitude.
-            """
             steps = predicted_queries.shape[1]
             total = predicted_queries.new_zeros(())
             for step in range(steps):
@@ -399,10 +322,7 @@ if _TORCH:
         def slot_nll(self, params: Dict[str, "torch.Tensor"], target: "torch.Tensor") -> "torch.Tensor":
             return -self.slot_head.log_prob(params, target).mean()
 
-        # -- persistence -----------------------------------------------------
-
         def version_hash(self) -> str:
-            """Checkpoint fingerprint recorded on every ``RolloutRecord``."""
             import hashlib
             digest = hashlib.blake2s(digest_size=8)
             for name, tensor in sorted(self.state_dict().items()):
@@ -434,25 +354,17 @@ if _TORCH:
             model.eval()
             return model
 
-else:  # pragma: no cover
+else:
 
-    class AUDynamicsModel:  # type: ignore[no-redef]
+    class AUDynamicsModel:
         def __init__(self, *_args, **_kwargs) -> None:
             raise ImportError("AUDynamicsModel needs PyTorch.")
 
-    class SlowFastRouter:  # type: ignore[no-redef]
+    class SlowFastRouter:
         def __init__(self, *_args, **_kwargs) -> None:
             raise ImportError("SlowFastRouter needs PyTorch.")
 
-
-# ---------------------------------------------------------------------------
-# Analytic dynamics -- the untrained stand-in
-# ---------------------------------------------------------------------------
-
-
 class AnalyticDynamics:
-    """Closed-form transition used when no trained M1 checkpoint is available.
-    """
 
     version = "m1-analytic"
 
@@ -462,7 +374,6 @@ class AnalyticDynamics:
 
     def step(self, activations: np.ndarray, emotion: Optional[str] = None,
              momentum: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """One-step activation prediction; returns ``(mean, variance)``."""
         current = np.asarray(activations, dtype=np.float64).reshape(-1)
         if current.size != K_SLOTS:
             current = np.resize(current, K_SLOTS)
@@ -479,8 +390,6 @@ class AnalyticDynamics:
 
         predicted = 0.82 * current + 0.55 * velocity + 0.12 * influence + 0.08 * prior
         predicted = np.clip(predicted, 0.0, 1.0)
-        # Uncertainty grows where the state is mid-range: that is where the next step is
-        # genuinely ambiguous, and it is what M4 routes on.
         variance = 0.02 + 0.10 * predicted * (1.0 - predicted)
         return predicted, variance
 
@@ -505,12 +414,6 @@ class AnalyticDynamics:
         }
 
     def log_likelihood(self, observed: np.ndarray, emotion: str) -> float:
-        """``l(e) = sum_t log p(A^obs_{t+1} | A^obs_{<=t}, z^e = e, z^s_t)``.
-
-        Gaussian around the one-step prediction made *under* hypothesis ``e``, so a
-        hypothesis whose dynamics do not match the measured unfolding is penalised even
-        when its static AU combination fits.
-        """
         observed = np.atleast_2d(np.asarray(observed, dtype=np.float64))
         if observed.shape[0] < 2:
             return 0.0
@@ -525,11 +428,9 @@ class AnalyticDynamics:
         return total / max(1, observed.shape[0] - 1)
 
     def interaction_weight(self, source: str, target: str) -> float:
-        """``w^model_{kk'}`` for the AU graph edge weight."""
         if source not in SLOT_INDEX or target not in SLOT_INDEX:
             return 0.0
         return float(self.interaction[SLOT_INDEX[source], SLOT_INDEX[target]])
-
 
 __all__ = [
     "prior_interaction_matrix", "PRIOR_INTERACTION", "emotion_one_hot",

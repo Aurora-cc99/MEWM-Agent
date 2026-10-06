@@ -1,5 +1,4 @@
-"""The deterministic orchestrator (paper 3.4.1, appendix D.3).
-"""
+"""ACE orchestrator: four-agent coordination state machine for ME analysis."""
 
 from __future__ import annotations
 
@@ -27,7 +26,6 @@ from .state import (
 
 LOGGER = logging.getLogger(__name__)
 
-# Main-graph states
 STATE_SCAN = "SCAN"
 STATE_FANOUT = "FANOUT"
 STATE_SUBGRAPH = "PROPOSAL_SUBGRAPH"
@@ -36,7 +34,6 @@ STATE_NARRATE = "NARRATE"
 STATE_ASSEMBLE = "ASSEMBLE"
 STATE_END = "END"
 
-#: Cascade target when a level's failures point at the previous level.
 CASCADE_TARGET: Dict[str, str] = {
     PHASE_A_ENCODE: PHASE_P_VERIFY,
     PHASE_A_GRAPH: PHASE_A_ENCODE,
@@ -47,7 +44,6 @@ CASCADE_TARGET: Dict[str, str] = {
 
 @dataclass
 class NodeOutcome:
-    """Result of running one node, gate included."""
 
     phase: str
     cid: str
@@ -63,7 +59,6 @@ class NodeOutcome:
 
 @dataclass
 class ProposalContext:
-    """Everything the subgraph needs for one proposal, assembled once."""
 
     cid: str
     interval: Tuple[int, int]
@@ -74,15 +69,12 @@ class ProposalContext:
     reference_graph: Optional[Any] = None
     image_paths: Sequence[str] = ()
     baseline_context: str = ""
-    #: Competitive activation pre-selection, passed to A-Agent as the candidate set.
     preselected_active: Sequence[str] = ()
     preselected_weak: Sequence[str] = ()
-    #: True when the coherence channel carried no discriminative information.
     coherence_saturated: bool = False
 
 
 class Orchestrator:
-    """Executes the graph over one video."""
 
     def __init__(
         self,
@@ -93,8 +85,8 @@ class Orchestrator:
         checkpoint: Optional[CheckpointStore] = None,
         lang: str = "en",
     ) -> None:
-        self.agents = agents               # {"P": ..., "A": ..., "R": ..., "C": ...}
-        self.service = service             # RolloutService
+        self.agents = agents
+        self.service = service
         self.config = config or load_config()
         self.episodic = episodic
         self.checkpoint = checkpoint
@@ -103,7 +95,6 @@ class Orchestrator:
         self.lang = lang
         self._step = 0
 
-    # -- entry point --------------------------------------------------------
 
     def run(
         self,
@@ -112,7 +103,6 @@ class Orchestrator:
         candidates: Optional[Sequence[CandidateInterval]] = None,
         max_micro_frames: int = 0,
     ) -> MEWMState:
-        """Run the whole graph for one video."""
         state.budget.max_llm_calls = self.config.orchestrator.max_llm_calls_per_video
 
         self._scan(state, candidates or state.proposals, max_micro_frames)
@@ -135,19 +125,11 @@ class Orchestrator:
         self._assemble(state)
         return state
 
-    # -- main graph ---------------------------------------------------------
 
     def _scan(self, state: MEWMState, candidates: Sequence[CandidateInterval],
               max_micro_frames: int) -> None:
         all_candidates = list(candidates)
         state.log(STATE_SCAN, "start", n_candidates=len(all_candidates))
-        # One call per whole video used to review every duration-eligible candidate at
-        # once, each carrying a prose "notes" field -- long enough on a video with many
-        # candidates to truncate mid-response (observed: gemini-3-flash cut off
-        # mid-string on a 29-candidate call), which invalidates that whole response's
-        # JSON. Chunking bounds each call's expected length to one batch's worth of
-        # candidates regardless of how long the full list gets, and confines a
-        # truncated response's fallback to just the batch that produced it.
         batch_size = max(1, self.config.orchestrator.p_scan_batch_size)
         micro_ids: set = set()
         for start in range(0, len(all_candidates), batch_size):
@@ -157,11 +139,6 @@ class Orchestrator:
                 candidates=batch, max_micro_frames=max_micro_frames,
             )
             products = outcome.result.product.get("proposals") or []
-            # P-Agent's own "channel" call has to actually gate the subgraph, not just
-            # get logged: a proposal it re-routes to "macro" (p_agent_scan.md rule 4)
-            # must leave the micro-expression pipeline the same way an unconfirmed one
-            # does, or the call has no effect and an over-long interval still gets
-            # narrated as a micro-expression no matter what P-Agent decided.
             if products:
                 micro_ids |= {
                     str(item.get("cid"))
@@ -170,10 +147,6 @@ class Orchestrator:
                     and str(item.get("channel", "micro")) == "micro"
                 }
             else:
-                # This batch's call degraded or came back empty; trust the
-                # deterministic engine's own channel tag for just these candidates,
-                # the same fallback the single-call design used across the whole
-                # video, now scoped to the batch that actually needs it.
                 micro_ids |= {p.cid for p in batch if p.channel == "micro"}
         state.proposals = [p for p in all_candidates if p.cid in micro_ids]
         state.log(STATE_SCAN, "done", n_confirmed=len(state.proposals))
@@ -214,7 +187,6 @@ class Orchestrator:
                   degradations=len(state.budget.degradations))
         self._save(state, STATE_ASSEMBLE)
 
-    # -- proposal subgraph --------------------------------------------------
 
     def _proposal_subgraph(self, state: MEWMState, context: ProposalContext) -> None:
         cid = context.cid
@@ -247,17 +219,11 @@ class Orchestrator:
                        reference_graph=context.reference_graph,
                        slot_trajectory=context.slot_trajectory)
 
-        # -- reasoning: tool scores first, then the argument -----------------
         observed = context.slot_trajectory
         candidates = self._candidate_set(active, weak)
         es, dc, k_crit, scores = self._score_hypotheses(observed, active, weak,
                                                         candidates, cid)
 
-        # ``measurements`` has to be handed over explicitly. The visibility matrix grants
-        # both R phases a digest of it, but a digest of ``None`` is ``None``, and because
-        # the field is granted rather than hidden it is never listed as withheld either --
-        # so the agent sees a null it was told it could rely on, and adjudicates every
-        # proposal at confidence 0 with the rationale "no measurements were supplied".
         reason = self._run_node(state, PHASE_R_REASON, cid,
                                 measurements=context.measurements,
                                 active_aus=active, weak_aus=weak, es=es, dc=dc,
@@ -266,7 +232,6 @@ class Orchestrator:
         cot = state.causal_cots.get(cid)
         main = cot.fine_label if cot else (max(es, key=lambda e: es[e]) if es else "other")
 
-        # -- routing ---------------------------------------------------------
         signal = build_signal(
             cid, es_scores=es, likelihood=(scores.log_likelihood if scores else None),
             belief_variance=float(kwargs_get(context, "belief_variance", 0.5)),
@@ -286,7 +251,6 @@ class Orchestrator:
                         if signal.path == PATH_DEEP else 1),
             )
 
-        # -- adjudication -----------------------------------------------------
         completeness = prototype_completeness(main, active)
         margin = 0.0
         if len(es) >= 2:
@@ -328,14 +292,12 @@ class Orchestrator:
 
         self._save(state, f"{STATE_SUBGRAPH}:{cid}")
 
-    # -- challenge loop -----------------------------------------------------
 
     def _challenge_loop(
         self, state: MEWMState, context: ProposalContext, main: str,
         candidates: Sequence[str], k_crit: Sequence[str],
         observed: Optional[np.ndarray], rounds: int,
     ) -> float:
-        """Bounded C <-> R loop; returns the monotone challenge factor."""
         from ..agents.reasoning import challenge_grade
 
         critic = self.agents.get("C")
@@ -371,10 +333,8 @@ class Orchestrator:
 
         return challenge_grade(state.challenges.get(cid, []))
 
-    # -- node execution -----------------------------------------------------
 
     def _run_node(self, state: MEWMState, phase: str, cid: str, **kwargs: Any) -> NodeOutcome:
-        """Run one node with gating and bounded revision."""
         agent = self.agents.get(_agent_of(phase))
         if agent is None:
             raise KeyError(f"no agent registered for phase {phase!r}")
@@ -413,8 +373,6 @@ class Orchestrator:
         assert outcome is not None
         if not outcome.passed and outcome.gate is not None:
             gate = outcome.gate
-            # Name the failing gate and its reason: "gate never passed ([])" is useless
-            # when the consistency rules passed and it was sufficiency that blocked.
             if not gate.consistency.passed:
                 reason = f"consistency rules {gate.consistency.failed_rules}"
             else:
@@ -426,7 +384,6 @@ class Orchestrator:
         return outcome
 
     def _commit(self, state: MEWMState, cid: str, outcome: NodeOutcome) -> None:
-        """Write an accepted node's evidence into the chain."""
         chain = state.chain(cid) if cid else state.chain("_")
         for entry in outcome.result.entries:
             if entry.eid in chain:
@@ -434,7 +391,7 @@ class Orchestrator:
             entry.cid = cid or entry.cid
             try:
                 chain.add(entry)
-            except Exception as exc:  # noqa: BLE001 - an illegal entry is dropped, not fatal
+            except Exception as exc:
                 state.log(outcome.phase, "evidence rejected", cid=cid, reason=str(exc))
 
     def _should_cascade(self, state: MEWMState, cid: str, phase: str) -> bool:
@@ -447,10 +404,8 @@ class Orchestrator:
         state.log(phase, "cascading back", cid=cid, target=CASCADE_TARGET[phase])
         return True
 
-    # -- scoring ------------------------------------------------------------
 
     def _candidate_set(self, active: Sequence[str], weak: Sequence[str]) -> List[str]:
-        """Hypotheses worth scoring: those sharing an AU with the observation."""
         from ..knowledge.emotion_prototypes import FINE_EMOTIONS
         observed = set(active) | set(weak)
         scored = [
@@ -467,7 +422,6 @@ class Orchestrator:
         self, observed: Optional[np.ndarray], active: Sequence[str],
         weak: Sequence[str], candidates: Sequence[str], cid: str,
     ) -> Tuple[Dict[str, float], Dict[str, float], List[str], Any]:
-        """Tool-side ES / DC / K_crit, computed before the agent argues."""
         from ..agents.reasoning import compute_es, leave_one_out_critical
 
         es = compute_es(active, weak, candidates)
@@ -480,7 +434,6 @@ class Orchestrator:
                                         self.config.es_dc_alpha)
         return es, dc, k_crit, scores
 
-    # -- checkpointing ------------------------------------------------------
 
     def _save(self, state: MEWMState, node: str) -> None:
         if self.checkpoint is None:
@@ -488,7 +441,7 @@ class Orchestrator:
         self._step += 1
         try:
             self.checkpoint.save(state.video_id, self._step, node, state.to_dict())
-        except Exception as exc:  # noqa: BLE001 - checkpointing must not break the run
+        except Exception as exc:
             LOGGER.warning("checkpoint failed at %s: %s", node, exc)
 
 

@@ -1,1 +1,1 @@
-"""MEWM-Agent cli subpackage."""
+"""CLI sub-package entry point."""

@@ -1,5 +1,4 @@
-"""Per-video multi-question interrogation against the ME-LVQA jsonl (2026-09-02).
-"""
+"""Interactive QA interrogation utility for inspecting model answers per clip."""
 
 from __future__ import annotations
 
@@ -22,7 +21,6 @@ LOGGER = logging.getLogger(__name__)
 
 _COUNT_RE = re.compile(r"\b(\d+)\b")
 _AU_CODE_RE = re.compile(r"\bAU\s*(\d{1,2})\b", re.IGNORECASE)
-#: Textual AU names the reference answers use when no code is given.
 _AU_NAMES = {
     "inner brow raiser": "AU1", "outer brow raiser": "AU2",
     "brow lowerer": "AU4", "upper lid raiser": "AU5",
@@ -35,13 +33,7 @@ _AU_NAMES = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
-
-
 def load_jsonl_qa(path: Path | str) -> Dict[str, List[QAItem]]:
-    """Read a ``*_me_lvqa_*.jsonl`` build into per-video question lists."""
     by_video: Dict[str, List[QAItem]] = {}
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -57,11 +49,6 @@ def load_jsonl_qa(path: Path | str) -> Dict[str, List[QAItem]]:
         )
         by_video.setdefault(item.video, []).append(item)
     return by_video
-
-
-# ---------------------------------------------------------------------------
-# Extraction helpers (one per question family)
-# ---------------------------------------------------------------------------
 
 
 def extract_count(text: str) -> Optional[int]:
@@ -81,11 +68,6 @@ def extract_aus(text: str) -> List[str]:
 def extract_emotion(text: str) -> Optional[str]:
     emotion, recognised = canonical_fine_label(text or "")
     return emotion if recognised else None
-
-
-# ---------------------------------------------------------------------------
-# Interrogation
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -112,7 +94,6 @@ def interrogate_video(
     reasoning_effort: str = "high",
     attach_frames: bool = True,
 ) -> List[Prediction]:
-    """Ask every QA question of one video separately; return one prediction each."""
     predictions: List[Prediction] = []
     for item in items:
         segment = parse_segment_question(item.question)
@@ -140,7 +121,7 @@ def interrogate_video(
                 reasoning_effort=reasoning_effort,
             )
             text = response.text
-        except Exception as exc:  # noqa: BLE001 - one failed question must not sink the video
+        except Exception as exc:
             LOGGER.warning("question failed for %s: %s", video.video_key, exc)
             text = f"__FAILED__: {type(exc).__name__}"
         predictions.append(Prediction(
@@ -150,16 +131,10 @@ def interrogate_video(
     return predictions
 
 
-# ---------------------------------------------------------------------------
-# Integration
-# ---------------------------------------------------------------------------
-
-
 def integrate(
     items: Sequence[QAItem],
     predictions: Sequence[Prediction],
 ) -> Dict[str, Any]:
-    """Vote/aggregate the per-question predictions; score against the references."""
     count_answers = []
     count_preds = []
     au_refs: Dict[str, List[str]] = {}
@@ -206,7 +181,6 @@ def integrate(
         "n_failed": sum(1 for p in predictions if p.predicted.startswith("__FAILED__")),
     }
 
-    # -- count family -------------------------------------------------------
     count_pred_vote = vote(count_preds)
     if count_answers:
         ref_vote = vote(count_answers)
@@ -220,7 +194,6 @@ def integrate(
             abs(count_pred_vote - ref_vote)
             if count_pred_vote is not None and ref_vote is not None else None)
 
-    # -- AU family ----------------------------------------------------------
     au_rows = []
     for key in sorted(set(au_refs) | set(au_preds)):
         refs = sorted(set(au_refs.get(key, [])))
@@ -234,7 +207,6 @@ def integrate(
         integrated["au_f1_mean"] = round(
             sum(r["au_f1"] for r in au_rows) / len(au_rows), 4)
 
-    # -- emotion family -----------------------------------------------------
     emo_rows = []
     for key in sorted(set(emotion_refs) | set(emotion_preds)):
         refs = emotion_refs.get(key, [])
@@ -254,18 +226,8 @@ def integrate(
     return integrated
 
 
-# ---------------------------------------------------------------------------
-# Gated interrogation (formwork.md 第 IV 条, 2026-09-03)
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class QARecord:
-    """One question/answer row exactly as it will be persisted (see
-    ``mewm.eval.subject_report``). Both asked and gate-skipped questions produce one
-    of these each, so a video's saved record is complete -- "why wasn't this question
-    answered" is itself part of the answer, never a silently missing row.
-    """
 
     question_index: int
     question: str
@@ -299,15 +261,10 @@ def interrogate_video_gated(
     attach_frames: bool = True,
     gate_on_existence: bool = True,
 ) -> Tuple[List[QARecord], ExistenceDecision, List[QAItem], List[Prediction]]:
-    """Ask the video's existence question first; gate the rest on its answer.
-    """
     items = list(items)
     existence_item = find_existence_question(items) if gate_on_existence else None
 
     if existence_item is None:
-        # No count-family question in this video's QA set (or gating disabled): every
-        # question is asked, and the "decision" is trivially "exists" so downstream
-        # consumers have one code path regardless.
         predictions = interrogate_video(video, items, call, model, reasoning_effort,
                                         attach_frames)
         decision = ExistenceDecision(exists=True, source="ungated",
@@ -320,7 +277,6 @@ def interrogate_video_gated(
         ]
         return records, decision, items, predictions
 
-    # -- step 1: ask the existence question alone, first ---------------------------
     existence_prediction = interrogate_video(
         video, [existence_item], call, model, reasoning_effort, attach_frames)[0]
     decision = decide_existence(
@@ -330,7 +286,6 @@ def interrogate_video_gated(
         extract_count_fn=extract_count,
     )
 
-    # -- step 2: split the remaining questions on the decision ----------------------
     to_ask, to_skip = split_items_by_gate(items, decision)
     to_ask_rest = [it for it in to_ask if it is not existence_item]
     rest_predictions = (
@@ -340,7 +295,6 @@ def interrogate_video_gated(
     )
     predicted_by_id = {id(it): p for it, p in zip(to_ask_rest, rest_predictions)}
 
-    # -- step 3: rebuild every question's record in the video's original order ------
     records: List[QARecord] = []
     asked_items: List[QAItem] = [existence_item]
     asked_predictions: List[Prediction] = [existence_prediction]
@@ -360,7 +314,7 @@ def interrogate_video_gated(
             ))
             asked_items.append(item)
             asked_predictions.append(pred)
-        else:  # gated off
+        else:
             records.append(QARecord(
                 index, item.question, item.qtype, True, None, item.answer,
                 skipped_reason="no_micro_expression_detected",

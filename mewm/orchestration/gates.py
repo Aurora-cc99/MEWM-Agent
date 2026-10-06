@@ -1,24 +1,4 @@
-"""The dual gates: consistency rules R1-R5 and the three-grade sufficiency check (D.5).
-
-**Consistency (hard, rule-based)**
-
-* **R1 reference legality** -- an entry may only cite strictly lower-level, live entries.
-  Dangling, level-skipping, or rejected citations fail.
-* **R2 responsibility boundary** -- graded vocabulary scan.  P must not name AUs or
-  emotions; A must not name emotions.
-* **R3 numeric recomputation** -- every quantity in a product must match the tool's own
-  recomputation to within 1e-3.  This is what stops an agent from asserting a number it
-  did not measure.
-* **R4 prior conflict** -- an antagonistic AU pair reported jointly active, or a
-  sign-conflicting graph edge, must already be registered as an open question.
-* **R5 phase consistency** -- the adjudicated emotion must match the argued one (or carry
-  a traceable, registered correction), and fine/coarse labels must satisfy the mapping.
-
-**Sufficiency (graded)** -- ``sufficient`` / ``specific_gap`` / ``clearly_insufficient``.
-Only ``sufficient`` passes.  A gap produces targeted follow-up questions pointing at
-specific entry ids, which the orchestrator ships with the revision instruction.
-"""
-
+"""Additional evidence gates used by the orchestrator between pipeline stages."""
 from __future__ import annotations
 
 import logging
@@ -46,8 +26,6 @@ GRADE_INSUFFICIENT = "clearly_insufficient"
 
 @dataclass
 class GateOutcome:
-    """Combined verdict of both gates for one node execution."""
-
     passed: bool
     consistency: GateRecord
     sufficiency: GateRecord
@@ -70,13 +48,7 @@ class GateOutcome:
         }
 
 
-# ---------------------------------------------------------------------------
-# Consistency gate
-# ---------------------------------------------------------------------------
-
-
 class ConsistencyGate:
-    """Rules R1-R5."""
 
     def __init__(self, tolerance: float = NUMERIC_TOLERANCE) -> None:
         self.tolerance = tolerance
@@ -116,11 +88,8 @@ class ConsistencyGate:
             failed_rules=failed, questions=details, retry_idx=retry_idx,
         )
 
-    # -- R1 -----------------------------------------------------------------
-
     @staticmethod
     def _r1_references(product: Dict[str, Any], chain: EvidenceChain) -> List[str]:
-        """Citations must point at strictly lower-level, live entries."""
         problems: List[str] = []
         entries = product.get("_entries") or []
         for entry in entries:
@@ -142,16 +111,6 @@ class ConsistencyGate:
                 problems.append(f"product cites unknown entry {ref}")
         return problems
 
-    # -- R2 -----------------------------------------------------------------
-
-    #: Fields exempt from the R2 vocabulary scan.
-    #:
-    #: The perception agent's proposal contract *requires* an ``attribution`` map keyed
-    #: by AU (appendix H.1), because the error decomposition attributes residual mass per
-    #: slot and the proposal carries that provenance forward. Those keys are engine
-    #: output passed through verbatim, not a judgement the agent made, so scanning them
-    #: would fail the contract the agent was told to satisfy. The ban still applies to
-    #: everything the agent actually writes -- claims, notes, summaries.
     R2_EXEMPT_FIELDS = frozenset({"attribution"})
 
     @classmethod
@@ -165,7 +124,6 @@ class ConsistencyGate:
 
     @classmethod
     def _strip_exempt(cls, payload: Any) -> Any:
-        """Recursively drop exempt fields before the vocabulary scan."""
         if isinstance(payload, dict):
             return {
                 key: cls._strip_exempt(value)
@@ -176,12 +134,9 @@ class ConsistencyGate:
             return [cls._strip_exempt(item) for item in payload]
         return payload
 
-    # -- R3 -----------------------------------------------------------------
-
     def _r3_numeric(
         self, product: Dict[str, Any], recompute: Optional[Dict[str, float]],
     ) -> List[str]:
-        """Claimed quantities must equal the tool's recomputation within tolerance."""
         if not recompute:
             return []
         problems: List[str] = []
@@ -202,15 +157,12 @@ class ConsistencyGate:
                 )
         return problems
 
-    # -- R4 -----------------------------------------------------------------
-
     @staticmethod
     def _r4_priors(
         active_aus: Sequence[str],
         au_graph: Optional[AUDynGraph],
         open_questions: Sequence[OpenQuestion],
     ) -> List[str]:
-        """Unregistered conflicts with the anatomical prior."""
         problems: List[str] = []
         registered = " ".join(q.detail for q in open_questions)
 
@@ -223,8 +175,7 @@ class ConsistencyGate:
 
         if au_graph is not None:
             for edge in au_graph.edges:
-                # A sign conflict must have been surfaced, not averaged away.
-                if edge.conflict or (edge.weight != edge.weight):   # NaN check
+                if edge.conflict or (edge.weight != edge.weight):
                     marker = f"{edge.source}->{edge.target}"
                     if marker not in registered:
                         problems.append(
@@ -241,14 +192,9 @@ class ConsistencyGate:
                         )
         return problems
 
-    # -- R5 -----------------------------------------------------------------
-
     @staticmethod
     def _r5_phase(causal_cot: Optional[CausalCoT], verdict: Optional[Verdict]) -> List[str]:
         problems: List[str] = []
-        # The label must be a member of the vocabulary. An invented class propagates into
-        # the main path, the authenticity score and the AU chain of thought, all of which
-        # then read as findings about a category that does not exist.
         for source, label in (("verdict", verdict.e_fine if verdict else ""),
                               ("CoT", causal_cot.fine_label if causal_cot else "")):
             if label and label not in FINE_EMOTIONS:
@@ -281,7 +227,6 @@ class ConsistencyGate:
 
 
 def _flatten_numbers(payload: Any, prefix: str = "") -> Dict[str, float]:
-    """Collect every numeric leaf, keyed by dotted path and by bare name."""
     out: Dict[str, float] = {}
     if isinstance(payload, dict):
         for key, value in payload.items():
@@ -301,15 +246,8 @@ def _flatten_numbers(payload: Any, prefix: str = "") -> Dict[str, float]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Sufficiency gate
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class CheckItem:
-    """One completeness requirement for a phase."""
-
     key: str
     description: str
     test: Callable[[Dict[str, Any]], bool]
@@ -321,7 +259,6 @@ def _non_empty(name: str) -> Callable[[Dict[str, Any]], bool]:
     return lambda product: bool(product.get(name))
 
 
-#: Per-phase completeness checklists (appendix D.5, "各级检查项表").
 CHECKLISTS: Dict[str, List[CheckItem]] = {
     "P.scan": [
         CheckItem("proposals", "the confirmed proposal set is present",
@@ -433,7 +370,6 @@ CHECKLISTS: Dict[str, List[CheckItem]] = {
 
 
 class SufficiencyGate:
-    """Three-grade completeness assessment."""
 
     def check(self, phase: str, product: Dict[str, Any], retry_idx: int = 0) -> GateRecord:
         items = CHECKLISTS.get(phase, [])
@@ -445,7 +381,7 @@ class SufficiencyGate:
         for item in items:
             try:
                 ok = bool(item.test(product))
-            except Exception:  # noqa: BLE001 - a malformed product simply fails the item
+            except Exception:
                 ok = False
             if not ok:
                 missing.append(item)
@@ -463,10 +399,6 @@ class SufficiencyGate:
             questions=[item.question for item in missing], retry_idx=retry_idx,
         )
 
-
-# ---------------------------------------------------------------------------
-# Combined gate
-# ---------------------------------------------------------------------------
 
 REVISION_TEMPLATE = """[Revision instruction]
 Target: {phase}
@@ -488,7 +420,6 @@ REVISION_TEMPLATE_ZH = """【修订指令】
 
 
 class DualGate:
-    """Runs both gates and produces the revision instruction on failure."""
 
     def __init__(self, tolerance: float = NUMERIC_TOLERANCE, lang: str = "en") -> None:
         self.consistency = ConsistencyGate(tolerance)
@@ -506,8 +437,6 @@ class DualGate:
 
         instruction = ""
         if not passed:
-            # Consistency first: a product with an illegal citation cannot be
-            # meaningfully assessed for completeness.
             failing = consistency if not consistency.passed else sufficiency
             template = REVISION_TEMPLATE_ZH if self.lang == "zh" else REVISION_TEMPLATE
             refs = _offending_refs(product)

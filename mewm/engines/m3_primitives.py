@@ -1,5 +1,4 @@
-"""M3 -- the four rollout service primitives (paper 3.3.3).
-"""
+"""M3 primitives: emotion-conditioned rollout and counterfactual test primitives."""
 
 from __future__ import annotations
 
@@ -20,19 +19,7 @@ from ..schemas import RolloutRecord
 
 LOGGER = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Distances
-# ---------------------------------------------------------------------------
-
-
 def dtw_distance(a: np.ndarray, b: np.ndarray, band_ratio: float = 0.2) -> float:
-    """Sakoe-Chiba-banded DTW between two activation sequences (appendix C.3).
-
-    The band both bounds the cost at ``O(n * band)`` and rules out degenerate alignments
-    that would warp a slow ramp onto a sharp transient -- a distinction this system
-    depends on when separating a social smile from a micro-expression.
-    """
     a = np.atleast_2d(np.asarray(a, dtype=np.float64))
     b = np.atleast_2d(np.asarray(b, dtype=np.float64))
     if a.size == 0 or b.size == 0:
@@ -52,12 +39,9 @@ def dtw_distance(a: np.ndarray, b: np.ndarray, band_ratio: float = 0.2) -> float
             local = float(np.linalg.norm(a[i - 1] - b[j - 1]))
             cost[i, j] = local + min(cost[i - 1, j], cost[i, j - 1], cost[i - 1, j - 1])
     result = cost[n, m]
-    # Normalise by path length so sequences of different duration stay comparable.
     return float(result / (n + m)) if np.isfinite(result) else float("inf")
 
-
 def cosine_divergence(a: np.ndarray, b: np.ndarray) -> float:
-    """``1 - mean cosine similarity`` between two aligned latent trajectories."""
     a = np.atleast_2d(np.asarray(a, dtype=np.float64))
     b = np.atleast_2d(np.asarray(b, dtype=np.float64))
     steps = min(a.shape[0], b.shape[0])
@@ -71,9 +55,7 @@ def cosine_divergence(a: np.ndarray, b: np.ndarray) -> float:
         similarities.append(float(a[i] @ b[i] / (na * nb)))
     return round(1.0 - float(np.mean(similarities)), 5) if similarities else 1.0
 
-
 def resample_template(curves: Dict[str, Sequence[float]], length: int) -> np.ndarray:
-    """Render a prototype template as a ``(length, K)`` activation matrix."""
     out = np.zeros((max(1, length), K_SLOTS), dtype=np.float64)
     source = np.linspace(0.0, 1.0, TEMPLATE_LENGTH)
     target = np.linspace(0.0, 1.0, max(1, length))
@@ -83,16 +65,10 @@ def resample_template(curves: Dict[str, Sequence[float]], length: int) -> np.nda
         out[:, SLOT_INDEX[au]] = np.interp(target, source, np.asarray(curve, dtype=np.float64))
     return out
 
-
-# ---------------------------------------------------------------------------
-# Results
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class RolloutResult:
-    trajectory: np.ndarray                       # (S, K) expected activations
-    variance: np.ndarray                         # (S,) or (S, K)
+    trajectory: np.ndarray
+    variance: np.ndarray
     emotion: Optional[str] = None
     record: Optional[RolloutRecord] = None
 
@@ -104,32 +80,29 @@ class RolloutResult:
             "mean_variance": round(float(np.mean(self.variance)), 5) if self.variance.size else 0.0,
         }
 
-
 @dataclass
 class ScoreResult:
     log_likelihood: Dict[str, float]
-    normalised: Dict[str, float]                  # DC(e), min-max within the candidate set
+    normalised: Dict[str, float]
     record: Optional[RolloutRecord] = None
 
     def ranked(self) -> List[Tuple[str, float]]:
         return sorted(self.log_likelihood.items(), key=lambda kv: -kv[1])
 
     def likelihood_ratio(self, first: str, second: str) -> float:
-        """``Lambda = l(e1) - l(e2)``."""
         return round(self.log_likelihood.get(first, 0.0) - self.log_likelihood.get(second, 0.0), 5)
 
     def digest(self) -> Dict[str, Any]:
         return {"ranked": [(e, round(v, 4)) for e, v in self.ranked()[:4]],
                 "dc": {k: v for k, v in list(self.normalised.items())[:6]}}
 
-
 @dataclass
 class MaskResult:
     belief_full: BeliefState
     belief_masked: BeliefState
     masked_slots: List[str]
-    mni: float                                    # D_KL(q(z^e|A) || q(z^e|A_-k))
-    flipped: bool                                 # did the argmax hypothesis change?
+    mni: float
+    flipped: bool
     entropy_delta: float
     record: Optional[RolloutRecord] = None
 
@@ -139,7 +112,6 @@ class MaskResult:
             "flipped": self.flipped, "entropy_delta": round(self.entropy_delta, 5),
             "full_top": self.belief_full.top(2), "masked_top": self.belief_masked.top(2),
         }
-
 
 @dataclass
 class CompareResult:
@@ -155,7 +127,6 @@ class CompareResult:
             "largest_gaps": sorted(self.per_au_delta.items(), key=lambda kv: -abs(kv[1]))[:4],
         }
 
-
 def _top_aus(trajectory: np.ndarray, n: int = 4) -> List[Tuple[str, float]]:
     if trajectory.size == 0:
         return []
@@ -164,18 +135,7 @@ def _top_aus(trajectory: np.ndarray, n: int = 4) -> List[Tuple[str, float]]:
     return [(SLOT_AUS[i], round(float(peaks[i]), 4)) for i in order
             if i < len(SLOT_AUS) and peaks[i] > 0.01]
 
-
-# ---------------------------------------------------------------------------
-# The service
-# ---------------------------------------------------------------------------
-
-
 class RolloutService:
-    """The four primitives, with provenance recording.
-
-    Works with a trained :class:`~mewm.engines.m1_dynamics.AUDynamicsModel` or with the
-    analytic stand-in; ``model_version`` always reflects which one answered.
-    """
 
     def __init__(
         self,
@@ -196,7 +156,7 @@ class RolloutService:
         if callable(getter):
             try:
                 return str(getter())
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         return str(getattr(self.dynamics, "version", "m1-unknown"))
 
@@ -207,8 +167,6 @@ class RolloutService:
         self.records.append(record)
         return record
 
-    # -- 1. rollout ---------------------------------------------------------
-
     def rollout(
         self,
         context: np.ndarray,
@@ -217,7 +175,6 @@ class RolloutService:
         caller: str = "R",
         cid: str = "",
     ) -> RolloutResult:
-        """Roll forward from ``context``; with ``emotion``, under that hypothesis."""
         steps = steps or self.config.rollout_steps
         context = np.atleast_2d(np.asarray(context, dtype=np.float64))
         last = context[-1] if context.shape[0] else np.zeros(K_SLOTS)
@@ -237,16 +194,8 @@ class RolloutService:
         return result
 
     def expected_trajectory(self, emotion: str, length: int) -> np.ndarray:
-        """``tilde A^(e)`` -- the prototype-shaped trajectory the hypothesis predicts.
-
-        Sourced from the prototype library rather than the transition model, so that the
-        CFS comparison of eq. (9) has a reference that is statistically independent of
-        the model producing the likelihoods (appendix C.3).
-        """
         template = self.library.get(emotion, "full")
         return resample_template(template.curves, length)
-
-    # -- 2. score -----------------------------------------------------------
 
     def score(
         self,
@@ -255,7 +204,6 @@ class RolloutService:
         caller: str = "R",
         cid: str = "",
     ) -> ScoreResult:
-        """Conditional log-likelihood of the observed trajectory per hypothesis."""
         trajectory = np.atleast_2d(np.asarray(trajectory, dtype=np.float64))
         candidates = list(emotions or self.emotions)
         likelihood = {
@@ -270,8 +218,6 @@ class RolloutService:
         )
         return result
 
-    # -- 3. mask ------------------------------------------------------------
-
     def mask(
         self,
         trajectory: np.ndarray,
@@ -280,13 +226,6 @@ class RolloutService:
         caller: str = "C",
         cid: str = "",
     ) -> MaskResult:
-        """Mask slots out of the observation set and re-infer the belief (eq. 10).
-
-        Masked slots are marked *unobserved* rather than set to zero.  Zeroing would
-        assert "this AU was measured and found inactive", which is a different and much
-        stronger claim than "this AU was not measured" -- and it is the latter that slot
-        dropout made an in-distribution input.
-        """
         trajectory = np.atleast_2d(np.asarray(trajectory, dtype=np.float64))
         candidates = list(emotions or self.emotions)
 
@@ -317,10 +256,8 @@ class RolloutService:
         self, trajectory: np.ndarray, emotions: Sequence[str],
         observed: Optional[np.ndarray] = None,
     ) -> BeliefState:
-        """``q(z^e | A)`` -- posterior from per-hypothesis conditional likelihood."""
         working = trajectory.copy()
         if observed is not None:
-            # Unobserved slots are dropped from the evidence, not asserted to be zero.
             working = working[:, observed] if working.shape[1] == observed.size else working
             padded = np.zeros_like(trajectory)
             if working.shape[1] == int(observed.sum()):
@@ -333,8 +270,6 @@ class RolloutService:
             for emotion in emotions
         }
         if observed is not None:
-            # Re-weight by how much of each prototype survived the mask, so removing a
-            # hypothesis's core evidence actually costs that hypothesis.
             from ..knowledge.emotion_prototypes import core_aus
             for emotion in emotions:
                 core = [au for au in core_aus(emotion) if au in SLOT_INDEX]
@@ -360,8 +295,6 @@ class RolloutService:
         belief.update({e: v - centre for e, v in scores.items()}, weight=1.0)
         return belief
 
-    # -- 4. compare ---------------------------------------------------------
-
     def compare(
         self,
         first: np.ndarray,
@@ -369,7 +302,6 @@ class RolloutService:
         caller: str = "C",
         cid: str = "",
     ) -> CompareResult:
-        """Structured difference report between two trajectories."""
         first = np.atleast_2d(np.asarray(first, dtype=np.float64))
         second = np.atleast_2d(np.asarray(second, dtype=np.float64))
         per_au: Dict[str, float] = {}
@@ -391,8 +323,6 @@ class RolloutService:
         )
         return result
 
-    # -- derived quantities the agents ask for ------------------------------
-
     def counterfactual_consistency(
         self,
         observed: np.ndarray,
@@ -400,7 +330,6 @@ class RolloutService:
         caller: str = "C",
         cid: str = "",
     ) -> Dict[str, float]:
-        """``CFS(e)`` of eq. (9): ``1 - DTW(A_obs, tilde A^(e)) / max_e' DTW``."""
         observed = np.atleast_2d(np.asarray(observed, dtype=np.float64))
         length = max(2, observed.shape[0])
         distances = {
@@ -428,7 +357,6 @@ class RolloutService:
         caller: str = "C",
         cid: str = "",
     ) -> Dict[str, MaskResult]:
-        """Leave-one-out ``MNI_k`` for each claimed critical AU."""
         return {
             au: self.mask(observed, [au], emotions, caller=caller, cid=cid)
             for au in critical_aus
@@ -441,13 +369,6 @@ class RolloutService:
         caller: str = "C",
         cid: str = "",
     ) -> Dict[str, float]:
-        """Distances to the full / neutralised / masked templates (appendix C.4).
-
-        The third-party reference: likelihood and rollout both come from the transition
-        model, so a systematic model bias shifts them together.  These templates are
-        counted from data, so agreement across all three is strong evidence and
-        disagreement localises the fault.
-        """
         observed = np.atleast_2d(np.asarray(observed, dtype=np.float64))
         length = max(2, observed.shape[0])
         out: Dict[str, float] = {}
@@ -462,8 +383,6 @@ class RolloutService:
                      {"primitive": "template", "emotion": emotion}, out, cid)
         return out
 
-    # -- provenance ---------------------------------------------------------
-
     def records_for(self, cid: str) -> List[RolloutRecord]:
         return [r for r in self.records if r.cid == cid]
 
@@ -473,7 +392,6 @@ class RolloutService:
             by_primitive[record.primitive] = by_primitive.get(record.primitive, 0) + 1
         return {"model_version": self.model_version, "calls": len(self.records),
                 "by_primitive": by_primitive}
-
 
 __all__ = [
     "dtw_distance", "cosine_divergence", "resample_template", "RolloutResult",

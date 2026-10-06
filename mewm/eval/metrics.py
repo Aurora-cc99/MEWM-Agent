@@ -1,12 +1,4 @@
-"""Evaluation metrics for the four protocols of paper 4.1-4.2.
-
-**``theta`` is a hyper-parameter, not the constant 0.5.** The paper fixes it at 0.5 and
-the ME-LVQA baselines report there, so that is the default -- but the entire
-precision/recall trade-off pivots on it, and a framework that hard-codes it cannot run
-the sensitivity sweep its own protocol asks for. It is threaded through every function
-here and driven from ``EvaluationConfig.iou_threshold``.
-"""
-
+"""Core evaluation metrics: F1, IoU, spotting precision/recall for ME tasks."""
 from __future__ import annotations
 
 import math
@@ -19,28 +11,18 @@ from ..knowledge.emotion_prototypes import canonical_fine_label
 
 Interval = Tuple[int, int]
 
-#: Paper default; override through ``EvaluationConfig.iou_threshold``.
 DEFAULT_IOU_THRESHOLD = 0.5
-
-
-# ---------------------------------------------------------------------------
-# The eq. (2) criterion -- one implementation, three callers
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class TPDecision:
-    """The verdict of eq. (2) on one proposal, with why it came out that way."""
-
     is_tp: bool
     rescued: bool
     iou: float
-    #: Empty when the proposal passed; otherwise a human-readable failure reason.
     reasons: Tuple[str, ...] = ()
 
     @property
     def is_tp_strict(self) -> bool:
-        """True only on the IoU clause -- the rescue-free figure."""
         return self.is_tp and not self.rescued
 
 
@@ -52,11 +34,6 @@ def tp_decision(
     affective_rescue: bool = True,
     rescue_min_iou: float = 0.0,
 ) -> TPDecision:
-    """The single implementation of eq. (2). Everything that judges a proposal calls it.
-
-    *Scoring* is deliberately not here. This answers "does it count"; the reward's
-    partial-credit curve is a separate question layered on top of the answer.
-    """
     overlap = float(overlap)
     if overlap > iou_threshold:
         return TPDecision(True, False, overlap)
@@ -66,23 +43,15 @@ def tp_decision(
                           (f"IoU {overlap:.3f} below threshold {iou_threshold:.2f} "
                            f"and affective rescue is disabled",))
     if overlap < rescue_min_iou:
-        # Without this floor a proposal that merely grazes the event -- or, at the 0.0
-        # default, misses it outright -- passes on its label alone.
         return TPDecision(False, False, overlap,
                           (f"IoU {overlap:.3f} below the rescue floor "
                            f"{rescue_min_iou:.2f}",))
 
-    # Canonicalise before comparing: "happiness" and "HAPPINESS " are the same emotion,
-    # and whether a run credits them alike must not depend on which caller is asking.
     predicted, pred_known = canonical_fine_label(fine_pred)
     reference, true_known = canonical_fine_label(fine_true)
     if pred_known and true_known:
         matched = predicted == reference
     else:
-        # Outside the canonical vocabulary every unknown string collapses to "other",
-        # so comparing canonical forms there would rescue "banana" against "unicorn".
-        # Fall back to exact equality of what was actually written -- which is also what
-        # lets a dataset-specific label match itself.
         written = fine_pred.strip().casefold()
         matched = bool(written) and written == fine_true.strip().casefold()
     if matched:
@@ -92,13 +61,7 @@ def tp_decision(
                        f"label {fine_pred!r} does not match {fine_true!r}",))
 
 
-# ---------------------------------------------------------------------------
-# Interval helpers
-# ---------------------------------------------------------------------------
-
-
 def iou(a: Interval, b: Interval) -> float:
-    """Temporal intersection over union of two inclusive frame intervals."""
     lo, hi = max(a[0], b[0]), min(a[1], b[1])
     intersection = max(0, hi - lo + 1)
     union = (a[1] - a[0] + 1) + (b[1] - b[0] + 1) - intersection
@@ -107,14 +70,12 @@ def iou(a: Interval, b: Interval) -> float:
 
 @dataclass
 class Match:
-    """One proposal paired with the ground-truth event it claimed."""
-
     proposal_index: int
     truth_index: Optional[int]
     iou: float
     predicted_label: str = ""
     true_label: str = ""
-    rescued: bool = False           # counted only via the affective-rescue clause
+    rescued: bool = False
     iou_threshold: float = DEFAULT_IOU_THRESHOLD
     affective_rescue: bool = True
     rescue_min_iou: float = 0.0
@@ -125,7 +86,6 @@ class Match:
 
     @property
     def decision(self) -> TPDecision:
-        """This match under eq. (2). An unmatched proposal is a FP by construction."""
         if self.truth_index is None:
             return TPDecision(False, False, self.iou,
                               ("no ground-truth event was claimed",))
@@ -147,7 +107,6 @@ def greedy_match(
     affective_rescue: bool = True,
     rescue_min_iou: float = 0.0,
 ) -> List[Match]:
-    """Greedy IoU matching; each ground-truth event is claimed at most once."""
     pairs = sorted(
         (
             (iou(p, g), pi, gi)
@@ -180,15 +139,8 @@ def greedy_match(
     return matches
 
 
-# ---------------------------------------------------------------------------
-# P1 -- proposal-level localisation + analysis
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class ProposalMetrics:
-    """Precision / recall / F1 under both criteria, plus boundary error."""
-
     n_proposals: int = 0
     n_truths: int = 0
     tp: int = 0
@@ -210,7 +162,6 @@ class ProposalMetrics:
 
     @property
     def rescue_gain(self) -> float:
-        """F1 attributable to the affective-rescue clause alone."""
         return round(self.f1 - self.f1_strict, 4)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -228,7 +179,6 @@ def evaluate_proposals(
     affective_rescue: bool = True,
     rescue_min_iou: float = 0.0,
 ) -> ProposalMetrics:
-    """P1: proposal-level metrics under both the eq. (2) and the strict-IoU criteria."""
     matches = greedy_match(proposals, truths, predicted_labels, true_labels,
                            iou_threshold, affective_rescue, rescue_min_iou)
     metrics = ProposalMetrics(n_proposals=len(proposals), n_truths=len(truths),
@@ -275,11 +225,6 @@ def _prf(tp: int, n_pred: int, n_true: int) -> Tuple[float, float, float]:
 
 
 def aggregate_proposal_metrics(per_video: Sequence[ProposalMetrics]) -> ProposalMetrics:
-    """Micro-average over videos: pool the counts, then compute the rates once.
-
-    Micro rather than macro because a per-video average would give a 40-frame clip with
-    one event the same weight as a 9000-frame video with eight.
-    """
     total = ProposalMetrics()
     if per_video:
         total.iou_threshold = per_video[0].iou_threshold
@@ -309,11 +254,6 @@ def sweep_iou_threshold(
     thresholds: Sequence[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7),
     affective_rescue: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Recompute P1 across a grid of IoU thresholds (paper 4.6(2)).
-
-    Reports both criteria at every point, so the precision/recall Pareto front and the
-    rescue clause's contribution can be read off together rather than confounded.
-    """
     rows: List[Dict[str, Any]] = []
     for threshold in thresholds:
         per_video = [
@@ -336,18 +276,8 @@ def sweep_iou_threshold(
     return rows
 
 
-# ---------------------------------------------------------------------------
-# P2 -- interval understanding: recognition and AU detection
-# ---------------------------------------------------------------------------
-
-
 def unweighted_f1(y_true: Sequence[str], y_pred: Sequence[str],
                   labels: Optional[Sequence[str]] = None) -> Tuple[float, Dict[str, float]]:
-    """UF1: macro F1 over classes, unweighted by support.
-
-    Unweighted because micro-expression datasets are heavily imbalanced; a
-    support-weighted score would mostly report performance on the majority class.
-    """
     labels = list(labels or sorted(set(y_true) | set(y_pred)))
     per_class: Dict[str, float] = {}
     for label in labels:
@@ -362,7 +292,6 @@ def unweighted_f1(y_true: Sequence[str], y_pred: Sequence[str],
 
 def unweighted_average_recall(y_true: Sequence[str], y_pred: Sequence[str],
                               labels: Optional[Sequence[str]] = None) -> float:
-    """UAR: mean per-class recall."""
     labels = list(labels or sorted(set(y_true)))
     recalls = []
     for label in labels:
@@ -382,7 +311,6 @@ def accuracy(y_true: Sequence[str], y_pred: Sequence[str]) -> float:
 
 def au_set_metrics(predicted: Sequence[Sequence[str]],
                    truth: Sequence[Sequence[str]]) -> Dict[str, float]:
-    """AU set F1 and Jaccard, averaged over samples."""
     f1_scores, jaccards = [], []
     for pred, true in zip(predicted, truth):
         p, t = set(pred), set(true)
@@ -399,14 +327,7 @@ def au_set_metrics(predicted: Sequence[Sequence[str]],
     }
 
 
-# ---------------------------------------------------------------------------
-# P3 -- ME-LVQA official metrics
-# ---------------------------------------------------------------------------
-
-
 def count_errors(predicted: Sequence[int], truth: Sequence[int]) -> Dict[str, Any]:
-    """Event-count MAE and RMSE.
-    """
     if not predicted or not truth:
         return {"status": "unavailable",
                 "reason": "no (predicted, truth) count pair was supplied"}
@@ -427,7 +348,6 @@ def _ngrams(tokens: Sequence[str], n: int) -> Dict[Tuple[str, ...], int]:
 
 
 def bleu(candidate: str, reference: str, max_n: int = 4) -> float:
-    """Sentence BLEU with the standard brevity penalty."""
     cand = candidate.split()
     ref = reference.split()
     if not cand or not ref:
@@ -443,8 +363,6 @@ def bleu(candidate: str, reference: str, max_n: int = 4) -> float:
                       for gram, count in cand_grams.items())
         precisions.append(overlap / sum(cand_grams.values()))
     if min(precisions) <= 0:
-        # Smooth rather than collapse to zero: a single missing 4-gram should not erase
-        # a otherwise-good short answer.
         precisions = [max(p, 1e-9) for p in precisions]
     geometric = math.exp(sum(math.log(p) for p in precisions) / max_n)
     brevity = 1.0 if len(cand) > len(ref) else math.exp(1 - len(ref) / max(1, len(cand)))
@@ -452,7 +370,6 @@ def bleu(candidate: str, reference: str, max_n: int = 4) -> float:
 
 
 def rouge_n(candidate: str, reference: str, n: int = 1) -> float:
-    """ROUGE-N recall."""
     cand_grams = _ngrams(candidate.split(), n)
     ref_grams = _ngrams(reference.split(), n)
     if not ref_grams:
@@ -462,7 +379,6 @@ def rouge_n(candidate: str, reference: str, n: int = 1) -> float:
 
 
 def rouge_l(candidate: str, reference: str, beta: float = 1.2) -> float:
-    """ROUGE-L F-measure over the longest common subsequence."""
     cand, ref = candidate.split(), reference.split()
     if not cand or not ref:
         return 0.0
@@ -478,14 +394,8 @@ def rouge_l(candidate: str, reference: str, beta: float = 1.2) -> float:
     return round((1 + beta ** 2) * precision * recall / denominator, 4) if denominator else 0.0
 
 
-# ---------------------------------------------------------------------------
-# Calibration and causal reliability
-# ---------------------------------------------------------------------------
-
-
 def expected_calibration_error(confidences: Sequence[float], correct: Sequence[bool],
                                n_bins: int = 10) -> float:
-    """ECE with equal-width bins."""
     if not confidences:
         return 0.0
     confidences = np.asarray(confidences, dtype=np.float64)
@@ -510,12 +420,10 @@ def brier_score(confidences: Sequence[float], correct: Sequence[bool]) -> float:
 
 @dataclass
 class CausalReliability:
-    """The causal-reliability block of the second evaluation layer."""
-
-    challenge_pass_rate: float = 0.0      # rho_pass
-    hallucination_rate: float = 0.0       # rho_hall: claimed AUs with no evidence
+    challenge_pass_rate: float = 0.0
+    hallucination_rate: float = 0.0
     mean_mni: float = 0.0
-    flip_rate: float = 0.0                # rho_flip
+    flip_rate: float = 0.0
     n_samples: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -529,7 +437,6 @@ def causal_reliability(
     mni_values: Sequence[Dict[str, float]],
     flips: Sequence[Dict[str, bool]],
 ) -> CausalReliability:
-    """Aggregate the four causal-reliability indicators."""
     metrics = CausalReliability(n_samples=len(claimed_aus))
     if challenge_finals:
         metrics.challenge_pass_rate = round(
@@ -550,13 +457,7 @@ def causal_reliability(
     return metrics
 
 
-# ---------------------------------------------------------------------------
-# Trajectory-level indicators
-# ---------------------------------------------------------------------------
-
-
 def trajectory_metrics(states: Sequence[Any]) -> Dict[str, Any]:
-    """Gate pass rate, revision effectiveness, degradation rate over a run set."""
     first_pass, total_gates, revisions, effective = 0, 0, 0, 0
     degraded_videos, n_calls = 0, 0
     for state in states:

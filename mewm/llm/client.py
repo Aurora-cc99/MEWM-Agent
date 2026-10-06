@@ -1,6 +1,4 @@
-"""LLM transport for the agent layer.
-"""
-
+"""Unified LLM client: dispatches to API-hosted or local open-weight backends."""
 from __future__ import annotations
 
 import base64
@@ -29,45 +27,28 @@ MAX_IMAGE_EDGE = 1024
 
 
 class LLMError(RuntimeError):
-    """Transport-level failure."""
+    pass
 
 
 class ModelMismatchError(LLMError):
-    """The endpoint answered as a different model than the one requested.
-
-    Never retried: retrying a silent remap just produces the wrong model's text again.
-    """
+    pass
 
 
 class BackendMismatch(LLMError):
-    """A role's declared backend contradicts the model's registry entry (方案 §5.1).
+    pass
 
-    ``hosted`` with an open-weight id, or ``local`` with a hosted id, is a
-    configuration error to report immediately -- never something to guess around.
-    """
-
-
-# ---------------------------------------------------------------------------
-# Backend router + audit manifest (方案 §5)
-# ---------------------------------------------------------------------------
 
 BACKEND_HOSTED = "hosted"
 BACKEND_LOCAL = "local"
 
 
 def backend_for(model: str, backend: str) -> ModelSpec:
-    """Validate an explicit ``'hosted' | 'local'`` backend against the registry.
-
-    The registry only *checks* consistency; it never chooses for the user
-    (方案 §5.1). Returns the resolved spec on success.
-    """
     spec = resolve(model)
     if backend == BACKEND_LOCAL:
         if not spec.open_weights:
             raise BackendMismatch(
                 f"{spec.model_id} is a hosted model and cannot run on the local "
-                f"backend; use an open-weight id or set this role's backend to "
-                f"'hosted'")
+                f"")
         return spec
     if backend == BACKEND_HOSTED:
         if spec.open_weights:
@@ -80,8 +61,6 @@ def backend_for(model: str, backend: str) -> ModelSpec:
         f"'local'")
 
 
-#: Per-process audit trail: one entry per model call, so a run's summary can state
-#: which role went over which route -- and whether any call fell back (方案 §5.3).
 _BACKEND_MANIFEST: List[Dict[str, Any]] = []
 
 
@@ -96,7 +75,6 @@ def record_backend_event(role: str, model: str, backend: str, route: str,
 
 
 def backend_manifest(reset: bool = False) -> List[Dict[str, Any]]:
-    """The calls recorded since the last reset; ``reset=True`` drains the list."""
     out = list(_BACKEND_MANIFEST)
     if reset:
         _BACKEND_MANIFEST.clear()
@@ -109,7 +87,7 @@ def reset_backend_manifest() -> None:
 
 @dataclass
 class LLMResponse:
-    """Model output plus the metadata the audit trail needs."""
+
 
     text: str
     model: str
@@ -118,11 +96,6 @@ class LLMResponse:
     attempts: int = 1
     reasoning_effort: str = ""
     served_model: str = ""
-    #: The chain of thought, when the model emitted one and the transport exposes it:
-    #: Anthropic ``thinking_delta`` blocks, or the ``<think>...</think>`` span an
-    #: open-weight model produced (see :mod:`mewm.llm.local_models`). Always kept
-    #: *out* of ``text`` -- the agent layer parses ``text`` as JSON, so a chain of
-    #: thought left in front of it is a parse failure, not extra information.
     reasoning: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -132,11 +105,6 @@ class LLMResponse:
             "attempts": self.attempts, "reasoning_effort": self.reasoning_effort,
             "chars": len(self.text), "reasoning_chars": len(self.reasoning),
         }
-
-
-# ---------------------------------------------------------------------------
-# Compatibility shims (the registry is the source of truth)
-# ---------------------------------------------------------------------------
 
 
 def is_claude_model(model: str) -> bool:
@@ -174,13 +142,7 @@ def credentials_available(model: str) -> bool:
     return _available(model)
 
 
-# ---------------------------------------------------------------------------
-# Images
-# ---------------------------------------------------------------------------
-
-
 def encode_image_as_data_url(image_path: str | Path, max_edge: int = MAX_IMAGE_EDGE) -> str:
-    """Read, downscale and base64-encode an image as a JPEG data URL."""
     path = Path(image_path)
     if not path.is_file():
         raise LLMError(f"image not found: {path}")
@@ -199,7 +161,7 @@ def encode_image_as_data_url(image_path: str | Path, max_edge: int = MAX_IMAGE_E
         if not ok:
             raise LLMError(f"could not encode {path}")
         payload = base64.b64encode(buffer.tobytes()).decode("ascii")
-    except ImportError:  # pragma: no cover
+    except ImportError:
         payload = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:image/jpeg;base64,{payload}"
 
@@ -207,11 +169,6 @@ def encode_image_as_data_url(image_path: str | Path, max_edge: int = MAX_IMAGE_E
 def _split_data_url(data_url: str) -> tuple[str, str]:
     media_type, _, payload = data_url.partition(";base64,")
     return (media_type.replace("data:", "") or "image/jpeg"), payload
-
-
-# ---------------------------------------------------------------------------
-# Anthropic transport
-# ---------------------------------------------------------------------------
 
 
 def _anthropic_headers(spec: ModelSpec) -> Dict[str, str]:
@@ -229,7 +186,6 @@ def _anthropic_headers(spec: ModelSpec) -> Dict[str, str]:
         "accept": "text/event-stream",
     }
     if provider.user_agent:
-        # Cloudflare rejects unknown agents on the newcli relays with 403 / 1010.
         headers["User-Agent"] = provider.user_agent
     return headers
 
@@ -246,7 +202,6 @@ def _anthropic_payload(spec: ModelSpec, system_prompt: str, user_prompt: str,
     body: Dict[str, Any] = {
         "model": spec.model_id,
         "max_tokens": max_tokens,
-        # These relays reject a plain-string system with a 400; the block form is required.
         "system": [{"type": "text", "text": system_prompt}] if system_prompt else [],
         "messages": [{"role": "user", "content": content}],
         "stream": True,
@@ -255,7 +210,6 @@ def _anthropic_payload(spec: ModelSpec, system_prompt: str, user_prompt: str,
         body.pop("system")
     if effort and spec.efforts:
         budget = EFFORT_THINKING_BUDGET.get(effort, EFFORT_THINKING_BUDGET["high"])
-        # The answer budget sits on top of the thinking budget.
         body["max_tokens"] = max(max_tokens, budget + max(1024, max_tokens))
         body["thinking"] = {"type": "enabled", "budget_tokens": budget, "effort": effort}
     return body
@@ -296,8 +250,6 @@ def _post_anthropic(spec: ModelSpec, body: Dict[str, Any],
                 delta = event.get("delta") or {}
                 if delta.get("type") == "text_delta":
                     chunks.append(str(delta.get("text") or ""))
-                # Thinking arrives on its own delta type. It is collected separately
-                # rather than concatenated: the caller parses the answer as JSON.
                 elif delta.get("type") == "thinking_delta":
                     thoughts.append(str(delta.get("thinking") or ""))
             elif kind == "error":
@@ -308,11 +260,6 @@ def _post_anthropic(spec: ModelSpec, body: Dict[str, Any],
             "a silently remapped model"
         )
     return "".join(chunks), served, "".join(thoughts)
-
-
-# ---------------------------------------------------------------------------
-# OpenAI transport
-# ---------------------------------------------------------------------------
 
 
 def _openai_headers(spec: ModelSpec) -> Dict[str, str]:
@@ -382,11 +329,6 @@ def _text_from_chat(data: Dict[str, Any]) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Gemini transport (native generateContent)
-# ---------------------------------------------------------------------------
-
-
 def _gemini_payload(system_prompt: str, user_prompt: str, data_urls: Sequence[str],
                     max_tokens: int) -> Dict[str, Any]:
     parts: List[Dict[str, Any]] = [{"text": user_prompt}]
@@ -429,11 +371,6 @@ def _post_gemini(spec: ModelSpec, body: Dict[str, Any], timeout: int) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
-
 def call_model(
     system_prompt: str,
     user_prompt: str,
@@ -448,8 +385,6 @@ def call_model(
     role: str = "",
     **_ignored: Any,
 ) -> LLMResponse:
-    """Call ``model`` with optional vision attachments and return its text.
-    """
 
     if not is_registered(model):
         raise LLMError(
@@ -492,8 +427,6 @@ def call_model(
 
     started = time.time()
     last_error: Optional[Exception] = None
-    # Some endpoints return empty completions intermittently (see the DeepSeek vision
-    # note in the registry); a per-model floor keeps that from surfacing as a failure.
     attempts_allowed = max(1, retries, spec.min_retries)
 
     for attempt in range(attempts_allowed):
@@ -531,12 +464,6 @@ def call_model(
                 if not base:
                     raise LLMError("OPENAI_API_URL is not set")
                 routes = [
-                    # ``/chat/completions`` was dropped as a fallback here -- on this
-                    # proxy it hangs until Cloudflare's edge times out (524) instead of
-                    # failing fast, at the token budgets this pipeline actually uses
-                    # (see module docstring). A stuck route wasted a full attempt's
-                    # timeout for nothing; retries now go through the attempt loop
-                    # below instead of a second in-attempt route.
                     (f"{base}/responses", _responses_payload, _text_from_responses),
                 ]
                 for url, build, extract in routes:
@@ -565,19 +492,15 @@ def call_model(
                 raise LLMError(f"unsupported transport {spec.transport!r}")
 
         except ModelMismatchError:
-            raise                                   # never retried
+            raise
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
             last_error = LLMError(f"HTTP {exc.code} from {spec.provider}: {detail}")
         except LLMError as exc:
             last_error = exc
-        except Exception as exc:  # noqa: BLE001 - network layer
+        except Exception as exc:
             last_error = LLMError(f"{type(exc).__name__}: {exc}")
 
-        # Announce the failed attempt rather than only the exhausted budget. Each attempt
-        # can burn the full timeout -- and the OpenAI transport tries two routes per
-        # attempt -- so a stalled call can hold the run for timeout x routes x attempts
-        # with no output at all. Silence there is indistinguishable from progress.
         LOGGER.warning("%s attempt %d/%d failed after %.0fs (%s); retrying",
                        spec.model_id, attempt + 1, attempts_allowed,
                        time.time() - started, last_error)
@@ -587,19 +510,9 @@ def call_model(
         f"{spec.model_id} transport failed after {attempts_allowed} attempts: {last_error}")
 
 
-# ---------------------------------------------------------------------------
-# Connectivity check
-# ---------------------------------------------------------------------------
-
-
 def ping(model: str, timeout: int = 120,
          image: Optional[str] = None) -> Dict[str, Any]:
-    """One minimal round-trip, for the ``test-models`` command.
 
-    With ``image`` set this becomes a *vision* probe, which is the check that matters
-    for the frame-reading phases: an endpoint can answer a text ping perfectly and still
-    fail every image request.
-    """
     started = time.time()
     prompt = ("Answer in one word: does this image show a human face?" if image
               else "Reply with the single word: ok")
@@ -615,7 +528,7 @@ def ping(model: str, timeout: int = 120,
             "latency_s": round(time.time() - started, 2),
             "route": response.route,
         }
-    except Exception as exc:  # noqa: BLE001 - the point is to report the failure
+    except Exception as exc:
         return {
             "model": model,
             "resolved": resolve(model).model_id if is_registered(model) else model,
@@ -624,13 +537,7 @@ def ping(model: str, timeout: int = 120,
         }
 
 
-# ---------------------------------------------------------------------------
-# Offline / deterministic stub
-# ---------------------------------------------------------------------------
-
-
 class StubClient:
-    """Deterministic replacement for :func:`call_model` in tests and dry runs."""
 
     def __init__(self, responses: Optional[Dict[str, Any]] = None) -> None:
         self.responses: Dict[str, Any] = dict(responses or {})

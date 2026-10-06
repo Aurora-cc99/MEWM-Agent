@@ -1,5 +1,4 @@
-"""Supervised temporal localiser trained on ground-truth micro-expression intervals.
-"""
+"""Supervised localiser fine-tuning using manually annotated ME intervals."""
 
 from __future__ import annotations
 
@@ -20,42 +19,31 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     _TORCH = True
-except ImportError:  # pragma: no cover - mirrors pretrain.py
-    torch = None  # type: ignore
-    nn = None  # type: ignore
+except ImportError:
+    torch = None
+    nn = None
     _TORCH = False
-
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class LocaliserTrainConfig:
-    """Defaults chosen against the measured failure, not copied from appendix F.1.
-    """
 
     dilations: Tuple[int, ...] = (1, 2, 4, 8, 16)
     channels: int = 64
     kernel_size: int = 3
     dropout: float = 0.1
 
-    epochs: int = 60
+    epochs: int = 300
     batch_windows: int = 8
-    window: int = 256              # frames per training window
+    window: int = 256
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
-    patience: int = 12             # early-stop patience, in epochs
+    patience: int = 12
 
-    #: Positive frames are ~1.5% of the corpus. Left unweighted the model predicts the
-    #: constant zero and scores a perfect loss, so the imbalance is corrected explicitly
-    #: and capped -- an uncapped ratio (~65x) makes the loss surface unstable.
     pos_weight_cap: float = 20.0
     focal_gamma: float = 1.0
 
-    #: Fraction of *subjects* (never frames) held out inside the pool for early stopping.
     val_subject_fraction: float = 0.25
     min_val_subjects: int = 1
 
@@ -63,19 +51,7 @@ class LocaliserTrainConfig:
     seed: int = 20260828
 
 
-# ---------------------------------------------------------------------------
-# Features
-# ---------------------------------------------------------------------------
-
-
 def _robust_z(x: np.ndarray, axis: int = 0) -> np.ndarray:
-    """Median/MAD standardisation, per video.
-
-    Subjects differ in face size, illumination and landmark noise floor, so raw slot
-    magnitudes are not comparable across videos. Median/MAD rather than mean/std because
-    the macro-expressions in these videos are exactly the high-leverage outliers that
-    would otherwise set the scale for everything else.
-    """
     med = np.median(x, axis=axis, keepdims=True)
     mad = np.median(np.abs(x - med), axis=axis, keepdims=True)
     scale = 1.4826 * mad
@@ -87,8 +63,6 @@ def frame_features(
     representation: Any,
     slot_error: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Per-frame feature matrix ``(T, D)`` for one video.
-    """
     activations = np.asarray(representation.slot_activations, dtype=np.float64)
     if activations.ndim != 2 or activations.shape[0] < 3:
         raise ValueError("frame_features needs (T, K) slot activations with T >= 3")
@@ -100,8 +74,6 @@ def frame_features(
 
     blocks: List[np.ndarray] = [a, velocity, acceleration]
 
-    # The current detection signal, kept as an input rather than discarded: it is
-    # below chance *pooled*, which is not the same as uninformative everywhere.
     if slot_error is not None:
         err = np.asarray(slot_error, dtype=np.float64)
         if err.shape == activations.shape:
@@ -114,9 +86,6 @@ def frame_features(
         if head.ndim == 2 and head.shape[0] == n_frames:
             head_z = _robust_z(head)
             head_v = np.diff(head_z, axis=0, prepend=head_z[:1])
-            # Scalar speed as well as the signed components: the confound is largely
-            # "is the head moving at all", and a magnitude makes that directly available
-            # instead of asking the first conv layer to synthesise it.
             speed = np.linalg.norm(head_v, axis=1, keepdims=True)
             blocks.extend([head_z, head_v, _robust_z(speed)])
 
@@ -135,13 +104,6 @@ def frame_labels(
     frames: Sequence[int],
     micro_only: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-frame binary micro labels, plus a mask of frames to *ignore* in the loss.
-
-    Macro-expression frames are masked out rather than labelled negative. A macro frame
-    is not a clean negative -- it carries real facial motion -- and training the model to
-    call it "not an event" spends capacity teaching a distinction the metric never scores.
-    Masking them says only "no gradient here", which is the honest statement.
-    """
     frames = list(frames)
     index = {f: i for i, f in enumerate(frames)}
     labels = np.zeros(len(frames), dtype=np.float32)
@@ -153,26 +115,17 @@ def frame_labels(
             if i is not None:
                 labels[i] = 1.0
 
-    if micro_only:
-        for event in video.macro_events():
-            onset, offset = event.interval
-            for t in range(int(onset), int(offset) + 1):
-                i = index.get(t)
-                if i is not None and labels[i] == 0.0:
-                    ignore[i] = True
-
     return labels, ignore
 
 
 @dataclass
 class VideoSample:
-    """One video's features, labels and provenance."""
 
     video_key: str
     subject: str
-    features: np.ndarray          # (T, D)
-    labels: np.ndarray            # (T,)
-    ignore: np.ndarray            # (T,) True where the loss is masked
+    features: np.ndarray
+    labels: np.ndarray
+    ignore: np.ndarray
     frames: List[int] = field(default_factory=list)
 
     @property
@@ -187,12 +140,6 @@ def build_frame_dataset(
     stride: int = 1,
     require_events: bool = True,
 ) -> List[VideoSample]:
-    """Run stage I + the analytic transition, and pair the result with frame labels.
-
-    ``videos`` must already be restricted to the fold's training pool; this function does
-    not know the fold and cannot check it, which is why :func:`train_localiser` records
-    the subjects it actually saw.
-    """
     from ..pipeline import run_representation
     from ..engines.m1_dynamics import AnalyticDynamics
 
@@ -206,7 +153,7 @@ def build_frame_dataset(
         try:
             representation = run_representation(
                 video, config, stride=stride, max_frames=max_frames)
-        except Exception as exc:  # noqa: BLE001 - one broken video must not stop a fold
+        except Exception as exc:
             LOGGER.warning("localiser dataset: skipping %s: %s", video.video_id, exc)
             continue
 
@@ -226,7 +173,6 @@ def build_frame_dataset(
         features = frame_features(representation, slot_error=slot_error)
         labels, ignore = frame_labels(video, representation.frames)
         if require_events and labels.sum() <= 0:
-            # Annotated events fell outside the decoded frame range.
             LOGGER.warning("localiser dataset: %s has no positive frames in range",
                            video.video_id)
             continue
@@ -241,15 +187,9 @@ def build_frame_dataset(
     return samples
 
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-
 if _TORCH:
 
     class _ResidualBlock(nn.Module):
-        """Dilated causal-free (centred) conv block with a residual path."""
 
         def __init__(self, channels: int, kernel: int, dilation: int, dropout: float):
             super().__init__()
@@ -268,12 +208,6 @@ if _TORCH:
             return x + h
 
     class SupervisedLocaliser(nn.Module):
-        """Dilated temporal CNN mapping per-frame features to a per-frame logit.
-
-        Centred (non-causal) convolutions on purpose: spotting is an offline task over a
-        recorded video, so there is no reason to hide the future from the model, and an
-        onset is much easier to identify when its offset is visible.
-        """
 
         def __init__(self, n_features: int, config: Optional[LocaliserTrainConfig] = None):
             super().__init__()
@@ -293,28 +227,21 @@ if _TORCH:
             return 1 + 2 * (self.config.kernel_size - 1) * sum(self.config.dilations)
 
         def forward(self, x):
-            """``x`` is ``(B, T, D)``; returns per-frame logits ``(B, T)``."""
             h = x.transpose(1, 2)
             h = self.stem(h)
             for block in self.blocks:
                 h = block(h)
             return self.head(h).squeeze(1)
 
-else:  # pragma: no cover - import guard mirrors pretrain.py
+else:
 
-    class SupervisedLocaliser:  # type: ignore
+    class SupervisedLocaliser:
         def __init__(self, *a, **kw):
             raise ImportError("SupervisedLocaliser needs PyTorch installed.")
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class LocaliserCheckpoint:
-    """Weights plus the provenance needed to prove a fold was not contaminated."""
 
     state_dict: Dict[str, Any]
     n_features: int
@@ -325,7 +252,6 @@ class LocaliserCheckpoint:
     metrics: Dict[str, Any] = field(default_factory=dict)
 
     def assert_excludes(self, subjects: Sequence[str]) -> None:
-        """Refuse to be used on a subject that was trained on."""
         seen = set(self.train_subjects) | set(self.val_subjects)
         leaked = sorted(seen & {str(s) for s in subjects})
         if leaked:
@@ -362,21 +288,9 @@ class LocaliserCheckpoint:
             fold_name=blob.get("fold_name", ""), metrics=blob.get("metrics", {}))
 
 
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-
-
 def _split_subjects(
     samples: Sequence[VideoSample], config: LocaliserTrainConfig,
 ) -> Tuple[List[str], List[str]]:
-    """Subject-disjoint train/val split for early stopping.
-
-    Splitting by window would put frames from the same subject -- often from the same
-    *event* -- on both sides, and the resulting validation curve would report memorisation
-    as generalisation. Subjects carrying no positive frames go to train: a validation fold
-    with no events cannot rank anything.
-    """
     rng = np.random.default_rng(config.seed)
     with_pos = sorted({s.subject for s in samples if s.n_positive > 0})
     without = sorted({s.subject for s in samples} - set(with_pos))
@@ -393,13 +307,6 @@ def _split_subjects(
 
 
 def _windows(sample: VideoSample, window: int, rng) -> List[Tuple[int, int]]:
-    """Windows over one video, biased toward the annotated events.
-
-    Uniform windowing over a 4000-frame video with 15 positive frames produces batches
-    that are almost all empty, and the pos_weight needed to compensate becomes extreme.
-    Centring one window on each event guarantees every event is seen every epoch while
-    the uniform windows keep the negative distribution honest.
-    """
     n = len(sample.labels)
     if n <= window:
         return [(0, n)]
@@ -423,7 +330,6 @@ def _windows(sample: VideoSample, window: int, rng) -> List[Tuple[int, int]]:
 def _batch(
     samples: Sequence[VideoSample], spans: Sequence[Tuple[int, VideoSample, int, int]],
 ):
-    """Stack ``(features, labels, mask)`` for a list of ``(_, sample, start, stop)``."""
     x = np.stack([s.features[a:b] for _, s, a, b in spans])
     y = np.stack([s.labels[a:b] for _, s, a, b in spans])
     m = np.stack([~s.ignore[a:b] for _, s, a, b in spans])
@@ -432,13 +338,6 @@ def _batch(
 
 
 def _masked_focal_bce(logits, targets, mask, pos_weight: float, gamma: float):
-    """Focal-weighted BCE over unmasked frames only.
-
-    Focal rather than plain BCE because the negatives are not merely numerous but mostly
-    *easy* -- long still stretches the model solves in the first epoch. Down-weighting
-    those concentrates the gradient on the frames near an onset, which is where the
-    analytic curve is wrong.
-    """
     weight = torch.where(targets > 0.5,
                          torch.full_like(targets, pos_weight),
                          torch.ones_like(targets))
@@ -454,7 +353,6 @@ def _masked_focal_bce(logits, targets, mask, pos_weight: float, gamma: float):
 
 
 def _frame_auc(scores: np.ndarray, labels: np.ndarray, mask: np.ndarray) -> float:
-    """Mann-Whitney rank AUC on unmasked frames; NaN when a side is empty."""
     keep = mask.astype(bool)
     pos = scores[keep & (labels > 0.5)]
     neg = scores[keep & (labels <= 0.5)]
@@ -463,7 +361,6 @@ def _frame_auc(scores: np.ndarray, labels: np.ndarray, mask: np.ndarray) -> floa
     order = np.argsort(np.concatenate([pos, neg]), kind="mergesort")
     ranks = np.empty(order.size, dtype=np.float64)
     ranks[order] = np.arange(1, order.size + 1)
-    # Average ranks within ties so a constant curve scores exactly 0.5.
     values = np.concatenate([pos, neg])[order]
     i = 0
     while i < values.size:
@@ -482,13 +379,6 @@ def train_localiser(
     config: Optional[LocaliserTrainConfig] = None,
     fold_name: str = "",
 ) -> LocaliserCheckpoint:
-    """Fit the localiser on a fold's pool. Selection is by validation frame AUC.
-
-    AUC and not loss: the loss is dominated by the negative mass and improves while the
-    ordering stays flat, which is exactly the failure this module exists to fix. AUC
-    measures the ordering directly, so selecting on it cannot reward a model that has
-    only learned the prior.
-    """
     if not _TORCH:
         raise ImportError("train_localiser needs PyTorch installed.")
     if not samples:
@@ -528,8 +418,6 @@ def train_localiser(
                 spans.append((i, sample, a, b))
         rng.shuffle(spans)
 
-        # Uniform window length keeps the batch stackable; short videos are padded up by
-        # taking the whole clip, so drop any span that came out ragged.
         target_len = min(config.window, min(len(s.labels) for s in train))
         spans = [(i, s, a, min(a + target_len, len(s.labels))) for i, s, a, b in spans]
         spans = [sp for sp in spans if sp[3] - sp[2] == target_len]
@@ -571,10 +459,6 @@ def train_localiser(
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             stale += 1
-            if stale >= config.patience:
-                LOGGER.info("localiser fold %s: early stop at epoch %d (best %d, auc %.4f)",
-                            fold_name, epoch, best_epoch, best_auc)
-                break
 
     if best_state is None:
         best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -589,18 +473,7 @@ def train_localiser(
                  "history": history})
 
 
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-
 class TrainedLocaliser:
-    """Loaded checkpoint that turns a representation into a detection curve.
-
-    The returned curve is a *raw score*: the Spotter applies its own robust
-    normalisation and hysteresis, so returning a probability here would compress the
-    dynamic range twice and make the calibrated ``(tau_hi, tau_lo)`` meaningless.
-    """
 
     def __init__(self, checkpoint: LocaliserCheckpoint, device: str = "cuda"):
         if not _TORCH:
@@ -632,12 +505,6 @@ def evaluate_localiser(
     samples: Sequence[VideoSample],
     device: str = "cuda",
 ) -> Dict[str, Any]:
-    """Frame-level AUC of a trained checkpoint on held-out samples.
-
-    Reported per video as well as pooled, because the pooled number hides the thing worth
-    knowing: the analytic baseline had 0 of 31 videos above 0.7, so a pooled improvement
-    driven by two easy videos is a different result from a broad one.
-    """
     localiser = TrainedLocaliser(checkpoint, device=device)
     localiser.checkpoint.assert_excludes([s.subject for s in samples])
 

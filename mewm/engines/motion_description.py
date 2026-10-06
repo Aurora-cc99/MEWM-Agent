@@ -1,6 +1,4 @@
-"""Deterministic ROI / AU motion descriptions -- the text side of the CLIP engine.
-"""
-
+"""Motion description utilities: converts flow tensors to natural-language summaries."""
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence
@@ -8,16 +6,10 @@ from typing import Dict, List, Optional, Sequence
 from ..knowledge.au_anatomy import candidate_entries
 from ..schemas import ROIMeasurement
 
-#: CLIP's text encoder truncates at 77 tokens, so the compact style has to say the most
-#: informative thing first: strongest regions, then their AU candidates.
 DEFAULT_TOP_K = 4
 
 
 def describe_roi(measurement: ROIMeasurement, style: str = "full") -> str:
-    """One ROI's motion observation as a templated sentence (方案 §1.3 example).
-
-    ``full``::
-    """
     entries = candidate_entries(measurement.roi_name, measurement.direction_deg)
     if style == "compact":
         aus = " ".join(
@@ -46,13 +38,6 @@ def frame_motion_description(
     salient_only: bool = True,
     style: str = "compact",
 ) -> str:
-    """The per-frame motion description ``t[N]`` the text tower encodes.
-
-    Region order is deterministic: salient regions (or all, when none is salient),
-    sorted by descending magnitude with the ROI index as tie-break -- the same ranking
-    :meth:`MotionFrontEnd.observation_payload` uses, so the description and the QA
-    observation records list regions in the same order.
-    """
     pool = [m for m in measurements if m.salient] if salient_only else list(measurements)
     if not pool:
         pool = list(measurements)
@@ -69,10 +54,6 @@ def au_motion_description(
     edges: Optional[Sequence[Dict[str, object]]] = None,
     top_k: int = 4,
 ) -> str:
-    """AU-level motion description from slot activations (方案 §1.3, 2nd template).
-
-    Example: ``AU6 active (peak 0.74); AU6->AU12 edge +0.87 leads onset->apex.``
-    """
     ranked = sorted(activations.items(), key=lambda kv: (-kv[1], kv[0]))
     parts: List[str] = [
         f"{au} active (peak {value:.2f})"
@@ -94,7 +75,6 @@ def phase_motion_description(
     phase: str,
     top_k: int = DEFAULT_TOP_K,
 ) -> str:
-    """A description prefixed with its flow phase (AP_ON / ON_OFF, 方案 §1.1)."""
     label = {"ap_on": "onset-to-apex", "on_off": "apex-to-offset"}.get(
         phase.lower(), phase)
     return f"{label} motion: " + frame_motion_description(

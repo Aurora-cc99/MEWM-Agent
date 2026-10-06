@@ -1,40 +1,26 @@
-"""Model registry: which models exist, how each is reached, and what it can do.
-
-* **Hosted** models reached over an API. Three transport shapes are in play and they are
-  *not* interchangeable: Anthropic Messages (Claude, DeepSeek, Grok), OpenAI
-  responses/chat (GPT), and native Gemini ``generateContent``. Sending a model to the
-  wrong shape either 404s or -- worse -- silently answers with a different model.
-* **Open-weight** models run locally through transformers, downloaded on first use.
-"""
-
+"""Model registry: maps config keys to provider credentials and generation params."""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-# ---------------------------------------------------------------------------
-# Transports and providers
-# ---------------------------------------------------------------------------
 
-TRANSPORT_ANTHROPIC = "anthropic"    # POST {base}/v1/messages, SSE
-TRANSPORT_OPENAI = "openai"          # POST {base}/responses only -- see client.py docstring
-TRANSPORT_GEMINI = "gemini"          # POST {base}/v1beta/models/{id}:generateContent
-TRANSPORT_LOCAL = "local"            # in-process transformers
+TRANSPORT_ANTHROPIC = "anthropic"
+TRANSPORT_OPENAI = "openai"
+TRANSPORT_GEMINI = "gemini"
+TRANSPORT_LOCAL = "local"
 
 TRANSPORTS = (TRANSPORT_ANTHROPIC, TRANSPORT_OPENAI, TRANSPORT_GEMINI, TRANSPORT_LOCAL)
 
 
 @dataclass(frozen=True)
 class ProviderSpec:
-    """Where a provider's endpoint and credential come from."""
-
     name: str
     transport: str
     base_env: Tuple[str, ...] = ()
     key_env: Tuple[str, ...] = ()
     default_base: str = ""
-    #: Cloudflare in front of the newcli relays rejects unknown agents with 403/1010.
     user_agent: str = ""
 
     def base_url(self) -> str:
@@ -62,15 +48,13 @@ PROVIDERS: Dict[str, ProviderSpec] = {
         "anthropic", TRANSPORT_ANTHROPIC,
         base_env=("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"),
         key_env=("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"),
-        user_agent="claude-cli/2.1.235",
+        user_agent="......",
     ),
     "openai": ProviderSpec(
         "openai", TRANSPORT_OPENAI,
         base_env=("OPENAI_API_URL", "OPENAI_BASE_URL"),
         key_env=("OPENAI_API_KEY",),
-        # The codex relay sits behind the same Cloudflare rule as the others and
-        # answers an unrecognised agent with 403 / error 1010.
-        user_agent="claude-cli/2.1.235",
+        user_agent="......",
     ),
     "deepseek": ProviderSpec(
         "deepseek", TRANSPORT_ANTHROPIC,
@@ -80,55 +64,34 @@ PROVIDERS: Dict[str, ProviderSpec] = {
     "gemini": ProviderSpec(
         "gemini", TRANSPORT_GEMINI,
         base_env=("GEMINI_BASE_URL",), key_env=("GEMINI_API_KEY",),
-        user_agent="claude-cli/2.1.235",
+        user_agent="......",
     ),
     "grok": ProviderSpec(
         "grok", TRANSPORT_ANTHROPIC,
         base_env=("GROK_BASE_URL",), key_env=("GROK_API_KEY",),
-        user_agent="claude-cli/2.1.235",
+        user_agent=".......",
     ),
     "local": ProviderSpec("local", TRANSPORT_LOCAL),
 }
 
 
-# ---------------------------------------------------------------------------
-# Model specifications
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class ModelSpec:
-    """One selectable model."""
-
-    model_id: str                       # the id the endpoint actually serves
+    model_id: str
     provider: str
     display: str = ""
     aliases: Tuple[str, ...] = ()
-    efforts: Tuple[str, ...] = ()       # selectable reasoning tiers, "" = none
+    efforts: Tuple[str, ...] = ()
     default_effort: str = ""
     vision: bool = True
     open_weights: bool = False
-    hf_repo: str = ""                   # HuggingFace repo for open-weight models
-    #: "4bit" = nf4 double quantisation via bitsandbytes (方案 §4.3); "" = full dtype.
-    #: Applied automatically when the visible VRAM cannot hold the full-precision model.
+    hf_repo: str = ""
+    local_weights: str = ""
     quantization: str = ""
     approx_vram_gb: float = 0.0
-    #: Open-weight only. How this model is made to think before answering:
-    #:   "template" -- its chat template takes ``enable_thinking`` and emits the
-    #:                 reasoning inside <think>...</think> (the Qwen3 family);
-    #:   "prompt"   -- no such switch, so a chain-of-thought directive is prepended to
-    #:                 the system prompt and the model is asked for the same delimiters
-    #:                 (Gemma and anything else without a thinking mode);
-    #:   ""         -- do not elicit a chain of thought.
-    #: :func:`mewm.llm.local_models.call_local_model` reads this; the parsed CoT comes
-    #: back on ``LLMResponse.reasoning``, separated from the answer text.
     thinking: str = ""
-    #: Tokens reserved for the chain of thought, added on top of the caller's answer
-    #: budget so a long CoT cannot truncate the answer that follows it.
     thinking_budget: int = 2048
     context: int = 128_000
-    #: Floor on retry attempts for endpoints with a measured flakiness problem; the
-    #: caller's own retry count wins when it is higher.
     min_retries: int = 0
     notes: str = ""
 
@@ -141,7 +104,6 @@ class ModelSpec:
         return self.provider == "local"
 
     def validate_effort(self, effort: str) -> str:
-        """Normalise a requested tier, or raise listing what this model accepts."""
         wanted = (effort or "").strip().lower().replace(" ", "").replace("-", "")
         aliases = {"extrahigh": "xhigh", "maximum": "max", "med": "medium", "": ""}
         wanted = aliases.get(wanted, wanted)
@@ -168,52 +130,31 @@ class ModelSpec:
         }
 
 
-#: Thinking-token budget per tier on the Anthropic transport (the Messages API takes a
-#: budget, not a tier name; the tier travels alongside it).
 EFFORT_THINKING_BUDGET: Dict[str, int] = {
     "low": 4096, "medium": 8192, "high": 16384, "xhigh": 32768, "max": 49152,
 }
 
 
 _MODEL_LIST: Tuple[ModelSpec, ...] = (
-    # -- hosted, Anthropic Messages transport --------------------------------
     ModelSpec(
-        "claude-sonnet-5", "anthropic", "Claude Sonnet 5",
+        "", "anthropic", "Claude Sonnet 5",
         efforts=("high", "xhigh", "max"), default_effort="xhigh", context=200_000,
     ),
     ModelSpec(
-        "claude-sonnet-4-20250514", "anthropic", "Claude Sonnet 4 (2025-05-14)",
-        aliases=("claude-sonnet-4", "claude-4-sonnet", "sonnet-4"),
+        "", "anthropic", "Claude Sonnet 4",
+        aliases=("", "claude-4-sonnet", "sonnet-4"),
         context=200_000,
-        notes="Same relay and credential as claude-sonnet-5; only the served id "
-              "differs. No reasoning tier is declared, so the request stays plain. "
-              "NOT REACHABLE on the current account, measured 2026-08-29: the relay "
-              "LISTS the id in GET /v1/models but POST /v1/messages answers HTTP 404 "
-              "'模型 claude-sonnet-4-20250514 未开放'. That is a per-account "
-              "entitlement, not a client bug -- claude-sonnet-4-5-20250929 over the "
-              "identical request succeeds, and the grok relay rejects the id with "
-              "'unknown provider'. The entry is kept so the model works the moment "
-              "the account is entitled; nothing else needs changing. Re-check with: "
-              "mewm test-models --models claude-sonnet-4-20250514",
+        notes="......",
     ),
     ModelSpec(
-        "claude-sonnet-4-5-20250929", "anthropic", "Claude Sonnet 4.5 (2025-09-29)",
-        aliases=("claude-sonnet-4.5", "claude-4.5-sonnet", "claude-sonnet-4-5",
+        "[REDACTED]", "anthropic", "Claude Sonnet 4.5 (2025-09-29)",
+        aliases=("[REDACTED].5", "claude-4.5-sonnet", "[REDACTED]",
                  "sonnet-4.5"),
         efforts=("high", "xhigh", "max"), default_effort="high", context=200_000,
-        notes="Same relay and credential as claude-sonnet-5. Registered as the "
-              "working stand-in for claude-sonnet-4-20250514, which 404s on this "
-              "account -- see that entry above; this id answers the identical "
-              "request (measured 2026-08-29, in that entry's own notes). "
-              "default_effort is pinned to \"high\" rather than \"xhigh\" on user "
-              "directive (2026-08-30), to cut the per-call latency the xhigh tier "
-              "costs on claude-sonnet-5; pass --reasoning-effort/--critic-effort "
-              "explicitly to override. Re-check with: mewm test-models --models "
-              "claude-sonnet-4-5-20250929",
+        notes="",
     ),
     ModelSpec(
         "deepseek-v4-flash-vision-exp", "deepseek", "DeepSeek V4 Flash Vision (exp)",
-        # The relay rejects the mixed-case spelling outright, so it is aliased here.
         aliases=("deepseekV4-Flash-Vision-Exp", "deepseek-v4-flash-vision",
                  "deepseek-vision"),
         context=128_000, min_retries=6,
@@ -236,8 +177,18 @@ _MODEL_LIST: Tuple[ModelSpec, ...] = (
         "grok-4.5", "grok", "Grok 4.5", aliases=("grok-4-5", "grok4.5"),
         context=256_000,
     ),
-
-    # -- hosted, OpenAI transport --------------------------------------------
+    ModelSpec(
+        "gpt-4o", "openai", "GPT-4o",
+        aliases=("gpt4o",),
+        efforts=("low", "medium", "high"), default_effort="medium",
+        context=128_000,
+    ),
+    ModelSpec(
+        "gpt-4o-mini", "openai", "GPT-4o mini",
+        aliases=("gpt4o-mini", "gpt-4o-mini"),
+        efforts=("low", "medium", "high"), default_effort="low",
+        context=128_000,
+    ),
     ModelSpec(
         "gpt-5.6-sol", "openai", "GPT-5.6-sol",
         efforts=("high", "xhigh"), default_effort="high", context=200_000,
@@ -253,12 +204,8 @@ _MODEL_LIST: Tuple[ModelSpec, ...] = (
         efforts=("low", "medium", "high", "xhigh"), default_effort="medium",
         context=200_000,
     ),
-
-    # -- hosted, native Gemini transport -------------------------------------
     ModelSpec(
         "gemini-3-pro", "gemini", "Gemini 3 Pro",
-        # gemini-3-pro-preview is listed by the relay but every call to it returns
-        # upstream HTTP 500, so the alias points at the id that actually serves.
         aliases=("gemini-3-pro-preview", "gemini-3pro"),
         context=1_000_000,
         notes="Native generateContent. The -preview id 500s upstream; aliased here.",
@@ -269,45 +216,61 @@ _MODEL_LIST: Tuple[ModelSpec, ...] = (
     ModelSpec("gemini-2.5-pro", "gemini", "Gemini 2.5 Pro", context=1_000_000),
     ModelSpec("gemini-2.5-flash", "gemini", "Gemini 2.5 Flash", context=1_000_000),
     ModelSpec("gemini-3-flash", "gemini", "Gemini 3 Flash", context=1_000_000),
-
-    # -- open weights, run locally -------------------------------------------
-    # Every entry declares a `thinking` mode. Without it these models answer straight
-    # from the prompt, and the SFT / GRPO traces they produce carry no chain of
-    # thought -- which the reward's causal term is scored on, so a non-thinking local
-    # policy is not comparable with the hosted ones it is benchmarked against.
     ModelSpec(
         "Qwen3-VL-8B", "local", "Qwen3-VL 8B", open_weights=True,
         hf_repo="Qwen/Qwen3-VL-8B-Instruct", quantization="4bit",
         approx_vram_gb=18.0, context=128_000,
         aliases=("qwen3-vl-8b",),
+        local_weights="Weights/Qwen3-VL-8B-Instruct",
         thinking="template", thinking_budget=2048,
-        notes="Qwen3 chat template: enable_thinking=True emits <think>...</think> "
-              "before the answer.",
     ),
     ModelSpec(
-        "Qwen3.6-VL-27B", "local", "Qwen3.6-VL 27B", open_weights=True,
-        hf_repo="Qwen/Qwen3.6-VL-27B-Instruct", quantization="4bit",
-        approx_vram_gb=58.0, context=128_000,
-        aliases=("qwen3.6-vl-27b",),
-        thinking="template", thinking_budget=3072,
+        "Qwen3-VL-30B", "local", "Qwen3-VL 30B", open_weights=True,
+        hf_repo="Qwen/Qwen3-VL-30B-Instruct", quantization="4bit",
+        approx_vram_gb=66.0, context=128_000,
+        aliases=("qwen3-vl-30b",),
+        local_weights="Weights/Qwen3-VL-30B-Instruct",
+        thinking="template", thinking_budget=2048,
     ),
     ModelSpec(
-        "Qwen3.8-27B", "local", "Qwen3.8 27B", open_weights=True, vision=False,
-        hf_repo="Qwen/Qwen3.8-27B-Instruct", quantization="4bit",
-        approx_vram_gb=58.0, context=128_000,
-        aliases=("qwen3.8-27b",),
-        thinking="template", thinking_budget=3072,
-        notes="Text-only: usable for R/C, not for phases that read frames.",
+        "Qwen2.5-VL-7B", "local", "Qwen2.5-VL 7B", open_weights=True,
+        hf_repo="Qwen/Qwen2.5-VL-7B-Instruct", quantization="4bit",
+        approx_vram_gb=18.0, context=128_000,
+        aliases=("qwen2.5-vl-7b",),
+        local_weights="Weights/Qwen2.5-VL-7B-Instruct",
+        thinking="prompt", thinking_budget=2048,
+    ),
+    ModelSpec(
+        "Qwen2.5-VL-32B", "local", "Qwen2.5-VL 32B", open_weights=True,
+        hf_repo="Qwen/Qwen2.5-VL-32B-Instruct", quantization="4bit",
+        approx_vram_gb=66.0, context=128_000,
+        aliases=("qwen2.5-vl-32b",),
+        local_weights="Weights/Qwen2.5-VL-32B-Instruct",
+        thinking="prompt", thinking_budget=2048,
+    ),
+    ModelSpec(
+        "Qwen2.5-Omni-7B", "local", "Qwen2.5-Omni 7B", open_weights=True,
+        hf_repo="Qwen/Qwen2.5-Omni-7B", quantization="4bit",
+        approx_vram_gb=18.0, context=128_000,
+        aliases=("qwen2.5-omni-7b",),
+        local_weights="Weights/Qwen2.5-Omni-7B",
+        thinking="prompt", thinking_budget=2048,
+    ),
+    ModelSpec(
+        "GLM-4.1V-9B-Thinking", "local", "GLM-4.1V 9B Thinking", open_weights=True,
+        hf_repo="zai-org/GLM-4.1V-9B-Thinking", quantization="4bit",
+        approx_vram_gb=18.0, context=200_000,
+        aliases=("glm-4.1v-9b", "glm4.1v-9b-thinking"),
+        local_weights="Weights/GLM-4.1V-9B-Thinking",
+        thinking="native", thinking_budget=4096,
     ),
     ModelSpec(
         "Gemma-4-31B", "local", "Gemma 4 31B", open_weights=True,
         hf_repo="google/gemma-4-31b-it", quantization="4bit",
         approx_vram_gb=66.0, context=128_000,
         aliases=("gemma-4-31b", "gemma4-31b"),
+        local_weights="Weights/gemma-4-31b-it",
         thinking="prompt", thinking_budget=2048,
-        notes="No enable_thinking switch in the Gemma template, so the chain of "
-              "thought is elicited by a system directive and parsed out of the same "
-              "<think> delimiters.",
     ),
 )
 
@@ -321,11 +284,10 @@ for _spec in _MODEL_LIST:
 
 
 class UnknownModelError(KeyError):
-    """Raised for a model id that is not registered."""
+    pass
 
 
 def resolve(name: str) -> ModelSpec:
-    """Map any accepted spelling onto its :class:`ModelSpec`."""
     key = (name or "").strip().lower()
     if key in _ALIASES:
         return MODELS[_ALIASES[key]]
@@ -335,7 +297,6 @@ def resolve(name: str) -> ModelSpec:
 
 
 def resolve_id(name: str) -> str:
-    """The id the endpoint actually serves, for a possibly-aliased name."""
     return resolve(name).model_id
 
 
@@ -388,12 +349,6 @@ def credentials_available(name: str) -> bool:
 
 
 def heterogeneous(model_a: str, model_b: str) -> bool:
-    """Whether two models are genuinely different bases.
-
-    Appendix D.1 requires the critic's base to differ from the reasoner's. Two ids from
-    the same provider *family* (two Gemini tiers, say) share training and therefore share
-    blind spots, so provider identity -- not just id inequality -- is what is checked.
-    """
     try:
         first, second = resolve(model_a), resolve(model_b)
     except UnknownModelError:
@@ -404,7 +359,6 @@ def heterogeneous(model_a: str, model_b: str) -> bool:
 
 
 def registry_report() -> Dict[str, object]:
-    """Promptable / printable summary of the whole registry."""
     return {
         "hosted": [s.to_dict() for s in list_models(hosted_only=True)],
         "open_weights": [s.to_dict() for s in list_models(open_only=True)],

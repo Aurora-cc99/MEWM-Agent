@@ -1,17 +1,4 @@
-"""LODO -- Leave-One-Dataset-Out training/evaluation protocol (formwork.md 第 V 条,
-``MEWM-Agent_完整执行方案.md`` 第 6.2 节).
-
-* **stage 0（CLIP 定位引擎）**：在每个训练数据集上分别训练一个"不留出任何被试"的 CLIP
-  检查点（复用 ``LOSORunner.run_clip``，只是喂给它一个"训练集=全部被试"的 :class:`FoldSpec`），
-  推理时对被留出数据集的每个视频，用三个检查点各自出一遍候选、取并集——这正是 formwork.md
-  第 III/16-20 条已经确立的"双分支取并集"思路在跨数据集场景下的自然延伸，而不是另起一套
-  新规则。
-* **stage 1/2/3（SFT/RFT/RL）**：``SFTTrainer`` / ``GRPOTrainer`` / ``MAPPOTrainer`` 本身
-  不关心样本来自哪个数据集，只消费一份 prompt/instruction 字典列表，因此直接把三个训练数
-  据集各自构建好的 QA 指令样本池合并成一份列表喂给它们即可，天然不需要改这三个训练器的任
-  何一行代码。
-* **stage 4（测试）**：在被留出数据集的全部视频上评测，不再按被试切分。
-"""
+"""Leave-one-dataset-out cross-corpus generalisation training loop."""
 
 from __future__ import annotations
 
@@ -33,19 +20,11 @@ from .sft import SFTBackend, SFTOutcome, SFTTrainer
 
 LOGGER = logging.getLogger(__name__)
 
-#: A "subject id" that stands for "the whole dataset, nothing held out" -- must never
-#: collide with a real subject id (checked in :func:`_full_pool_fold`).
 _POOL_SENTINEL = "__lodo_full_pool__"
-
-
-# ---------------------------------------------------------------------------
-# Fold construction
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class DatasetFoldSpec:
-    """One LODO fold: which dataset is held out, which three train."""
 
     test_dataset: str
     train_datasets: List[str] = field(default_factory=list)
@@ -69,8 +48,6 @@ def build_dataset_folds(
     datasets: Optional[Sequence[str]] = None,
     held_out: Optional[Sequence[str]] = None,
 ) -> List[DatasetFoldSpec]:
-    """One fold per dataset (or just the requested ``held_out`` subset).
-    """
     pool = list(datasets) if datasets is not None else list(DATASETS)
     wanted = set(held_out) if held_out is not None else set(pool)
     unknown = wanted - set(pool)
@@ -91,8 +68,6 @@ def build_dataset_folds(
 
 
 def _full_pool_fold(index: DatasetIndex) -> FoldSpec:
-    """A ``FoldSpec`` that holds out nothing -- every subject of ``index`` trains.
-    """
     subjects = index.subjects()
     if _POOL_SENTINEL in subjects:
         raise RuntimeError(
@@ -108,15 +83,10 @@ def _full_pool_fold(index: DatasetIndex) -> FoldSpec:
     return fold
 
 
-# ---------------------------------------------------------------------------
-# Per-fold result
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class DatasetFoldResult:
     fold: DatasetFoldSpec
-    clip: Dict[str, Any] = field(default_factory=dict)          # train_dataset -> stage-0 result
+    clip: Dict[str, Any] = field(default_factory=dict)
     sft: Dict[str, Any] = field(default_factory=dict)
     rft: Dict[str, Any] = field(default_factory=dict)
     sft_after_rft: Dict[str, Any] = field(default_factory=dict)
@@ -133,18 +103,12 @@ class DatasetFoldResult:
         }
 
 
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-
 RftFn = Callable[[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]],
                  Tuple[Dict[str, Any], List[Dict[str, Any]]]]
 EvaluatorFn = Callable[[DatasetFoldSpec, Sequence[Dict[str, Any]]], Dict[str, Any]]
 
 
 class LODORunner:
-    """Chains stage 0-4 across a leave-one-dataset-out split.
-    """
 
     def __init__(
         self,
@@ -184,10 +148,8 @@ class LODORunner:
         self.clip_max_frames = clip_max_frames
         self.device = device
 
-    # -- stage 0 --------------------------------------------------------------
 
     def run_clip_pool(self, dataset: str) -> Dict[str, Any]:
-        """Fine-tune a CLIP localiser on *all* of ``dataset``'s subjects (第 6.2 节)."""
         index = self.indices[dataset]
         runner = LOSORunner(
             dataset=dataset, sft_backend=self.sft_backend, mewm_config=self.mewm_config,
@@ -196,17 +158,11 @@ class LODORunner:
         )
         return runner.run_clip(_full_pool_fold(index))
 
-    # -- stage 1 ----------------------------------------------------------------
 
     def run_sft(self, samples: Sequence[Dict[str, Any]]) -> SFTOutcome:
         trainer = SFTTrainer(self.sft_backend, self.config, self.mewm_config)
-        # LODO has no held-out *subject* validation split (the held-out dataset is
-        # test material, never a validation source) -- so, like LOSO's
-        # ``n_val_subjects = 0`` default, the monitor set is the training pool itself
-        # and the outcome is explicitly labelled in-sample.
         return trainer.fit(list(samples), eval_samples=(), in_sample_eval=True)
 
-    # -- stage 2 (pluggable; see module docstring) -------------------------------
 
     def run_rft(self, samples: Sequence[Dict[str, Any]],
                candidates: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -214,7 +170,6 @@ class LODORunner:
             return {"status": "skipped", "reason": "no rft_fn supplied"}, []
         return self.rft_fn(samples, candidates)
 
-    # -- stage 3 ------------------------------------------------------------------
 
     def run_rl(self, prompts: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self.rl_algorithm == "mappo":
@@ -241,7 +196,6 @@ class LODORunner:
             history.append(trainer.step(batch, progress))
         return history
 
-    # -- full chain -----------------------------------------------------------------
 
     def run_fold(
         self,
@@ -250,8 +204,6 @@ class LODORunner:
         candidates_by_dataset: Optional[Dict[str, Sequence[Dict[str, Any]]]] = None,
         test_prompts: Sequence[Dict[str, Any]] = (),
     ) -> DatasetFoldResult:
-        """The whole stage 0-4 chain for one held-out dataset.
-        """
         fold.check_disjoint()
         result = DatasetFoldResult(fold=fold)
 
@@ -265,12 +217,11 @@ class LODORunner:
                 f"LODO fold {fold.name}: prompts tagged with the held-out dataset "
                 f"{fold.test_dataset!r} were included in the training pool")
 
-        # -- stage 0: one CLIP checkpoint per training dataset -------------------
         if self.config.clip_finetune:
             for dataset in fold.train_datasets:
                 try:
                     result.clip[dataset] = self.run_clip_pool(dataset)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     if self.config.clip_required:
                         raise ClipEngineUnavailable(
                             f"LODO fold {fold.name}: stage 0 failed for training "
@@ -283,11 +234,9 @@ class LODORunner:
         else:
             result.clip = {"status": "disabled (training.clip_finetune = false)"}
 
-        # -- stage 1: SFT on the pooled cross-dataset instruction set -------------
         outcome = self.run_sft(pooled_prompts)
         result.sft = outcome.to_dict()
 
-        # -- stage 2: RFT (optional, see module docstring) ------------------------
         pooled_candidates: List[Dict[str, Any]] = []
         for dataset in fold.train_datasets:
             pooled_candidates.extend((candidates_by_dataset or {}).get(dataset, []))
@@ -298,7 +247,6 @@ class LODORunner:
                 outcome2 = self.run_sft(pooled_prompts + accepted)
                 result.sft_after_rft = outcome2.to_dict()
 
-        # -- stage 3: RL (GRPO or MAPPO, per rl_algorithm) ------------------------
         rl_history = self.run_rl(pooled_prompts)
         if rl_history:
             result.rl_history = rl_history
@@ -308,7 +256,6 @@ class LODORunner:
                 "was empty"
             )
 
-        # -- stage 4: test on the ENTIRE held-out dataset -------------------------
         if self.evaluator is not None:
             result.test = self.evaluator(fold, test_prompts)
         return result
@@ -320,7 +267,6 @@ class LODORunner:
         candidates_for: Optional[Callable[[str], Sequence[Dict[str, Any]]]] = None,
         test_prompts_for: Optional[Callable[[DatasetFoldSpec], Sequence[Dict[str, Any]]]] = None,
     ) -> List[DatasetFoldResult]:
-        """Run every requested fold (default: all four datasets held out once each)."""
         folds = build_dataset_folds(list(self.indices), held_out)
         LOGGER.info("LODO: %d fold(s) over %s", len(folds), list(self.indices))
         results = []
@@ -333,11 +279,6 @@ class LODORunner:
             results.append(self.run_fold(fold, prompts_by_dataset, candidates_by_dataset,
                                          test_prompts))
         return results
-
-
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
 
 
 def summarise(results: Sequence[DatasetFoldResult]) -> Dict[str, Any]:
@@ -355,8 +296,7 @@ def summarise(results: Sequence[DatasetFoldResult]) -> Dict[str, Any]:
         "clip_engine_status": clip_status,
         "rl_ran": sum(1 for r in results if r.rl_history),
         "rl_skipped": sum(1 for r in results if r.rl_skipped),
-        "note": "每折训练池 = 其余三个数据集的全部视频（无被试级验证切分），"
-               "diagnostics 相对训练池是 in-sample 的，与 LOSO n_val_subjects=0 的约定一致",
+        "note": "",
     }
 
 

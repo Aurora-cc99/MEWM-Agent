@@ -1,5 +1,4 @@
-"""CLIP dual-tower localiser training (修改方案 §1 + §2 + §3 的落地).
-"""
+"""Clip-level supervised localiser training for the SoftNet spotter."""
 
 from __future__ import annotations
 
@@ -24,29 +23,23 @@ LOGGER = logging.getLogger(__name__)
 try:
     import torch
     _TORCH = True
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
+except ImportError:
+    torch = None
     _TORCH = False
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class ClipVideoSample:
-    """One video's CLIP-trainable material, all arrays aligned on the frame axis."""
 
     video_key: str
     subject: str
     frames: List[int]
     frame_paths: List[str]
     descriptions: List[str]
-    labels: np.ndarray            # (T,)
-    ignore: np.ndarray            # (T,) True where the loss is masked
-    head_block: np.ndarray        # (T, 7) explicit head-motion input
-    analytic: np.ndarray          # (T, K) analytic activations (distill target)
+    labels: np.ndarray
+    ignore: np.ndarray
+    head_block: np.ndarray
+    analytic: np.ndarray
 
     @property
     def n_positive(self) -> int:
@@ -64,11 +57,6 @@ def build_clip_dataset(
     max_frames: int = 0,
     require_events: bool = True,
 ) -> List[ClipVideoSample]:
-    """Stage I per video, plus descriptions, labels and the head-motion block.
-
-    ``videos`` must already be the fold's training pool (same contract as
-    ``build_frame_dataset``); the trainer records the subjects it actually saw.
-    """
     from ..pipeline import run_representation
 
     config = config or load_config()
@@ -80,7 +68,7 @@ def build_clip_dataset(
         try:
             representation = run_representation(
                 video, config, stride=stride, max_frames=max_frames)
-        except Exception as exc:  # noqa: BLE001 - one broken video must not stop a fold
+        except Exception as exc:
             LOGGER.warning("clip dataset: skipping %s: %s", video.video_id, exc)
             continue
         if representation.slot_activations is None or len(representation) < 32:
@@ -126,19 +114,8 @@ def build_clip_dataset(
     return samples
 
 
-# ---------------------------------------------------------------------------
-# Losses beyond the shared focal BCE
-# ---------------------------------------------------------------------------
-
-
 def soft_iou_loss(probs: "torch.Tensor", labels: "torch.Tensor",
                   mask: "torch.Tensor") -> "torch.Tensor":
-    """``1 − soft-IoU`` between the per-frame probabilities and the GT interval mask.
-
-    方案 §3 的连续监督: the discrete IoU of eq. (2) with the indicator replaced by the
-    sigmoid probability, so the interval boundaries receive a *dense* gradient rather
-    than only the per-frame BCE one. Ignored (macro) frames contribute to neither side.
-    """
     p = probs * mask
     y = labels * mask
     intersection = (p * y).sum()
@@ -152,8 +129,6 @@ def head_motion_triplet(
     negatives: "torch.Tensor",
     margin: float,
 ) -> Optional["torch.Tensor"]:
-    """方案 §2.2 分量二 -- the micro-expression vs head-motion discriminative triplet.
-    """
     pos_idx = torch.nonzero(labels > 0.5, as_tuple=False).flatten()
     neg_idx = torch.nonzero(negatives > 0.5, as_tuple=False).flatten()
     if pos_idx.numel() < 2 or neg_idx.numel() == 0:
@@ -168,18 +143,12 @@ def head_motion_triplet(
 
 
 def negative_mask(sample: ClipVideoSample, percentile: float) -> np.ndarray:
-    """Head-motion negative frames: fast head, outside every annotated event."""
     speed = sample.head_speed
     if speed.size == 0:
         return np.zeros(0, dtype=np.float32)
     threshold = np.percentile(speed, percentile)
     negatives = (speed >= threshold) & (sample.labels <= 0.5) & (~sample.ignore)
     return negatives.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Windows (event-biased, CLIP-affordable)
-# ---------------------------------------------------------------------------
 
 
 def _event_windows(sample: ClipVideoSample, window: int, rng,
@@ -200,14 +169,8 @@ def _event_windows(sample: ClipVideoSample, window: int, rng,
     return spans
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class CLIPLocaliserCheckpoint:
-    """Trainable-only weights plus fold provenance (same guarantees as the MLP one)."""
 
     trainable_state: Dict[str, Any]
     clip_config: Dict[str, Any]
@@ -267,29 +230,17 @@ def checkpoint_path(dataset: str, fold_name: str,
 
 def find_checkpoint(dataset: str, subject: str,
                     config: Optional[ClipConfig] = None) -> Optional[Path]:
-    """The fold checkpoint whose held-out subject is ``subject``, if trained."""
     path = checkpoint_path(dataset, str(subject), config)
     return path if path.is_file() else None
 
 
 def train_state_path(dataset: str, fold_name: str,
                      config: Optional[ClipConfig] = None) -> Path:
-    """Epoch-level resume checkpoint for a fold that is still training.
-
-    Lives next to the fold's final ``clip_localiser.pt`` so a kill mid-fold loses at
-    most one epoch of that fold instead of the whole fold (断点续训, user directive).
-    """
     return checkpoint_path(dataset, fold_name, config).parent / "train_state.pt"
-
-
-# ---------------------------------------------------------------------------
-# Trainer
-# ---------------------------------------------------------------------------
 
 
 def _split_subjects(samples: Sequence[ClipVideoSample],
                     config: ClipConfig) -> Tuple[List[str], List[str]]:
-    """Subject-disjoint train/val split (same rule as localiser_supervised)."""
     rng = np.random.default_rng(config.seed)
     with_pos = sorted({s.subject for s in samples if s.n_positive > 0})
     without = sorted({s.subject for s in samples} - set(with_pos))
@@ -305,7 +256,6 @@ def _split_subjects(samples: Sequence[ClipVideoSample],
 
 
 class _WindowEncoder:
-    """Runs one window through the towers, chunked so 8 GB survives it."""
 
     def __init__(self, model: CLIPSpotterModel, config: ClipConfig, device: str):
         self.model = model
@@ -320,7 +270,6 @@ class _WindowEncoder:
 
     def encode(self, sample: ClipVideoSample, a: int, b: int,
                grad: bool = True) -> Tuple["torch.Tensor", "torch.Tensor"]:
-        """Frames ``[a, b)`` -> (v, m) each (T, d). Chunked; graphs kept when ``grad``."""
         import contextlib
         chunks_v, chunks_m = [], []
         step = max(1, self.config.batch_frames)
@@ -346,11 +295,6 @@ def _save_train_state(
     best_state: Optional[Dict[str, "torch.Tensor"]], best_epoch: int, stale: int,
     history: List[Dict[str, float]], rng: np.random.Generator,
 ) -> None:
-    """Write the epoch-granularity resume blob (model/optimiser/RNG/best-so-far).
-
-    Written after every epoch, atomically (tmp file + rename) so a kill mid-write never
-    leaves a corrupt resume file -- the whole point is surviving an interruption.
-    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -377,13 +321,6 @@ def train_clip_localiser(
     fold_name: str = "",
     state_path: Optional[Path] = None,
 ) -> CLIPLocaliserCheckpoint:
-    """Fit the dual tower + heads on a fold's pool; select on validation frame AUC.
-
-    ``state_path``, if given, is an epoch-level resume checkpoint: written after every
-    epoch and read back at the top of this call if it already exists, so an interrupted
-    fold picks up at ``last_epoch + 1`` instead of restarting (断点续训, user directive).
-    It is deleted once the fold finishes normally.
-    """
     if not _TORCH:
         raise ImportError("train_clip_localiser needs PyTorch installed.")
     if not samples:
@@ -442,9 +379,6 @@ def train_clip_localiser(
     if state_path is not None and Path(state_path).is_file():
         LOGGER.info("clip localiser fold %s: resume file found at %s, loading",
                     fold_name, state_path)
-        # map_location="cpu": the RNG-state tensors *must* stay CPU ByteTensors for
-        # torch.set_rng_state / cuda.set_rng_state_all -- load_state_dict below casts
-        # the model/optimiser tensors onto `device` on its own.
         blob = torch.load(state_path, map_location="cpu", weights_only=False)
         model.load_trainable_state_dict(blob["model_state"])
         optimiser.load_state_dict(blob["optimiser_state"])
@@ -539,10 +473,6 @@ def train_clip_localiser(
                 best_auc=best_auc, best_state=best_state, best_epoch=best_epoch,
                 stale=stale, history=history, rng=rng)
 
-        if stale >= config.patience:
-            LOGGER.info("clip localiser fold %s: early stop at epoch %d "
-                        "(best %d, auc %.4f)", fold_name, epoch, best_epoch, best_auc)
-            break
 
     if best_state is None:
         best_state = model.trainable_state_dict()
@@ -564,7 +494,6 @@ def train_clip_localiser(
 
 def _score_sample(model: CLIPSpotterModel, encoder: _WindowEncoder,
                   sample: ClipVideoSample, device: str) -> np.ndarray:
-    """Full-video forward (no grad) -> raw per-frame detection scores."""
     with torch.no_grad():
         v, m = encoder.encode(sample, 0, len(sample.frames), grad=False)
         u = model.fuse(v, m)
@@ -573,17 +502,7 @@ def _score_sample(model: CLIPSpotterModel, encoder: _WindowEncoder,
     return logits.detach().cpu().numpy().astype(np.float64)
 
 
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-
 class TrainedCLIPSpotter:
-    """Loaded fold checkpoint: representation -> detection curve + (T, K) activations.
-
-    The curve is a raw score, exactly like ``TrainedLocaliser.curve``: the Spotter
-    applies its own robust normalisation and hysteresis downstream (方案 §2.3).
-    """
 
     def __init__(self, checkpoint: CLIPLocaliserCheckpoint,
                  config: Optional[ClipConfig] = None, device: str = "cuda"):
@@ -591,7 +510,6 @@ class TrainedCLIPSpotter:
             raise ImportError("TrainedCLIPSpotter needs PyTorch installed.")
         self.checkpoint = checkpoint
         base = config or load_config().clip
-        # Architecture fields come from the checkpoint; paths stay overridable.
         merged = ClipConfig(**{**vars(base), **{
             k: v for k, v in checkpoint.clip_config.items()
             if k in {"vision_unfreeze_layers", "text_unfreeze_layers",
@@ -636,12 +554,6 @@ class TrainedCLIPSpotter:
             head_block=head_block, analytic=analytic)
 
     def infer(self, video: Any, representation: Any) -> Dict[str, np.ndarray]:
-        """Curve on the representation's frame grid + transition-head activations.
-
-        Frames without an RGB file keep the analytic activation row and get a curve
-        value of the finite minimum, so the output grids stay aligned with
-        ``representation.frames``.
-        """
         self.checkpoint.assert_excludes([str(video.subject)])
         sample = self._sample_for(video, representation)
         with torch.no_grad():
@@ -674,7 +586,6 @@ def evaluate_clip_localiser(
     config: Optional[ClipConfig] = None,
     device: str = "cuda",
 ) -> Dict[str, Any]:
-    """Frame-level AUC on held-out samples, per video and pooled."""
     spotter = TrainedCLIPSpotter(checkpoint, config=config, device=device)
     spotter.checkpoint.assert_excludes([s.subject for s in samples])
     per_video, aucs = [], []

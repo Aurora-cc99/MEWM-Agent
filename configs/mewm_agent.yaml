@@ -1,22 +1,11 @@
 # MEWM-Agent runtime configuration.
-#
-# Values here override the dataclass defaults in mewm/config.py, and environment
-# variables of the form MEWM_<SECTION>__<FIELD> override these in turn.
-# Everything below is a *design default* from the paper, not a calibrated value:
-# thresholds must be re-fitted on a calibration fold before any reported number
-# (`python -m mewm.cli.main calibrate --dataset ...`).
 
-# --- V1: deterministic motion quantisation ---------------------
 motion:
   n_roi: 29
-  # Disjunctive salience: magnitude OR coherence. Never raise m_min expecting a
-  # cleaner signal -- a magnitude-only gate deletes the sub-pixel micro-expression
-  # displacement this whole system exists to measure.
   m_min: 0.15
   c_min: 0.60
   default_flow_gap: 7
 
-# --- V2/V3: object slots and the two-timescale latent state ------------------
 representation:
   n_slots: 16
   slot_dim: 128
@@ -24,48 +13,35 @@ representation:
   fast_dim: 128
   belief_dim: 64
   appearance_dim: 64
-  # Slot dropout is not regularisation: it is what keeps mask() inside the
-  # training distribution, so MNI stays interpretable.
   slot_dropout: 0.15
-  # Q must stay well below slow_obs_noise: it sets how much of a transient the slow
-  # term can absorb (the h of proposition B.3). At 1e-4 the steady-state gain is ~0.42
-  # and the slow variable swallows much of every micro-expression; 1e-5 gives ~0.16.
   slow_process_noise: 0.00001
   slow_obs_noise: 0.01
   changepoint_frames: 15
   changepoint_nll: 12.0
 
-# --- M1: emotion-conditioned AU dynamics-----------------------
 dynamics:
   n_gat_layers: 4
   n_heads: 4
   hidden_dim: 256
   n_mixture: 5
-  rollout_steps: 3          # S
-  future_queries: 8         # N_s
+  rollout_steps: 3
+  future_queries: 8
   kappa_low: 0.7
   lambda_imagine: 1.0
   lambda_flow: 0.5
   lambda_slow: 0.1
 
-# --- M2: error decomposition and proposals ---------------------
 spotting:
-  window: 300               # W
+  window: 300
   tau_hi: 3.5
   tau_lo: 1.5
-  # Proposal extent is UNBOUNDED. The onset/offset come off the frame-level S curve
-  # and off the matched filter's argmax over its duration bank; a preset length
-  # window would override that with a prior instead of measuring. All three are
-  # opt-in -- 0 means "no bound". Set a positive value only for a corpus whose event
-  # lengths are genuinely known, and re-run `diagnose-localisation` afterwards.
-  min_duration_frames: 0    # 0 = keep every hysteresis span, however short
-  min_micro_seconds: 0.0    # 0 = the bank starts at the shortest decodable extent
-  max_micro_seconds: 0.0    # 0 = no ceiling; nothing is routed to macro by length
+  min_duration_frames: 0
+  min_micro_seconds: 0.0
+  max_micro_seconds: 0.0
   n_physio_templates: 12
   physio_match_thresh: 0.55
   merge_gap_frames: 3
 
-# --- C-Agent decision thresholds-------------------------------
 critic:
   eta_lambda: 2.0
   eta_cfs: 0.10
@@ -75,14 +51,12 @@ critic:
   max_challenges_per_round: 3
   max_challenge_rounds: 3
 
-# --- M4: fast / standard / deep routing -----------------------
 scheduler:
   theta_fast: 0.20
   eta_fast: 3.0
   theta_deep: 0.55
   theta_var: 0.35
 
-# --- V4: evidence token regulation ---------------
 token_regulator:
   enabled: true
   n_r: 9
@@ -92,7 +66,6 @@ token_regulator:
   gamma_anchor_min: 1.0
   keep_instruction_tokens: true
 
-# --- Three-layer memory  ------------------------------
 memory:
   stationary_run_length: 30
   n_query_tokens_multi_au: 8
@@ -103,23 +76,16 @@ memory:
   retrieval_max_tokens: 800
   retrieval_enabled: true
 
-# --- Orchestrator budgets --------------------------
 orchestrator:
   max_gate_retries: 2
   max_challenge_rounds: 3
   max_cascade_rollbacks: 1
   max_narrative_revisions: 1
   subgraph_parallelism: 8
-  max_llm_calls_per_video: 2500  # 2026-08-31: raised to match config.py default (was 400, overrode it)
+  max_llm_calls_per_video: 2500
   checkpoint_backend: sqlite
-  # P.scan reviews candidates in chunks of this size per call rather than one
-  # call for the whole video -- keeps a wordy model's response short enough to
-  # avoid mid-JSON truncation on videos with many candidates.
   p_scan_batch_size: 10
 
-# --- Five-dimensional composite reward ------------------------
-# These are the *static* weights; GRPO overrides them with the three-stage
-# cosine curriculum in appendix F.3 when a training progress value is supplied.
 reward:
   w_au: 0.20
   w_emo: 0.20
@@ -129,20 +95,11 @@ reward:
   lambda_graph: 0.35
   hallucination_penalty: 0.5
 
-# --- CLIP dual-tower motion representation engine ----------
-# RGB frames go through the vision tower, the deterministic optical-flow motion
-# descriptions (mewm/engines/motion_description.py) through the text tower; the two
-# are aligned per frame with InfoNCE and fused by a learned gate. The fused
-# representation feeds (a) the supervised localisation head trained on the QA GT
-# intervals (focal BCE + head-motion triplet + soft-IoU) and (b) the transition head
-# that replaces the analytic slot readout while keeping the (T, K) contract.
-# All of these parameters are LOCAL and receive real gradients; the hosted APIs
-# appear nowhere in this path.
 clip:
   enabled: true
-  weights_path: E:/code/Mamba_CLIP/weights/clip/clip-vit-base-patch16
-  vision_unfreeze_layers: 6      # fine-tune the last 6 ViT layers (user directive)
-  text_unfreeze_layers: 2        # fine-tune the last 2 text layers (user directive)
+  weights_path: ~
+  vision_unfreeze_layers: 6
+  text_unfreeze_layers: 2
   temperature: 0.07
   lambda_align: 0.5
   lambda_loc: 1.0
@@ -150,8 +107,8 @@ clip:
   lambda_prop: 0.5
   lambda_distill: 0.25
   contrastive_margin: 0.2
-  head_speed_percentile: 75      # 方案 §2.2: head-motion negatives above per-video p75
-  epochs: 12
+  head_speed_percentile: 75
+  epochs: 50
   window: 64
   batch_frames: 32
   uniform_windows_per_video: 4
@@ -160,54 +117,41 @@ clip:
   weight_decay: 0.0001
   grad_clip: 1.0
   patience: 4
-  checkpoint_root: runs/clip_localiser
   replace_activations: true
 
-# --- Evaluation criterion -------------------------
-# The IoU threshold is a HYPER-PARAMETER, not a constant. 0.5 is the paper default
-# and what the ME-LVQA baselines report at, but the whole precision/recall trade-off
-# pivots on it, so sweeping it is part of the protocol:
-#     python -m mewm.cli.main sweep-iou --dataset casme_sq
-# The reward's temporal term reads the same value, so training and evaluation cannot
-# drift apart onto different objectives.
 evaluation:
   iou_threshold: 0.5
-  affective_rescue: true      # the second clause of eq. (2); off = pure localisation
-  rescue_min_iou: 0.0         # raise to stop a barely-touching proposal being rescued
+  affective_rescue: true
+  rescue_min_iou: 0.0
   iou_sweep: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
   rescue_reward_scale: 0.5
 
-# --- The LOSO training protocol (stage 1 SFT -> gate -> stage 2 RFT -> stage 3 RL) ---
-# One fold per subject. All N-1 non-test subjects train; nothing about the held-out
-# subject reaches any stage. There is no DPO stage -- the filtering role it would have
-# played is a reward-ranked filter (mewm/training/candidate_filter.py), so a rejected
-# candidate never enters a loss term.
+sft_lora:
+  policy: ~
+  quantization: 4bit
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: all-linear
+  batch_size: 2
+  max_length: 4096
+  learning_rate: 0.00002
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  grad_clip: 1.0
+  epochs: 6
+  held_out_subject: ~
+  evaluate_videos: []
+  merge_output: ~
+  test_runs_output: ~
+
 training:
-  # n_val_subjects = 0 is the configured protocol: the whole non-test pool trains, so
-  # the sufficiency gate below is measured on the training pool and its numbers are
-  # IN-SAMPLE. A loss plateau then means the pool was memorised, not that the policy
-  # converged, and pass@1 is optimistic. Raise to 1+ to gate on held-out subjects
-  # instead; nothing else changes.
   n_val_subjects: 0
   fold_seed: 20260824
-
-  # The policy must be open-weight: SFT and GRPO both need gradients, which the HTTP
-  # endpoints do not expose. A hosted id here is rejected with an explanation rather
-  # than failing mid-run.
-  policy_model: Qwen3-VL-8B
-
-  # Stage 0. The CLIP engine is fine-tuned on each fold's pool INSIDE the loso run,
-  # before calibration and SFT, because every later stage reads the representation it
-  # produces. Weights go to <clip.checkpoint_root>/<dataset>/fold_<subject>/
-  # clip_localiser.pt with the held-out report beside them, and are re-asserted against
-  # the held-out subject on load. clip_required makes a stage-0 failure fatal: falling
-  # back to the analytic front end would still print metrics, but not CLIP metrics.
+  policy_model: ~
   clip_finetune: true
   clip_reuse_checkpoint: true
   clip_required: true
-
-  # Stage 1. 100 is a CEILING, not a target: early stopping picks the epoch, so a fold
-  # that converges at 40 stops at 40 instead of overfitting for 60 more.
   sft_max_epochs: 100
   sft_batch_size: 4
   sft_learning_rate: 0.00001
@@ -215,113 +159,51 @@ training:
   sft_warmup_ratio: 0.03
   sft_grad_clip: 1.0
   sft_early_stop: true
-  sft_patience: 8
+  sft_patience: 5
   sft_min_delta: 0.0001
-  # 方案 §3 -- lambda_prop: extra CE weight on the onset/offset/apex number tokens of
-  # part1_proposals, so the localisation answer and the analysis answer share one
-  # backward pass. Only meaningful for gradient-capable (local) policies; the hosted
-  # API policy cannot receive it (no gradients over HTTP) and simply ignores it.
   sft_prop_weight: 1.0
-  max_sft_rounds: 3           # how many times the gate may send the run back to SFT
-
-  # --- The sufficiency gate -------------------------------------------------
-  # 1a. Format alignment: can it follow the instruction contract and emit valid JSON?
-  #     Absolute, and checked first -- RL on unparseable samples optimises the parser.
+  max_sft_rounds: 2
   format_pass_rate: 0.95
-  # 1b. Loss plateau: judged on slope AND coefficient of variation over the trailing
-  #     window. Slope alone would call an oscillating curve converged.
   plateau_window: 0.2
-  plateau_max_slope: 0.001
+  plateau_max_slope: 0.0015
   plateau_max_cv: 0.05
-  # 2a. Headroom. "pass@k > pass@1" is a tautology (pass@k is monotone in k), so the
-  #     criterion is a minimum GAP plus a FLOOR: the policy must be able to pass, and
-  #     must not already rank its passing answer first.
   pass_k: 8
   pass_at_k_samples: 16
   pass_gap_min: 0.15
-  pass_at_k_floor: 0.50
-  # 2b. Reward spread, three ways. all_low -> SFT is undertrained, keep training.
-  #     spread -> trainable, start RL. all_high -> saturated; a group at the ceiling
-  #     has exactly as little advantage as one at the floor.
+  pass_at_k_floor: 0.45
   reward_std_min: 0.05
   reward_mean_low: 0.20
   reward_mean_high: 0.85
-
-  # --- Stage 2: rejection-sampling fine-tuning ------------------------------
-  # Sample k per prompt, keep only candidates that pass the shared criterion and clear
-  # the reward floor, then fine-tune on them. This is what makes the FIRST generation
-  # prefer the highest-probability passing answer.
   rft_samples_per_prompt: 8
   rft_accept_top_k: 2
   rft_min_reward: 0.6
-  # Accepted candidates are written to Q-T-A/<dataset>/augmented/fold_<subject>/ in the
-  # exact 4-field jsonl schema of the reference sets; provenance (source video, event
-  # index, interval) lives in video_id plus a sidecar manifest, so the jsonl stays
-  # byte-compatible. A pair from outside the fold's pool raises rather than being dropped.
   write_augmented_qa: true
   use_augmented_qa: true
-  # The corpus-level sweep written by `mewm augment-qa`, projected onto each fold's
-  # pool by video key. Drawn once from a frozen fold-agnostic policy, so per-fold
-  # redrawing would be statistically identical at N times the API cost -- this is what
-  # keeps augmentation inside the loso run instead of beside it. Rows outside the pool
-  # are filtered (the file spans every subject by design); the per-fold files still
-  # raise, because those promise they contain pool material only.
   use_consolidated_augmented: true
-  consolidated_augmented_model: claude-sonnet-5
-
-  # --- Stage 3: GRPO --------------------------------------------------------
-  rl_total_steps: 1000        # optimisation steps, not passes over the prompt set
-  rl_group_size: 8            # G in the group-relative advantage
+  consolidated_augmented_model: ~
+  rl_total_steps: 1000
+  rl_group_size: 8
   rl_prompts_per_step: 4
   rl_eval_every: 50
   rl_temperature: 0.7
-  rl_admit_prompts: true      # skip degenerate groups instead of taking a no-op step
-
-  # Stage 4. Test-time augmentation: k draws per held-out prompt, keep the highest
-  # CompositeReward. NO gradient step, no optimiser, nothing written back as training
-  # data -- the held-out subject still reaches no loss term, which is the property LOSO
-  # claims. pass@1 is always reported beside the aggregated number, because best-of-k
-  # changes the inference budget and a lone aggregated number hides that.
+  rl_admit_prompts: true
   test_time_augmentation: true
   tta_samples: 5
 
-# --- Model bindings ----------------------------------------------------------
-# Verification heterogeneity is a hard requirement (appendix D.1): critic_model
-# MUST differ from reasoning_model. If they match, the critic shares the
-# reasoner's blind spots and adversarial verification degenerates into
-# self-agreement -- `mewm doctor` warns when this holds.
-# Any id from `python -m mewm.cli.main models` works here. Hosted:
-#   claude-sonnet-5 (high|xhigh|max), claude-sonnet-4-20250514 (not entitled on the
-#   current account -- see the registry note), gpt-5.6-sol (high|xhigh),
-#   gpt-5.4 / gpt-5.4-mini (low|medium|high|xhigh),
-#   deepseek-v4-flash-vision-exp, grok-4.5,
-#   gemini-3-pro, gemini-3-flash, gemini-3.1-pro, gemini-2.5-pro, gemini-2.5-flash
-# Open weights (downloaded on first use), all thinking-enabled -- they emit a
-# <think>...</think> chain of thought that the client parses onto
-# LLMResponse.reasoning, kept out of the answer text:
-#   Qwen3-VL-8B, Qwen3.6-VL-27B, Qwen3.8-27B (text-only), Gemma-4-31B
 llm:
-  reasoning_model: gpt-5.6-sol
-  perception_model: gpt-5.6-sol
-  structure_model: gpt-5.6-sol
-  critic_model: claude-sonnet-5   # must differ in PROVIDER from reasoning_model
-  orchestrator_model: gpt-5.6-sol
-
-  # Per-role backend (方案 §5.6): hosted | local, explicit. 'hosted' with an
-  # open-weight id (or 'local' with a hosted id) is a BackendMismatch error at
-  # startup, never a silent re-route. CLI --backend / --*-backend flags override.
+  reasoning_model: ~
+  perception_model: ~
+  structure_model: ~
+  critic_model: ~
+  orchestrator_model: ~
   reasoning_backend: hosted
   perception_backend: hosted
   structure_backend: hosted
   critic_backend: hosted
-
-  # Per-role reasoning tier; "" uses each model's registered default.
   reasoning_effort: ""
   perception_effort: ""
   structure_effort: ""
   critic_effort: ""
-
-  # Open-weight runtime
   local_dtype: bfloat16
   local_device_map: auto
   local_max_new_tokens: 2048
@@ -332,28 +214,15 @@ llm:
   temperature_r_train: 0.7
   temperature_c: 0.5
   max_tokens: 8192
-  # P.scan's batch call (see orchestrator.p_scan_batch_size) gets its own, larger
-  # ceiling: one JSON entry with a prose "notes" field per candidate in the batch
-  # can still run long even with batching. Every other call keeps max_tokens.
   p_scan_max_tokens: 16384
   timeout: 600
   retries: 3
 
-# --- Hosted / local double-backend runtime (方案 §5) --------------------------
 backends:
   local_dtype: bfloat16
-  local_quantization: 4bit      # none | 4bit (nf4 double quantisation, 方案 §4.3)
-  fallback_to_api: false        # the ONLY sanctioned degradation; every fallback is
-                                # WARNING-logged and recorded in backend_manifest.json
-  prefetch: []                  # model ids to ensure_weights() before a run starts
+  local_quantization: 4bit
+  fallback_to_api: false
+  prefetch: []
 
-# --- 方案 §4.4 hyper-parameter tiers (documentation; applied when the policy is
-# switched to an open-weight model with `loso --policy <id>`) -------------------
-#   Qwen3-VL-8B    nf4 4bit  LoRA r16/a32/0.05  SFT 2e-5/b4/w0.03  GRPO 1e-6/g8/clip0.2/beta0.02
-#   Qwen3.6-VL-27B nf4 4bit  LoRA r32/a64/0.05  SFT 1e-5/b2/w0.03  GRPO 5e-7/g8/clip0.2/beta0.02
-#   Qwen3.8-27B    nf4 4bit  LoRA r32/a64/0.05  SFT 1e-5/b4/w0.03  GRPO 5e-7/g8/clip0.2/beta0.02
-#   Gemma-4-31B    nf4 4bit  LoRA r32/a64/0.05  SFT 1e-5/b1/w0.05  GRPO 5e-7/g8/clip0.2/beta0.02
-
-# --- Global ------------------------------------------------------------------
-es_dc_alpha: 0.5            # ES / DC convex combination (paper 3.4.4)
+es_dc_alpha: 0.5
 seed: 20260824

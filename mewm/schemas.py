@@ -1,13 +1,4 @@
-"""The seven typed interface objects of appendix A.2.
-
-* **Evidence layering.**  ``Evidence.refs`` may only point at entries whose evidence
-  level is *strictly lower* (motion < au < emotion < verification).  That makes the
-  reference graph acyclic by construction, so a motion observation can never be
-  justified by an emotion conclusion (gate rule R1, paper 3.4.1).
-* **Replayability.**  Every ``RolloutRecord`` carries the frozen engine's version hash,
-  so any number quoted by an agent can be recomputed later from the same checkpoint.
-"""
-
+"""Typed interface objects shared across agents and engines."""
 from __future__ import annotations
 
 import hashlib
@@ -19,18 +10,11 @@ from enum import IntEnum
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 
-# ---------------------------------------------------------------------------
-# Evidence levels -- the ordering that makes the reference graph a DAG
-# ---------------------------------------------------------------------------
-
-
 class EvidenceLevel(IntEnum):
-    """Strictly ordered evidence tiers of the motion -> AU -> emotion chain."""
-
-    MOTION = 0        # P-Agent: ROI measurements, proposal confirmation
-    AU = 1            # A-Agent: activation set, AU->AU dynamic graph
-    EMOTION = 2       # R-Agent: causal CoT, labels, verdict, narrative
-    VERIFICATION = 3  # C-Agent: challenges and their rollout analysis reports
+    MOTION = 0
+    AU = 1
+    EMOTION = 2
+    VERIFICATION = 3
 
     @classmethod
     def of_agent(cls, agent: str) -> "EvidenceLevel":
@@ -48,7 +32,7 @@ class EvidenceLevel(IntEnum):
 
 
 class ContractError(ValueError):
-    """Raised when an interface object violates its output contract."""
+    pass
 
 
 def _new_id(prefix: str, payload: Any = None) -> str:
@@ -56,15 +40,8 @@ def _new_id(prefix: str, payload: Any = None) -> str:
     return f"{prefix}#{hashlib.blake2s(seed.encode('utf-8'), digest_size=5).hexdigest()}"
 
 
-# ---------------------------------------------------------------------------
-# 1. LatentStream -- representation engine output, per frame
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class ROIMeasurement:
-    """One ``(m, theta, c)`` triple of eq. (3) for one anatomical region."""
-
     roi_index: int
     roi_name: str
     roi_label: str
@@ -82,20 +59,17 @@ class ROIMeasurement:
 
 @dataclass
 class FrameState:
-    """Per-frame slice of the latent stream."""
-
     t: int
     measurements: List[ROIMeasurement] = field(default_factory=list)
-    head_motion: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)  # g_t: dx,dy,dtheta,scale
-    slot_activations: Dict[str, float] = field(default_factory=dict)       # sigma_hat_{k,t}
-    slots: Optional[Any] = None            # A_t, (K, d_a) array -- kept out of JSON
+    head_motion: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    slot_activations: Dict[str, float] = field(default_factory=dict)
+    slots: Optional[Any] = None
     z_slow: Optional[Any] = None
     z_fast: Optional[Any] = None
     z_belief: Optional[Any] = None
-    available: bool = True                 # avail_t; False when face detection failed
+    available: bool = True
 
     def digest(self) -> Dict[str, Any]:
-        """JSON-safe summary (the dense arrays stay in memory / on disk)."""
         return {
             "t": self.t,
             "available": self.available,
@@ -107,8 +81,6 @@ class FrameState:
 
 @dataclass
 class LatentStream:
-    """``{t: (o_t, g_t, A_t, z_t, avail_t)}`` -- produced by V, consumed by M and P/A."""
-
     video_id: str
     fps: float
     frames: Dict[int, FrameState] = field(default_factory=dict)
@@ -126,14 +98,12 @@ class LatentStream:
         return self.frames.get(t)
 
     def slot_trajectory(self, au: str, t_on: int, t_off: int) -> List[float]:
-        """``sigma_hat_{k,t}`` over ``[t_on, t_off]`` -- the A-Agent's node profile input."""
         return [
             float(self.frames[t].slot_activations.get(au, 0.0))
             for t in range(t_on, t_off + 1) if t in self.frames
         ]
 
     def availability_gaps(self) -> List[Tuple[int, int]]:
-        """Contiguous runs of unavailable frames, propagated downstream as-is."""
         gaps: List[Tuple[int, int]] = []
         start: Optional[int] = None
         for t in self.indices():
@@ -147,15 +117,8 @@ class LatentStream:
         return gaps
 
 
-# ---------------------------------------------------------------------------
-# 2. ErrorRecord -- M2 output, per frame
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class PhysioEvent:
-    """One matched entry of the physiological template dictionary (appendix B.5)."""
-
     t_start: int
     t_end: int
     template_id: str
@@ -168,8 +131,6 @@ class PhysioEvent:
 
 @dataclass
 class ErrorRecord:
-    """``S_t`` plus the three-way decomposition of eq. (6); root of the episodic tree."""
-
     video_id: str
     t_start: int
     s_curve: List[float] = field(default_factory=list)
@@ -177,7 +138,7 @@ class ErrorRecord:
     delta_scene: List[float] = field(default_factory=list)
     delta_physio: List[float] = field(default_factory=list)
     delta_expr: List[float] = field(default_factory=list)
-    au_attribution: Dict[str, List[float]] = field(default_factory=dict)  # per-slot delta_{k,t}
+    au_attribution: Dict[str, List[float]] = field(default_factory=dict)
     physio_events: List[PhysioEvent] = field(default_factory=list)
     low_confidence_spans: List[Tuple[int, int]] = field(default_factory=list)
 
@@ -196,7 +157,6 @@ class ErrorRecord:
         }
 
     def summary(self, t_on: int, t_off: int) -> Dict[str, Any]:
-        """The bounded digest that mid-chain phases are allowed to see (table D.2)."""
         win = self.window(t_on, t_off)
         s = win["S"] or [0.0]
         return {
@@ -210,23 +170,16 @@ class ErrorRecord:
         }
 
 
-# ---------------------------------------------------------------------------
-# 3. CandidateInterval -- M2 proposal, confirmed by P-Agent scan phase
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class CandidateInterval:
-    """``{cid, t_on, t_off, apex, peak_S, attribution, physio_overlap}``."""
-
     cid: str
     t_on: int
     t_off: int
     apex: int
     peak_S: float
-    attribution: Dict[str, float] = field(default_factory=dict)   # pi_{k,j}
+    attribution: Dict[str, float] = field(default_factory=dict)
     physio_overlap: bool = False
-    channel: str = "micro"          # "micro" | "macro" (over the 0.5 s ceiling)
+    channel: str = "micro"
     confirmed: bool = False
     notes: str = ""
 
@@ -248,12 +201,6 @@ class CandidateInterval:
         return asdict(self)
 
 
-# ---------------------------------------------------------------------------
-# 4. Evidence -- the universal cognitive-layer carrier
-# ---------------------------------------------------------------------------
-
-# Vocabulary bans of gate rule R2 (appendix D.5).  P must not name AUs or emotions;
-# A must not name emotions.  Scanned case-insensitively over the serialised product.
 AU_PATTERN = re.compile(r"\bAU\s?\d{1,2}\b", re.IGNORECASE)
 EMOTION_LEXICON = (
     "happiness", "happy", "joy", "surprise", "surprised", "disgust", "disgusted",
@@ -272,20 +219,13 @@ MUSCLE_LEXICON = (
 
 @dataclass
 class Evidence:
-    """``eps = (id, a_src, claim, Pi, u, c, s)`` of paper 3.4.1.
-
-    ``payload`` (``Pi``) holds the machine-checkable numbers, ``uncertainty`` (``u``)
-    the spread, ``confidence`` (``c``) the producer's own score and ``status`` (``s``)
-    the gate outcome.  Revision never mutates: it emits a new entry and keeps the old.
-    """
-
     eid: str
-    source: str                       # a_src: "P" | "A" | "R" | "C" | "V1" | "M2" | ...
+    source: str
     claim: str
     payload: Dict[str, Any] = field(default_factory=dict)
     uncertainty: Dict[str, float] = field(default_factory=dict)
     confidence: float = 1.0
-    status: str = "active"            # "active" | "revised" | "rejected"
+    status: str = "active"
     level: EvidenceLevel = EvidenceLevel.MOTION
     refs: List[str] = field(default_factory=list)
     cid: str = ""
@@ -316,7 +256,6 @@ class Evidence:
         )
 
     def revise(self, claim: str, payload: Optional[Dict[str, Any]] = None) -> "Evidence":
-        """Emit the replacement entry; the caller marks this one ``revised``."""
         successor = Evidence.create(
             self.source, claim, payload if payload is not None else self.payload,
             refs=self.refs, confidence=self.confidence, cid=self.cid,
@@ -331,8 +270,6 @@ class Evidence:
 
 
 class EvidenceChain:
-    """Append-only DAG of evidence entries for one proposal."""
-
     def __init__(self, cid: str = "") -> None:
         self.cid = cid
         self._entries: Dict[str, Evidence] = {}
@@ -357,7 +294,7 @@ class EvidenceChain:
         ]
 
     def add(self, entry: Evidence, *, enforce_layering: bool = True) -> Evidence:
-        """Append after checking R1 (reference legality)."""
+        # R1: refs must point strictly lower in the evidence hierarchy
         if entry.eid in self._entries:
             raise ContractError(f"duplicate evidence id {entry.eid}")
         if enforce_layering:
@@ -391,17 +328,11 @@ class EvidenceChain:
         return chain
 
 
-# ---------------------------------------------------------------------------
-# 5. RolloutRecord -- provenance for every M3 primitive call
-# ---------------------------------------------------------------------------
-
 PRIMITIVES = ("rollout", "score", "mask", "compare")
 
 
 @dataclass
 class RolloutRecord:
-    """``{req_id, caller, primitive, params, result_digest, model_version}``."""
-
     req_id: str
     caller: str
     primitive: str
@@ -425,7 +356,6 @@ class RolloutRecord:
         )
 
     def as_evidence(self) -> Evidence:
-        """Rollout records enter the chain as motion-level (recomputable) entries."""
         entry = Evidence.create(
             "M3",
             f"{self.primitive}({', '.join(f'{k}={v}' for k, v in list(self.params.items())[:3])})",
@@ -439,25 +369,18 @@ class RolloutRecord:
         return asdict(self)
 
 
-# ---------------------------------------------------------------------------
-# 6. ChallengeRecord -- the C <-> R protocol
-# ---------------------------------------------------------------------------
-
 CHALLENGE_TYPES = ("evidence_gap", "dynamics_inconsistency", "insufficient_necessity")
 CHALLENGE_TYPES_ZH = {
     "evidence_gap": "证据缺口",
     "dynamics_inconsistency": "动力学不一致",
     "insufficient_necessity": "必要性不足",
 }
-FINAL_VERDICTS = ("rejected", "partial", "upheld")   # 不成立 / 部分成立 / 成立
-# Monotone confidence steps applied by the R-Agent adjudication phase (paper 3.4.5).
+FINAL_VERDICTS = ("rejected", "partial", "upheld")
 FINAL_VERDICT_STEP = {"rejected": 0.0, "partial": -0.08, "upheld": -0.20}
 
 
 @dataclass
 class ChallengeRecord:
-    """One challenge, its rollout-backed analysis report, the response and the verdict."""
-
     ch_id: str
     ch_type: str
     refs: List[str] = field(default_factory=list)
@@ -476,7 +399,6 @@ class ChallengeRecord:
         if ch_type not in CHALLENGE_TYPES:
             raise ContractError(f"unknown challenge type {ch_type!r}")
         if not analysis_report_id:
-            # "空口质疑将被仲裁规则退回" -- enforced at construction, not at review time.
             raise ContractError("a challenge must cite a rollout analysis report")
         if not refs:
             raise ContractError("a challenge must cite at least one evidence entry")
@@ -499,15 +421,8 @@ class ChallengeRecord:
         return asdict(self)
 
 
-# ---------------------------------------------------------------------------
-# 7. Verdict / Narrative, plus the AU graph and causal CoT they quote
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class AUNode:
-    """``Phi_j(k) = (t_on, t_apex, t_off, sigma_max, kappa_rise, kappa_decay)``."""
-
     au: str
     t_on: int
     t_apex: int
@@ -515,7 +430,7 @@ class AUNode:
     peak: float
     rise_slope: float
     decay_slope: float
-    activation: str = "active"    # "active" | "weak"
+    activation: str = "active"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -523,14 +438,12 @@ class AUNode:
 
 @dataclass
 class AUEdge:
-    """``(k -> k', rho, tau, w)`` with the harmonic-mean weight of appendix C.5."""
-
     source: str
     target: str
-    polarity: str                 # "+" (synergy) | "-" (antagonism)
+    polarity: str
     lag_frames: int
     lag_ms: float
-    weight: float                 # nan when the two sources disagree in sign
+    weight: float
     w_model: float = 0.0
     w_obs: float = 0.0
     conflict: bool = False
@@ -538,19 +451,17 @@ class AUEdge:
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
-        if self.weight != self.weight:  # NaN is not JSON-representable
+        if self.weight != self.weight:
             data["weight"] = None
         return data
 
 
 @dataclass
 class AUDynGraph:
-    """``G^AU_j = (V_j, E_j, Phi_j)`` (paper 3.4.3, appendix C.5)."""
-
     cid: str
     nodes: Dict[str, AUNode] = field(default_factory=dict)
     edges: List[AUEdge] = field(default_factory=list)
-    narrative: str = ""           # the language-side multi-dimensional motion account
+    narrative: str = ""
 
     @property
     def active_aus(self) -> List[str]:
@@ -574,18 +485,12 @@ class AUDynGraph:
 
 @dataclass
 class CausalCoT:
-    """The five-layer field-structured chain of thought (paper 3.4.4, appendix C.7).
-
-    ``cf_mhv`` is filled by the C-Agent, never by R: keeping the field but denying the
-    write is what makes "the critic填写" checkable rather than a convention.
-    """
-
     cid: str
-    P: Dict[str, str] = field(default_factory=dict)       # motion facts
-    M: Dict[str, str] = field(default_factory=dict)       # motion -> AU
-    C: Dict[str, Any] = field(default_factory=dict)       # hypothesis scoring
-    cf_mhv: Dict[str, Any] = field(default_factory=dict)  # critic-owned
-    MC: Dict[str, Any] = field(default_factory=dict)      # confidence + open questions
+    P: Dict[str, str] = field(default_factory=dict)
+    M: Dict[str, str] = field(default_factory=dict)
+    C: Dict[str, Any] = field(default_factory=dict)
+    cf_mhv: Dict[str, Any] = field(default_factory=dict)
+    MC: Dict[str, Any] = field(default_factory=dict)
 
     es: Dict[str, float] = field(default_factory=dict)
     dc: Dict[str, float] = field(default_factory=dict)
@@ -598,40 +503,32 @@ class CausalCoT:
         return asdict(self)
 
 
-#: The only values ``Verdict.suppression`` may take (paper 3.4.5, appendix C.4).
 SUPPRESSION_STATES = ("none", "neutralised", "masked")
 
 
 def coerce_suppression(value: Any) -> Tuple[str, str]:
-    """Map a model-emitted suppression field onto its enum, returning ``(state, prose)``.
-    """
     text = str(value or "").strip()
     if not text:
         return "none", ""
     lowered = text.lower()
     if lowered in SUPPRESSION_STATES:
         return lowered, ""
-    # Long-form answer: recover the state from its vocabulary, keep the prose.
     if "masquerad" in lowered or "masked" in lowered or "掩饰" in text:
         return "masked", text
     if "neutralis" in lowered or "neutraliz" in lowered or "抑制" in text:
         return "neutralised", text
     if "suppress" in lowered:
-        # "suppressed to coarse other" is a labelling decision, not a facial suppression
-        # pattern; recording it as one would assert a C.4 finding that was never made.
         return "none", text
     return "none", text
 
 
 @dataclass
 class Verdict:
-    """``{e_coarse, e_fine, C, suppression, fusion_terms}``."""
-
     cid: str
     e_coarse: str = ""
     e_fine: str = ""
     confidence: float = 0.0
-    suppression: str = "none"     # "none" | "neutralised" | "masked"
+    suppression: str = "none"
     fusion_terms: Dict[str, float] = field(default_factory=dict)
     prototype_completeness: float = 0.0
     degraded: bool = False
@@ -643,8 +540,6 @@ class Verdict:
 
 @dataclass
 class NarrativeAssertion:
-    """One time-bearing sentence plus the entries that license it."""
-
     text: str
     refs: List[str] = field(default_factory=list)
     t_span: Optional[Tuple[int, int]] = None
@@ -652,8 +547,6 @@ class NarrativeAssertion:
 
 @dataclass
 class Narrative:
-    """``{全局叙述文本, 逐断言引用表}`` -- the video-level output."""
-
     video_id: str
     text: str = ""
     assertions: List[NarrativeAssertion] = field(default_factory=list)
@@ -674,17 +567,10 @@ class Narrative:
         }
 
 
-# ---------------------------------------------------------------------------
-# Auxiliary state objects
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class OpenQuestion:
-    """Registered disagreement -- never silently dropped (paper 3.4.3 / R4)."""
-
     qid: str
-    kind: str            # "slot_rule_mismatch" | "edge_sign_conflict" | "weak_activation" | ...
+    kind: str
     detail: str
     refs: List[str] = field(default_factory=list)
     cid: str = ""
@@ -697,12 +583,7 @@ class OpenQuestion:
 
     @classmethod
     def coerce(cls, item: Any, cid: str = "", default_kind: str = "unspecified") -> "OpenQuestion":
-        """Build one from whatever shape a model emitted.
-
-        The contract asks for ``{"kind": ..., "detail": ...}`` but models routinely send
-        a bare string, and an open question is precisely the thing that must not be lost
-        to a parsing quibble -- it is the record that something was left unresolved.
-        """
+        # open questions must not be lost to a parsing quibble
         if isinstance(item, cls):
             return item
         if isinstance(item, dict):
@@ -719,8 +600,6 @@ class OpenQuestion:
 
 @dataclass
 class SlowDigest:
-    """``(t, z^s summary, Kalman gain, reset_flag)`` -- one slow-variable log row."""
-
     t: int
     summary: List[float] = field(default_factory=list)
     kalman_gain: float = 0.0
@@ -732,13 +611,11 @@ class SlowDigest:
 
 @dataclass
 class GateRecord:
-    """``(gate, verdict, failed_rules, retry_idx)``."""
-
-    gate: str            # "consistency" | "sufficiency"
+    gate: str
     node: str
     passed: bool
     failed_rules: List[str] = field(default_factory=list)
-    grade: str = ""      # sufficiency: "sufficient" | "specific_gap" | "clearly_insufficient"
+    grade: str = ""
     questions: List[str] = field(default_factory=list)
     retry_idx: int = 0
 
@@ -748,8 +625,6 @@ class GateRecord:
 
 @dataclass
 class BudgetState:
-    """``{llm_calls_used, path_choices, gate_retries, degradations}``."""
-
     llm_calls_used: int = 0
     max_llm_calls: int = 400
     path_choices: Dict[str, str] = field(default_factory=dict)
@@ -766,7 +641,7 @@ class BudgetState:
         self.llm_calls_used += n
 
     def degrade(self, reason: str) -> None:
-        """Every fallback is written down -- silent degradation is what we're avoiding."""
+        # every fallback is recorded; silent degradation is what we avoid
         self.degradations.append(reason)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -775,8 +650,6 @@ class BudgetState:
 
 @dataclass
 class VideoMeta:
-    """``{video_id, path, fps, n_frames, subject_id}``."""
-
     video_id: str
     dataset: str
     path: str
@@ -792,10 +665,6 @@ class VideoMeta:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-
-# ---------------------------------------------------------------------------
-# Contract validation
-# ---------------------------------------------------------------------------
 
 _CONTRACTS: Dict[str, Dict[str, Any]] = {
     "proposal": {
@@ -833,8 +702,6 @@ _CONTRACTS: Dict[str, Dict[str, Any]] = {
 
 
 def validate(payload: Dict[str, Any], contract: str) -> List[str]:
-    """Structural check of an agent product; returns the list of violations."""
-
     spec = _CONTRACTS.get(contract)
     if spec is None:
         raise KeyError(f"no contract named {contract!r}")
@@ -859,12 +726,6 @@ def validate(payload: Dict[str, Any], contract: str) -> List[str]:
 
 
 def _text_leaves(payload: Any, path: str = "") -> Iterator[Tuple[str, str]]:
-    """Yield ``(field_path, text)`` for every string in a nested product.
-
-    Dict keys are yielded as well as values: the banned vocabulary can appear as a key
-    (an AU-keyed map) just as easily as in prose, and a scan that only looked at values
-    would miss it.
-    """
     if isinstance(payload, str):
         yield path or "<root>", payload
     elif isinstance(payload, dict):
@@ -879,9 +740,6 @@ def _text_leaves(payload: Any, path: str = "") -> Iterator[Tuple[str, str]]:
 
 
 def scan_forbidden_vocabulary(payload: Any, *, ban_au: bool, ban_emotion: bool) -> List[str]:
-    """Gate rule R2: graded lexicon scan over an agent product.
-    """
-
     leaves = list(_text_leaves(payload))
     hits: List[str] = []
 
@@ -916,7 +774,6 @@ def scan_forbidden_vocabulary(payload: Any, *, ban_au: bool, ban_emotion: bool) 
 
 
 def json_schema_for(contract: str) -> Dict[str, Any]:
-    """Equivalent JSON Schema, for external validators."""
     spec = _CONTRACTS[contract]
     py_to_json = {list: "array", dict: "object", str: "string",
                   int: "integer", float: "number", bool: "boolean"}

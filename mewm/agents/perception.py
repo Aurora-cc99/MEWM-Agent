@@ -1,13 +1,4 @@
-"""P-Agent -- candidate localisation and motion evidence verification (paper 3.4.2).
-
-* **scan** (segment-window granularity) -- read the ``S_t`` curve and its three-way
-  decomposition, confirm the hysteresis boundaries, re-scan across segment joins, and
-  route over-long intervals to the macro channel.
-* **verify** (per proposal) -- transcribe the V1 measurements for every anatomical region
-  into citable evidence entries, so an automatic measurement becomes something the rest
-  of the chain can quote and the critic can challenge.
-"""
-
+"""Perception agent: validates motion evidence and ME candidate proposals."""
 from __future__ import annotations
 
 import json
@@ -23,8 +14,6 @@ LOGGER = logging.getLogger(__name__)
 
 
 class PerceptionAgent(BaseAgent):
-    """Scan and verification phases of the perception role."""
-
     role_files = {
         PHASE_P_SCAN: "p_agent_scan",
         PHASE_P_VERIFY: "p_agent_verify",
@@ -36,8 +25,6 @@ class PerceptionAgent(BaseAgent):
     def phases(self) -> Tuple[str, ...]:
         return (PHASE_P_SCAN, PHASE_P_VERIFY)
 
-    # -- prompts ------------------------------------------------------------
-
     def build_user_prompt(self, phase: str, projection: Projection,
                           state: MEWMState, **kwargs: Any) -> str:
         if phase == PHASE_P_SCAN:
@@ -47,16 +34,6 @@ class PerceptionAgent(BaseAgent):
     def _scan_prompt(self, projection: Projection, state: MEWMState, **kwargs: Any) -> str:
         record = projection.get("error_record")
         proposals: Sequence[CandidateInterval] = kwargs.get("candidates") or state.proposals
-        # This number is reference context, not a rule the detector itself enforces:
-        # pipeline.py passes the uniform MICRO_CEILING_FRAMES (200) unless an explicit
-        # max_micro_seconds override is configured -- the same ceiling the engine's own
-        # micro/macro routing already applied, so P-Agent's channel call corroborates a
-        # decision the detector made rather than being the only check left. Duration
-        # alone must never force the verdict, or this reintroduces the blind-filter
-        # regression documented in SpottingConfig. Weigh it alongside the energy
-        # decomposition, physio overlap and attribution below, per p_agent_scan.md
-        # rule 4. 0 means even that reference is unavailable; the line is then dropped
-        # rather than defaulted to a number that does not exist.
         max_dur = int(kwargs.get("max_micro_frames", 0) or 0)
         lines = [
             f"Video: {state.video_id}  frames "
@@ -145,8 +122,6 @@ class PerceptionAgent(BaseAgent):
         )
         return "\n".join(lines)
 
-    # -- parsing ------------------------------------------------------------
-
     def parse(self, phase: str, payload: Dict[str, Any], projection: Projection,
               state: MEWMState, **kwargs: Any) -> AgentResult:
         if phase == PHASE_P_SCAN:
@@ -165,10 +140,6 @@ class PerceptionAgent(BaseAgent):
             if len(interval) != 2:
                 continue
             source = candidates.get(cid)
-            # If the model omits "channel" outright, defer to the engine's own
-            # pre-assigned channel for this candidate rather than blindly defaulting
-            # to "micro" -- an omission should preserve whatever M2's length-based
-            # routing (or a prior stage) already decided, not silently override it.
             default_channel = source.channel if source is not None else "micro"
             record = {
                 "cid": cid,
@@ -234,11 +205,8 @@ class PerceptionAgent(BaseAgent):
         }
         return result
 
-    # -- deterministic fallback --------------------------------------------
-
     def fallback(self, phase: str, projection: Projection, state: MEWMState,
                  reason: str, **kwargs: Any) -> AgentResult:
-        """Fall back on the engine's own output (paper D.3: "P falls back to V1")."""
         result = AgentResult(phase=phase, degraded=True, parsed=False)
         result.notes.append(f"degraded: {reason}; using the deterministic engine output")
 

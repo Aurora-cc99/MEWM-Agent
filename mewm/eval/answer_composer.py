@@ -1,6 +1,4 @@
-"""Compose the final ME-LVQA answer: one flowing summary per video.
-"""
-
+"""Composes structured natural-language answers from agent evidence chains."""
 from __future__ import annotations
 
 import logging
@@ -23,8 +21,6 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class AnswerSection:
-    """One proposal's contribution to the final answer."""
-
     proposal_id: int
     cid: str
     onset: int
@@ -49,18 +45,8 @@ def _format_aus(aus: Sequence[str]) -> str:
     return ", ".join(aus) if aus else "none"
 
 
-# ---------------------------------------------------------------------------
-# Deterministic fallback prose
-# ---------------------------------------------------------------------------
-
-
 def _fallback_static(graph: Optional[AUDynGraph], fine: str,
                      measurements: Sequence[Any] = ()) -> str:
-    """Render a static reading from measurements when the narrator did not run.
-
-    Written from the quantities the engines produced, and it says so. A fabricated
-    appearance description would read like a model observation while resting on nothing.
-    """
     if graph is None or not graph.nodes:
         return ("No action unit reaches activation inside this interval, so no static "
                 "facial configuration can be asserted from the observed motion.")
@@ -92,7 +78,6 @@ def _fallback_static(graph: Optional[AUDynGraph], fine: str,
 
 
 def _au_change_cot(graph: Optional[AUDynGraph], fine: str) -> str:
-    """The activation-order chain, in the reference's phrasing."""
     if graph is None or not graph.nodes:
         return "No activation sequence could be resolved inside this interval."
     order = graph.onset_order()
@@ -114,18 +99,10 @@ def _au_change_cot(graph: Optional[AUDynGraph], fine: str) -> str:
     return ", ".join(clauses) + tail + "."
 
 
-# ---------------------------------------------------------------------------
-# Composer
-# ---------------------------------------------------------------------------
-
-
 class AnswerComposer:
-    """Renders a :class:`~mewm.pipeline.PipelineResult` into the ME-LVQA answer text."""
 
     def __init__(self, lang: str = "en") -> None:
         self.lang = lang
-
-    # -- per proposal -------------------------------------------------------
 
     def section(
         self,
@@ -149,7 +126,6 @@ class AnswerComposer:
 
         chunks: List[str] = []
 
-        # -- localisation line
         chunks.append(
             f"{_ordinal(proposal_id)} micro-expression: frames {proposal.t_on}-"
             f"{proposal.t_off} (apex {proposal.apex}), "
@@ -159,7 +135,6 @@ class AnswerComposer:
             f"annotated action units: {_format_aus(annotated_aus)}."
         )
 
-        # -- static / dynamic reading
         chunks.append(scrub(static_text.strip())
                       or _fallback_static(graph, fine, measurements))
         if dynamic_text.strip():
@@ -167,7 +142,6 @@ class AnswerComposer:
 
         metrics: Dict[str, Any] = {}
 
-        # -- W-matrix summary
         if graph is not None and graph.nodes:
             links = strongest_links(graph, 3)
             active = graph.active_aus or list(graph.nodes)
@@ -189,7 +163,6 @@ class AnswerComposer:
                     + ", ".join(f"{e.source}->{e.target}" for e in conflicts) + "."
                 )
 
-        # -- label consistency
         if fine and coarse:
             consistent = labels_consistent(fine, coarse)
             chunks.append(
@@ -199,13 +172,11 @@ class AnswerComposer:
             )
             metrics["label_consistent"] = consistent
 
-        # -- main path
         if graph is not None and graph.nodes:
             path = main_path(graph, fine)
             chunks.append(f"Global main path: {'->'.join(path)}.")
             metrics["main_path"] = path
 
-            # -- DAG validation and key causal node
             acyclicity = acyclicity_score(graph)
             chunks.append(
                 f"DAG validation: acyclicity score = {acyclicity:.4f} "
@@ -223,7 +194,6 @@ class AnswerComposer:
                 metrics["betweenness"] = centrality
                 metrics["key_node"] = key_node
 
-        # -- authenticity and confidence
         if cot is not None and fine:
             raw, normalised = authenticity_score(
                 cot.es, cot.dc, fine,
@@ -236,7 +206,6 @@ class AnswerComposer:
             metrics.update({"score_auth": raw, "normalised_confidence": normalised,
                             "verdict_confidence": confidence})
 
-        # -- GCN-style validation
         if graph is not None and graph.nodes:
             propagation = gcn_propagation(graph)
             chunks.append(
@@ -247,7 +216,6 @@ class AnswerComposer:
             )
             metrics["gcn"] = propagation
 
-        # -- counterfactual feature intervention (== MNI of eq. 10)
         if cfi:
             mean_cfi = float(np.mean(list(cfi.values())))
             rendered = ", ".join(f"{au} {value:.3f}"
@@ -281,7 +249,6 @@ class AnswerComposer:
                 )
             metrics["confidence_bands"] = bands
 
-        # -- label recheck
         if cot is not None and fine and cot.fine_label and cot.fine_label != fine:
             reason = scrub(verdict.rationale) if (verdict and verdict.rationale) else ""
             if len(reason) > 300:
@@ -299,7 +266,6 @@ class AnswerComposer:
                 f"and maps consistently onto the coarse class {coarse}."
             )
 
-        # -- suppression / masquerade
         if verdict is not None and verdict.suppression != "none":
             descriptor = {
                 "neutralised": "a neutralised display -- a core unit of the expression "
@@ -310,10 +276,7 @@ class AnswerComposer:
             chunks.append(f"Suppression verdict: {descriptor}.")
             metrics["suppression"] = verdict.suppression
 
-        # -- measurement-quality caveat
         if coherence_saturated:
-            # Stated in the answer, not just logged: a reader comparing this against a
-            # reference set needs to know the discriminative channel had collapsed.
             chunks.append(
                 "Reliability note: every facial region in this interval shows a "
                 "similarly uniform motion direction, so directional agreement does not "
@@ -322,7 +285,6 @@ class AnswerComposer:
                 "certain than the individual scores suggest."
             )
 
-        # -- AU-change chain of thought
         chunks.append("AU-change CoT: " + _au_change_cot(graph, fine))
 
         return AnswerSection(
@@ -332,8 +294,6 @@ class AnswerComposer:
             metrics=metrics,
         )
 
-    # -- whole video --------------------------------------------------------
-
     def compose(
         self,
         result: Any,
@@ -342,7 +302,6 @@ class AnswerComposer:
         measurements_by_cid: Optional[Dict[str, Sequence[Any]]] = None,
         saturated_by_cid: Optional[Dict[str, bool]] = None,
     ) -> Dict[str, Any]:
-        """Build the final answer text plus its per-proposal breakdown."""
         state = result.state
         fps = state.video_meta.fps if state.video_meta else 30.0
         cfi_by_cid = cfi_by_cid or {}
@@ -363,7 +322,6 @@ class AnswerComposer:
         header += "."
 
         if n_detected == 0:
-            # A negative is a claim and needs the same support as a positive one.
             record = state.error_record
             evidence = ""
             if record is not None and record.s_curve:
@@ -401,7 +359,6 @@ class AnswerComposer:
 
         body = " ".join(s.text for s in sections)
 
-        # -- baseline outside the proposals: the claim the whole-curve index supports
         baseline = ""
         episodic = getattr(result, "episodic", None)
         if episodic is not None:
@@ -425,7 +382,6 @@ class AnswerComposer:
                         "as cleanly separated from background motion."
                     )
 
-        # -- cross-proposal relations
         links = ""
         if episodic is not None and getattr(episodic, "cross_links", None):
             rendered = "; ".join(f"{l.source}->{l.target}: {l.relation}"
@@ -436,12 +392,9 @@ class AnswerComposer:
         if narrative:
             narrative = " " + scrub(narrative.strip())
 
-        # -- process disclosure: whether the answer was produced under full process
         degradations = state.budget.degradations
         disclosure = ""
         if degradations:
-            # Kept, because it changes how much weight the reading deserves -- but said
-            # as a statement about the analysis, not about which module fell over.
             disclosure = (
                 " Reliability: parts of this analysis could not be completed, so the "
                 "reading above is provisional and the confidence figures are upper "
@@ -471,7 +424,6 @@ class AnswerComposer:
 
     @staticmethod
     def _narration_lookup(state: Any) -> Dict[str, Tuple[str, str]]:
-        """Pull per-proposal static/dynamic prose out of the narration product."""
         out: Dict[str, Tuple[str, str]] = {}
         narrative = getattr(state, "narrative", None)
         if narrative is None:
@@ -505,7 +457,6 @@ def compose_answer(
     saturated_by_cid: Optional[Dict[str, bool]] = None,
     lang: str = "en",
 ) -> Dict[str, Any]:
-    """Convenience wrapper around :class:`AnswerComposer`."""
     return AnswerComposer(lang).compose(result, annotated_events, cfi_by_cid,
                                         measurements_by_cid, saturated_by_cid)
 

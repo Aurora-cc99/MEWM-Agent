@@ -1,27 +1,8 @@
-"""Layer-by-layer attribution for a low localisation score.
-
-1. **Is the event in the signal?** Frame-level AUC of ``S`` for micro-expression
-   frames against unannotated frames. 0.5 means ``S`` carries no information
-   about where micro-expressions are. Below 0.5 means it carries information
-   pointing the wrong way. Nothing downstream can recover from either.
-
-2. **Is it reachable by a threshold?** Where each event's peak ``S`` sits in its
-   own video's distribution. ``tau_hi`` on a robust-normalised curve sits near
-   the video's p99; an event whose peak is at p80 is invisible to it no matter
-   how the segmentation is written.
-
-3. **Is the extent right?** Duration ratio of the best-matching interval to the
-   truth, and where the interval's apex falls in normalised event time. An
-   interval half the length of the truth cannot exceed IoU 0.5 even when
-   perfectly centred, so this bounds the score independently of (1) and (2).
-
-4. **What does filtering buy?** The score after keeping only the intervals that
-   already reach the IoU threshold -- an oracle filter, unattainable in practice.
-   That is the ceiling on every reranking, NMS, top-k and confidence-calibration
-   idea combined. If it is low, the answer is not a better filter.
-"""
+"""Localisation diagnostics: per-fold error breakdown and false-alarm analysis."""
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -39,7 +20,6 @@ def _iou(a: Sequence[int], b: Sequence[int]) -> float:
 
 
 def rank_auc(pos: np.ndarray, neg: np.ndarray) -> float:
-    """Mann-Whitney rank AUC with ties at 0.5. NaN if either side is empty."""
     pos = np.asarray(pos, dtype=np.float64).reshape(-1)
     neg = np.asarray(neg, dtype=np.float64).reshape(-1)
     if pos.size == 0 or neg.size == 0:
@@ -65,7 +45,6 @@ def _prf(tp: int, fp: int, fn: int) -> Tuple[float, float, float]:
 def _match(intervals: Sequence[Tuple[int, int, float]],
            truth: Sequence[Tuple[int, int]],
            iou_threshold: float) -> Tuple[int, int, int]:
-    """Greedy one-to-one matching by descending score."""
     used: set = set()
     tp = 0
     for interval in sorted(intervals, key=lambda x: -x[2]):
@@ -82,23 +61,12 @@ def _match(intervals: Sequence[Tuple[int, int, float]],
     return tp, len(intervals) - tp, len(truth) - tp
 
 
-# ---------------------------------------------------------------------------
-# 1. is the event in the signal?
-# ---------------------------------------------------------------------------
-
-
 def signal_auc(
     s_curve: np.ndarray,
     micro_truth: Sequence[Tuple[int, int]],
     all_truth: Sequence[Tuple[int, int]] = (),
     frame_offset: int = 0,
 ) -> Dict[str, Any]:
-    """Can ``S`` rank a micro-expression frame above an unannotated frame?
-
-    ``all_truth`` (every annotated event, micro and macro) is excluded from the
-    negatives. Counting macro-expression frames as negatives would credit the
-    curve for firing on macro events, which is a different task.
-    """
     s = np.asarray(s_curve, dtype=np.float64).reshape(-1)
     if s.size == 0 or not micro_truth:
         return {"status": "unavailable",
@@ -133,18 +101,12 @@ def signal_auc(
     }
 
 
-# ---------------------------------------------------------------------------
-# 2. is it reachable by a threshold?
-# ---------------------------------------------------------------------------
-
-
 def threshold_reachability(
     s_curve: np.ndarray,
     micro_truth: Sequence[Tuple[int, int]],
     tau_hi: float,
     frame_offset: int = 0,
 ) -> Dict[str, Any]:
-    """Where each event's peak ``S`` sits in its own video's distribution."""
     s = np.asarray(s_curve, dtype=np.float64).reshape(-1)
     if s.size == 0 or not micro_truth:
         return {"status": "unavailable", "reason": "no curve or no ground truth"}
@@ -174,18 +136,11 @@ def threshold_reachability(
     }
 
 
-# ---------------------------------------------------------------------------
-# 3. is the extent right?
-# ---------------------------------------------------------------------------
-
-
 def extent_anatomy(
     intervals: Sequence[Tuple[int, int, int, float]],
     micro_truth: Sequence[Tuple[int, int]],
     iou_threshold: float = 0.5,
 ) -> Dict[str, Any]:
-    """Per-event best-match anatomy: found at all, how close, how long, where.
-    """
     if not micro_truth:
         return {"status": "unavailable", "reason": "no micro-expression ground truth"}
 
@@ -252,8 +207,6 @@ def error_taxonomy(
     macro_truth: Sequence[Tuple[int, int]] = (),
     iou_threshold: float = 0.5,
 ) -> Dict[str, Any]:
-    """Sort every FP and FN into a cause, so the counts stop being one number.
-    """
     matched: set = set()
     tp_ids: set = set()
     for idx in sorted(range(len(intervals)), key=lambda i: -intervals[i][3]):
@@ -305,23 +258,11 @@ def error_taxonomy(
     }
 
 
-# ---------------------------------------------------------------------------
-# 4. what does filtering buy?
-# ---------------------------------------------------------------------------
-
-
 def filter_ceiling(
     per_video: Sequence[Tuple[Sequence[Tuple[int, int, int, float]],
                              Sequence[Tuple[int, int]]]],
     iou_threshold: float = 0.5,
 ) -> Dict[str, Any]:
-    """Score as-is, versus with an oracle filter that keeps only true hits.
-
-    The oracle line is the ceiling on every precision-side idea -- NMS, top-k,
-    confidence calibration, a learned reranker -- taken together, because it is
-    what a *perfect* discriminator would achieve on this proposal set. Recall is
-    untouched by filtering, so if the ceiling is low the answer is upstream.
-    """
     def score(select) -> Dict[str, float]:
         tp = fp = fn = 0
         for intervals, truth in per_video:
@@ -346,11 +287,6 @@ def filter_ceiling(
     }
 
 
-# ---------------------------------------------------------------------------
-# the report
-# ---------------------------------------------------------------------------
-
-
 def localisation_report(
     videos: Sequence[Any],
     curves: Dict[str, np.ndarray],
@@ -360,7 +296,6 @@ def localisation_report(
     iou_threshold: float = 0.5,
     include_per_video: bool = True,
 ) -> Dict[str, Any]:
-    """The four questions, per video and pooled. Micro-expression events only."""
     offsets = offsets or {}
     per_video: Dict[str, Any] = {}
     pooled_pos: List[np.ndarray] = []
@@ -469,10 +404,6 @@ def localisation_report(
             "recall_at_threshold": round(hits / n_truth, 4) if n_truth else 0.0,
             "duration_ratio_median": (round(float(np.median(ratios)), 4)
                                       if ratios else None),
-            # Ordering matters here. An earlier version of this verdict compared
-            # only found vs hits and concluded "an extent problem, not a
-            # detection problem" -- while 45 of 52 events were never overlapped
-            # by anything. Judge the events that were never found FIRST.
             "verdict": (
                 ("%d of %d events are never overlapped by any interval: a "
                  "detection problem. Extent only explains the remaining %d."

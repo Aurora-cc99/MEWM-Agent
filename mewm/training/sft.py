@@ -1,15 +1,4 @@
-"""Stage 1 -- supervised fine-tuning of the R-Agent policy.
-
-**The epoch count is a ceiling.** ``sft_max_epochs`` is 100, but a fold's training pool is a
-few hundred samples; 100 unchecked passes over it memorises the pool. The loop therefore
-tracks the loss curve and stops when it has genuinely flattened (``patience`` epochs without
-a ``min_delta`` improvement), recording the epoch it selected. The configured 100 remains the
-ceiling, so the setting is honoured without spending the run on the overfitting regime.
-
-**The loss curve is a first-class output.** Sufficiency judgement 1b reads it, so it is
-retained per-epoch as well as per-step, and :meth:`SFTTrainer.curve` hands back exactly the
-series the diagnostic expects.
-"""
+"""Supervised fine-tuning stage: role-specific LoRA adapter training."""
 
 from __future__ import annotations
 
@@ -30,13 +19,6 @@ from ..config import MEWMConfig, TrainingConfig, load_config
 LOGGER = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Localisation supervision inside the SFT loss (修改方案 §3)
-# ---------------------------------------------------------------------------
-
-#: Onset/offset/apex numbers inside a part1-style proposal payload -- the tokens that
-#: carry the localisation answer. Matches both the keyed form (``"onset": 57``) and
-#: the bare triple form (``[57, 71, 62]`` inside a ``proposals`` list).
 _PROP_KEYED_RE = re.compile(r'"(?:onset|offset|apex)"\s*:\s*(\d+)')
 _PROP_TRIPLE_RE = re.compile(
     r'"(?:proposals|part1_proposals)"\s*:\s*\[(.*?)\]\s*[,}]', re.DOTALL)
@@ -44,30 +26,20 @@ _NUMBER_RE = re.compile(r"\d+")
 
 
 def proposal_number_spans(text: str) -> List[Tuple[int, int]]:
-    """Character spans of the localisation numbers in an assistant target.
-
-    These are the positions whose cross-entropy gets the extra ``lambda_prop`` weight,
-    so the interval tokens and the analysis tokens share one backward pass
-    (方案 §3 -- "定位网络与分析策略在一个优化步里共享梯度").
-    """
     spans: List[Tuple[int, int]] = []
     for match in _PROP_KEYED_RE.finditer(text):
         spans.append(match.span(1))
     for block in _PROP_TRIPLE_RE.finditer(text):
         body = block.group(1)
         if "{" in body:
-            # Keyed objects inside the list: the keyed regex above already picked the
-            # localisation numbers; taking every digit here would also weight ids.
             continue
         offset = block.start(1)
         for number in _NUMBER_RE.finditer(body):
             spans.append((offset + number.start(), offset + number.end()))
-    # De-duplicate (a keyed number inside a proposals block matches twice).
     return sorted(set(spans))
 
 
 def soft_iou(predicted: Tuple[float, float], truth: Tuple[float, float]) -> float:
-    """Plain interval IoU, exposed for the eval/reward side of ``L_prop``."""
     lo = max(min(predicted), min(truth))
     hi = min(max(predicted), max(truth))
     intersection = max(0.0, hi - lo + 1.0)
@@ -76,41 +48,24 @@ def soft_iou(predicted: Tuple[float, float], truth: Tuple[float, float]) -> floa
     return float(intersection / union) if union > 0 else 0.0
 
 
-# ---------------------------------------------------------------------------
-# Backends
-# ---------------------------------------------------------------------------
-
-
 class SFTBackend(ABC):
-    """Interface between the SFT schedule and whatever holds the parameters."""
 
     @abstractmethod
     def step(self, batch: Sequence[Dict[str, Any]], learning_rate: float) -> float:
-        """Apply one optimiser step over a batch of chat samples; return the loss."""
 
     def evaluate(self, batch: Sequence[Dict[str, Any]]) -> float:
-        """Loss without an update. Defaults to the training loss for backends that
-        cannot separate the two, which keeps a dry run honest about what it measured."""
         return float("nan")
 
     def save(self, path: Path | str) -> Optional[Path]:
         return None
 
     def snapshot(self) -> Optional[Any]:
-        """A restorable copy of the trainable weights, or ``None`` if unsupported.
-        """
         return None
 
     def restore(self, state: Any) -> None:
-        """Load a snapshot back into the model."""
 
 
 class DryRunSFT(SFTBackend):
-    """No-parameter backend driven by a caller-supplied loss function.
-
-    Used to validate the schedule and the stopping rule. The default loss is a decaying
-    curve with noise, which is the shape the stopping rule has to handle correctly.
-    """
 
     def __init__(self, loss_fn: Optional[Callable[[int, Sequence[Dict[str, Any]]], float]] = None,
                  seed: int = 20260824) -> None:
@@ -132,20 +87,13 @@ class DryRunSFT(SFTBackend):
 
 
 class LoRASFTBackend(SFTBackend):
-    """PyTorch/PEFT backend.
-
-    Thin by design: it adapts an already-constructed model and tokenizer rather than owning
-    their configuration, so this module stays independent of any particular serving stack.
-    Loss is computed on the assistant turn only -- supervising the prompt tokens would train
-    the policy to reproduce the question, which competes with the objective for capacity.
-    """
 
     def __init__(self, model: Any = None, tokenizer: Any = None,
                  device: str = "cuda", max_length: int = 4096,
                  weight_decay: float = 0.01, prop_weight: float = 0.0) -> None:
         try:
             import torch
-        except ImportError as exc:  # pragma: no cover
+        except ImportError as exc:
             raise ImportError("LoRASFTBackend needs PyTorch installed.") from exc
         if model is None or tokenizer is None:
             raise ValueError(
@@ -157,21 +105,9 @@ class LoRASFTBackend(SFTBackend):
         self.tokenizer = tokenizer
         self.device = device
         self.max_length = max_length
-        #: 方案 §3 -- lambda_prop. Extra CE weight on the onset/offset/apex number
-        #: tokens of the assistant target, so the localisation answer is supervised
-        #: harder than the surrounding prose in the *same* backward pass. 0 preserves
-        #: the historical plain-CE behaviour exactly.
         self.prop_weight = float(max(0.0, prop_weight))
         self._warned_no_offsets = False
-        #: Identities of the samples whose prompt alone exceeded ``max_length``. A *set*,
-        #: not a counter: ``_encode`` runs once per sample per batch per epoch, and again
-        #: for every monitor-loss pass, so a counter would report "17 dropped" for one
-        #: over-length sample seen across 17 encodings. The reported figure has to be the
-        #: number of distinct training samples lost.
         self._dropped: set = set()
-        #: How many times an over-length sample was re-encountered, drops included. Only
-        #: interesting next to :attr:`n_dropped` -- a large ratio means the same handful
-        #: of samples is being re-encoded, which is expected, not a second problem.
         self.n_drop_events = 0
         self.optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -179,29 +115,22 @@ class LoRASFTBackend(SFTBackend):
 
     @property
     def n_dropped(self) -> int:
-        """Distinct samples dropped for being unsupervisable at this ``max_length``."""
         return len(self._dropped)
 
     @staticmethod
     def _sample_key(sample: Dict[str, Any]) -> str:
-        """A stable identity for a sample, so re-encoding it is not a second drop."""
         for field_name in ("id", "sample_id", "pair_id"):
             value = sample.get(field_name)
             if value:
                 return f"{field_name}:{value}"
-        # No declared id: hash the content. Two byte-identical samples are the same
-        # sample for this purpose -- the point is to count losses, not occurrences.
         digest = hashlib.blake2b(
             json.dumps(sample.get("messages", []), ensure_ascii=False,
                        sort_keys=True).encode("utf-8"),
             digest_size=8).hexdigest()
         return f"digest:{digest}"
 
-    # -- masking ------------------------------------------------------------
 
     def _encode(self, sample: Dict[str, Any]) -> Optional[Tuple[Any, Any]]:
-        """Tokenise one chat sample, masking everything but the assistant turn.
-        """
         torch = self.torch
         messages = sample["messages"]
         prompt_messages = [m for m in messages if m["role"] != "assistant"]
@@ -209,7 +138,7 @@ class LoRASFTBackend(SFTBackend):
 
         if hasattr(self.tokenizer, "apply_chat_template"):
             prompt_text = self._render_prompt(prompt_messages, target)
-        else:  # pragma: no cover - tokenizers without a template
+        else:
             prompt_text = "\n".join(m["content"] for m in prompt_messages) + "\n"
 
         prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
@@ -241,16 +170,6 @@ class LoRASFTBackend(SFTBackend):
 
     def _render_prompt(self, prompt_messages: List[Dict[str, Any]],
                        target: str) -> str:
-        """Render the prompt with the template's thinking mode set from the target.
-
-        * target with a chain of thought + ``enable_thinking=False`` -- the template
-          pre-closes the block, so the target's own ``<think>`` is supervised as
-          ordinary text inside the answer, and the model learns to emit a literal
-          ``<think>`` tag after the block has already closed;
-        * target without one + ``enable_thinking=True`` -- the model is supervised to
-          jump straight to the answer where a chain of thought was expected, which is
-          exactly how a thinking policy gets trained out of thinking.
-        """
         from ..llm.local_models import THINK_OPEN
         wants_thinking = THINK_OPEN in (target or "")
         try:
@@ -262,12 +181,6 @@ class LoRASFTBackend(SFTBackend):
                 prompt_messages, tokenize=False, add_generation_prompt=True)
 
     def _target_weights(self, target: str, n_target_tokens: int) -> List[float]:
-        """Per-token CE weights over the assistant turn (方案 §3, lambda_prop).
-
-        1.0 everywhere; ``1 + prop_weight`` on tokens overlapping an onset/offset/apex
-        number span. Needs a fast tokenizer for offset mapping; without one the term
-        degrades to plain CE with a single warning rather than a crash.
-        """
         weights = [1.0] * n_target_tokens
         if self.prop_weight <= 0.0:
             return weights
@@ -278,7 +191,7 @@ class LoRASFTBackend(SFTBackend):
             encoding = self.tokenizer(target, add_special_tokens=False,
                                       return_offsets_mapping=True)
             offsets = encoding["offset_mapping"]
-        except Exception:  # noqa: BLE001 - slow tokenizers have no offsets
+        except Exception:
             if not self._warned_no_offsets:
                 LOGGER.warning(
                     "tokenizer exposes no offset mapping; the lambda_prop interval-"
@@ -316,7 +229,6 @@ class LoRASFTBackend(SFTBackend):
         }
 
     def _loss(self, encoded: Dict[str, Any]) -> Any:
-        """Assistant-turn CE; token-weighted when ``prop_weight`` is active (方案 §3)."""
         torch = self.torch
         weights = encoded.pop("loss_weights")
         outputs = self.model(**encoded)
@@ -334,7 +246,6 @@ class LoRASFTBackend(SFTBackend):
         denom = (shifted_weights * mask).sum().clamp_min(1.0)
         return weighted.sum() / denom
 
-    # -- steps --------------------------------------------------------------
 
     def step(self, batch: Sequence[Dict[str, Any]], learning_rate: float) -> float:
         torch = self.torch
@@ -371,12 +282,6 @@ class LoRASFTBackend(SFTBackend):
         return target
 
     def snapshot(self) -> Optional[Any]:
-        """Detached CPU copy of the trainable parameters only.
-
-        Trainable-only keeps this cheap: under LoRA that is the adapter, tens of MB, not
-        the frozen base. CPU keeps the best snapshot from competing with the live model
-        for device memory across the patience window.
-        """
         return {
             name: param.detach().to("cpu").clone()
             for name, param in self.model.named_parameters() if param.requires_grad
@@ -392,14 +297,8 @@ class LoRASFTBackend(SFTBackend):
                     param.copy_(state[name].to(param.device))
 
 
-# ---------------------------------------------------------------------------
-# Trainer
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class SFTOutcome:
-    """What one SFT run produced."""
 
     epochs_run: int = 0
     max_epochs: int = 0
@@ -413,11 +312,7 @@ class SFTOutcome:
     step_losses: List[float] = field(default_factory=list)
     eval_losses: List[float] = field(default_factory=list)
     evaluated_on: str = "training_pool"
-    #: True when the saved weights were rolled back to ``selected_epoch``. False means
-    #: the artefact is the last epoch -- read ``stop_reason`` for why.
     restored_selected_epoch: bool = False
-    #: *Distinct* samples the backend refused to encode (prompt alone longer than
-    #: ``max_length``), not encode attempts -- see ``LoRASFTBackend.n_dropped``.
     n_dropped: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -437,7 +332,6 @@ class SFTOutcome:
 
 
 class SFTTrainer:
-    """Cross-entropy fine-tuning with a plateau-aware stopping rule."""
 
     def __init__(
         self,
@@ -452,10 +346,8 @@ class SFTTrainer:
         self.rng = np.random.default_rng(seed)
         self.outcome = SFTOutcome(max_epochs=self.config.sft_max_epochs)
 
-    # -- schedule -----------------------------------------------------------
 
     def _learning_rate(self, step: int, warmup: int, total: int) -> float:
-        """Linear warm-up then cosine decay, matching the stage-0 schedule."""
         base = self.config.sft_learning_rate
         if step <= warmup:
             return base * step / max(1, warmup)
@@ -468,7 +360,6 @@ class SFTTrainer:
         for start in range(0, len(order), size):
             yield [samples[int(i)] for i in order[start:start + size]]
 
-    # -- loop ---------------------------------------------------------------
 
     def fit(
         self,
@@ -477,8 +368,6 @@ class SFTTrainer:
         output_dir: Optional[Path | str] = None,
         in_sample_eval: bool = True,
     ) -> SFTOutcome:
-        """Run the schedule.
-        """
         samples = list(samples)
         self.outcome = SFTOutcome(max_epochs=self.config.sft_max_epochs,
                                   n_samples=len(samples))
@@ -513,25 +402,19 @@ class SFTTrainer:
             self.outcome.epochs_run = epoch
             self.outcome.final_loss = epoch_loss
 
-            # Monitored loss over the *whole* monitor set, batched. Evaluating only the
-            # first ``sft_batch_size`` samples -- the same four, every epoch, never
-            # reshuffled -- made the stopping rule a function of whichever handful landed
-            # at the front of the list: four easy samples stop the run early, four hard
-            # ones never plateau. The sets here are small enough that a full pass costs
-            # nothing worth saving.
             monitored = self._monitor_loss(monitor)
             if not math.isfinite(monitored):
                 monitored = epoch_loss
             self.outcome.eval_losses.append(float(monitored))
 
-            if monitored < best - self.config.sft_min_delta:
+            threshold = self.config.sft_min_delta
+            if math.isfinite(best):
+                threshold = max(threshold, best * self.config.sft_min_delta_relative)
+            if monitored < best - threshold:
                 best = float(monitored)
                 self.outcome.best_loss = best
                 self.outcome.selected_epoch = epoch
                 patience_left = self.config.sft_patience
-                # Snapshot *now*, at the epoch being selected. By the time the loop
-                # knows this was the best epoch it is ``sft_patience`` epochs further on
-                # and the weights have moved.
                 best_state = self.backend.snapshot()
             else:
                 patience_left -= 1
@@ -543,7 +426,8 @@ class SFTTrainer:
             if self.config.sft_early_stop and patience_left <= 0:
                 self.outcome.stopped_early = True
                 self.outcome.stop_reason = (
-                    f"no improvement greater than {self.config.sft_min_delta} for "
+                    f"no improvement greater than max({self.config.sft_min_delta}, "
+                    f"{self.config.sft_min_delta_relative:.0%} of best) for "
                     f"{self.config.sft_patience} epochs; selected epoch "
                     f"{self.outcome.selected_epoch}"
                 )
@@ -558,9 +442,6 @@ class SFTTrainer:
             self.outcome.best_loss = self.outcome.final_loss
             self.outcome.selected_epoch = self.outcome.epochs_run
 
-        # Roll back to the selected epoch before anything is written. Otherwise the
-        # artefact on disk is the last epoch -- ``sft_patience`` epochs past the one the
-        # outcome file names -- and stage 3 starts from weights nobody chose.
         self.outcome.restored_selected_epoch = False
         if best_state is not None and self.outcome.selected_epoch < self.outcome.epochs_run:
             self.backend.restore(best_state)
@@ -584,7 +465,6 @@ class SFTTrainer:
         return self.outcome
 
     def _monitor_loss(self, monitor: Sequence[Dict[str, Any]]) -> float:
-        """Mean backend loss over the whole monitor set, batch by batch."""
         size = max(1, self.config.sft_batch_size)
         losses = []
         for start in range(0, len(monitor), size):
@@ -594,7 +474,6 @@ class SFTTrainer:
         return float(np.mean(losses)) if losses else float("nan")
 
     def curve(self, per_step: bool = False) -> List[float]:
-        """The loss series the plateau diagnostic reads."""
         return list(self.outcome.step_losses if per_step else self.outcome.epoch_losses)
 
     def save(self, output_dir: Path | str) -> Path:
@@ -607,23 +486,12 @@ class SFTTrainer:
         return target
 
 
-# ---------------------------------------------------------------------------
-# Sample assembly
-# ---------------------------------------------------------------------------
-
-
 def build_sft_samples(
     instruction_samples: Sequence[Any],
     roles: Sequence[str] = ("P", "A", "R", "C"),
     include_end_to_end: bool = True,
     augmented: Sequence[Dict[str, Any]] = (),
 ) -> List[Dict[str, Any]]:
-    """Render instruction samples to chat form, plus any augmented QA pairs.
-
-    Augmented pairs enter as end-to-end question/answer chats -- the same shape as a
-    reference triple-task item -- so a fold that has run stage 2 trains on a strictly
-    larger set with no change to the loop.
-    """
     from .instruction_set import to_chat_format
 
     chats: List[Dict[str, Any]] = []

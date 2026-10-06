@@ -1,28 +1,4 @@
-"""The QA-augmentation sweep: one dataset, every subject, per-fold output.
-
-1. **Perceive once per video.** Stages I-II (representation and prediction-error
-   spotting) are deterministic and involve no LLM call, so they run once for the whole
-   corpus and the resulting :class:`~mewm.training.rl_prompts.VideoEvidence` is shared by
-   every prompt on that video and by every fold that video belongs to.
-
-2. **Filter, then sample once per admitted instruction.** The reference QA set is split
-   into the fixed-answer instructions (excluded, with the reason recorded) and the
-   free-form reasoning instructions (admitted). Each admitted instruction is sampled ``k``
-   times and every draw is scored.
-
-3. **Project into folds.** A candidate drawn on subject *S*'s video is valid supervision
-   for every LOSO fold except fold *S*. The write path re-checks that with the fold's own
-   pool, so an off-pool pair raises rather than being written.
-
-**Why sampling once is legitimate here, and where it is not.** In the real protocol,
-stage 2 samples from the fold's *own* SFT-trained policy, so the samples differ per fold
-and must be drawn per fold. This sweep samples from a frozen hosted model that has no
-fold-specific state at all, which makes the draws fold-independent by construction --
-sampling them 22 times would produce 22 statistically identical sets at 22 times the cost.
-That is a property of running the augmentation with an external policy, not a shortcut
-that survives into the trained-policy setting, and it is written into every manifest so a
-reader cannot mistake this output for the trained-policy stage 2.
-"""
+"""Hyperparameter sweep driver for QA training stages."""
 
 from __future__ import annotations
 
@@ -50,11 +26,6 @@ from .rl_prompts import (
 LOGGER = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Stage 1: perception
-# ---------------------------------------------------------------------------
-
-
 def perceive(
     videos: Sequence[LongVideo],
     config: Optional[MEWMConfig] = None,
@@ -62,13 +33,6 @@ def perceive(
     stride: int = 1,
     progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> Tuple[Dict[str, VideoEvidence], Dict[str, Any]]:
-    """Run stages I-II over every video and keep the evidence.
-
-    A video whose frames cannot be read yields an *unavailable* evidence block rather
-    than being dropped: its prompts still go out, labelled as having no perceptual
-    channel, so the loss of coverage is visible in the output instead of showing up as a
-    smaller corpus with no explanation.
-    """
     from ..pipeline import run_representation, run_spotting
 
     config = config or load_config()
@@ -87,7 +51,7 @@ def perceive(
             spotting = run_spotting(video, representation, config)
             evidence[video.video_key] = evidence_from_spotting(
                 video, representation, spotting)
-        except Exception as exc:  # noqa: BLE001 - recorded per video, not fatal
+        except Exception as exc:
             LOGGER.warning("%s: perception unavailable (%s)", video.video_key, exc)
             failures[video.video_key] = f"{type(exc).__name__}: {exc}"
             evidence[video.video_key] = unavailable_evidence(
@@ -105,14 +69,8 @@ def perceive(
     return evidence, summary
 
 
-# ---------------------------------------------------------------------------
-# Stage 2: sample and score
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class SweepResult:
-    """Everything one dataset sweep produced."""
 
     dataset: str
     policy_model: str
@@ -127,13 +85,7 @@ class SweepResult:
     consolidated: Dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Stage 2: sample and score
-# ---------------------------------------------------------------------------
-
-
 def _candidate_row(candidate: Candidate) -> Dict[str, Any]:
-    """A candidate serialised well enough to rebuild it after a process died."""
     row = candidate.to_dict()
     row["text"] = candidate.text
     row["product"] = candidate.product
@@ -156,7 +108,6 @@ def _candidate_from_row(row: Dict[str, Any]) -> Candidate:
 
 
 def _read_checkpoint(path: Path) -> Dict[str, List[Candidate]]:
-    """Prompt id -> its already-drawn candidates, tolerating a torn last line."""
     restored: Dict[str, List[Candidate]] = {}
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(),
                                        start=1):
@@ -194,8 +145,6 @@ def sample_pool(
     checkpoint_path: Optional[Path] = None,
     resume: bool = False,
 ) -> Tuple[List[Candidate], int]:
-    """``k`` scored draws for every admitted prompt.
-    """
     restored: Dict[str, List[Candidate]] = {}
     if checkpoint_path is not None:
         if resume and checkpoint_path.is_file():
@@ -245,11 +194,6 @@ def sample_pool(
     return [c for group in results if group for c in group], n_restored
 
 
-# ---------------------------------------------------------------------------
-# Stage 3: project into folds and write
-# ---------------------------------------------------------------------------
-
-
 def _subject_of(prompt_index: Dict[str, Dict[str, Any]], candidate: Candidate) -> str:
     entry = prompt_index.get(candidate.prompt_id, {})
     return str(entry.get("subject", ""))
@@ -261,7 +205,6 @@ def write_folds(
     config: MEWMConfig,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Select per fold and write each fold's augmented QA file and manifest."""
     prompt_index = {str(p["id"]): p for p in result.prompts}
     question_by_prompt = {str(p["id"]): str(p["question"]) for p in result.prompts}
     subject_by_video = {v.video_key: v.subject for v in index.videos}
@@ -300,12 +243,6 @@ def _write_fold_supplement(
     accepted: Sequence[Candidate],
     prompt_index: Dict[str, Dict[str, Any]],
 ) -> Path:
-    """The per-subject filtering-and-augmentation record, beside the fold's jsonl.
-
-    ``qa_augment.write_augmented`` writes the pairs and their provenance. This adds what
-    it cannot know: which reference instructions were considered and rejected, which
-    subjects the surviving supervision came from, and under what scoring caveat.
-    """
     target = qa_augment.augmented_dir(result.dataset, spec.name)
     target.mkdir(parents=True, exist_ok=True)
 
@@ -388,11 +325,6 @@ def _write_fold_supplement(
     return path
 
 
-# ---------------------------------------------------------------------------
-# The corpus-level consolidated file
-# ---------------------------------------------------------------------------
-
-
 def write_consolidated(
     result: SweepResult,
     index: DatasetIndex,
@@ -400,8 +332,6 @@ def write_consolidated(
     qa_rows: Sequence[Dict[str, Any]],
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """One dataset-level JSON: every accepted pair once, beside its source QA pair.
-    """
     rows = list(qa_rows)
     row_by_id = {str(r.get("video_id", "")): r for r in rows if r.get("video_id")}
     question_by_prompt = {str(p["id"]): str(p["question"]) for p in result.prompts}
@@ -409,7 +339,6 @@ def write_consolidated(
 
     accepted, report = select(result.candidates, config.training)
 
-    # Fold membership, keyed on exactly the tuple build_pairs carries into the pair.
     membership: Dict[Tuple[str, str, int, Tuple[int, int]], Set[str]] = {}
     for spec in build_folds(index, config.training):
         pool = spec.pool_videos()
@@ -512,11 +441,6 @@ def write_consolidated(
             "n_source_instructions": report.n_prompts_with_accept}
 
 
-# ---------------------------------------------------------------------------
-# The sweep
-# ---------------------------------------------------------------------------
-
-
 def run_sweep(
     dataset: str,
     index: DatasetIndex,
@@ -532,8 +456,6 @@ def run_sweep(
     resume: bool = False,
     progress: Optional[Callable[[str, str, int, int], None]] = None,
 ) -> SweepResult:
-    """Perceive, filter, sample, select and write, for one dataset.
-    """
     config = config or load_config()
     videos = list(index.videos)
 
@@ -544,8 +466,6 @@ def run_sweep(
     rows = list(qa_rows)
     prompts, ledger = build_rl_prompts(dataset, videos, rows, evidence)
 
-    # Attach the whole-video truth the video-level criterion needs. It is not part of the
-    # prompt the policy sees -- it travels beside it, for the scorer.
     by_key = {v.video_key: v for v in videos}
     for prompt in prompts:
         if prompt["kind"] == KIND_VIDEO_REASONING:
@@ -591,7 +511,6 @@ def run_sweep(
 
 
 def _augmentation_by_subject(result: SweepResult) -> Dict[str, Any]:
-    """Per-subject augmentation outcome, aggregated across folds."""
     prompt_index = {str(p["id"]): p for p in result.prompts}
     out: Dict[str, Any] = {}
 
@@ -619,7 +538,6 @@ def _augmentation_by_subject(result: SweepResult) -> Dict[str, Any]:
         bucket["n_videos"] = len(bucket["videos"])
         bucket["mean_reward"] = round(bucket.pop("reward_sum") / drawn, 4) if drawn else 0.0
         bucket["pass_rate"] = round(bucket["n_passed_criterion"] / drawn, 4) if drawn else 0.0
-        # Truncate to the reasons that actually mattered; the full ledger is per fold.
         bucket["rejected_reasons"] = dict(sorted(
             bucket["rejected_reasons"].items(), key=lambda kv: -kv[1])[:6])
         bucket["appears_in_folds"] = sorted(
@@ -629,7 +547,6 @@ def _augmentation_by_subject(result: SweepResult) -> Dict[str, Any]:
 
 
 def sweep_summary(result: SweepResult) -> Dict[str, Any]:
-    """The top-level record written beside the per-fold directories."""
     accepted_total = sum(f["filter"]["n_accepted"] for f in result.folds.values())
     return {
         "dataset": result.dataset,

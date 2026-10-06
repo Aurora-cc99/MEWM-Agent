@@ -1,15 +1,4 @@
-"""按受试者的问答落盘 + 最终指标汇总（formwork.md 第 IV/V 条尾句，
-``MEWM-Agent_完整执行方案.md`` 第 9 节）。
-
-1. :func:`write_qa_records` —— 把 :class:`mewm.qa.interrogate.QARecord`（或等价的
-   ``dict``）逐条写入 ``runs/<run_id>/<dataset>/<subject>/<video_id>/qa_records.jsonl``，
-   asked 和 gated-skipped 的问题都在同一个文件里，互不覆盖（见 formwork.md IV）。
-2. :func:`aggregate_final_metrics` + :func:`write_summary` —— 把若干视频的定位/识别/文本
-   原始预测，按"每数据集""每受试者""全体"三个粒度分别喂给
-   ``mewm.eval.megc_metrics.megc_report``（不重新实现任何一条指标公式），产出
-   ``runs/<run_id>/final_metrics_summary.json`` 与同名 ``.md``。
-"""
-
+"""Per-subject diagnostic report generation for LOSO evaluation."""
 from __future__ import annotations
 
 import json
@@ -17,15 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ..config import RUNS_ROOT
+from ..config import RUNS_ROOT, load_config
 from .megc_metrics import (
     au_scores, count_scores, megc_report, recognition_scores, spotting_scores,
     text_scores,
 )
-
-# ---------------------------------------------------------------------------
-# 1. 每受试者·每视频·每问题记录
-# ---------------------------------------------------------------------------
 
 
 def qa_records_path(run_id: str, dataset: str, subject: str, video_id: str,
@@ -44,8 +29,6 @@ def write_qa_records(
     run_root: Optional[Path] = None,
     extra_fields: Optional[Dict[str, Any]] = None,
 ) -> Path:
-    """Append one ``qa_records.jsonl`` for a video.
-    """
     path = qa_records_path(run_id, dataset, subject, video_id, run_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines: List[str] = []
@@ -73,7 +56,6 @@ def read_qa_records(path: Path | str) -> List[Dict[str, Any]]:
 
 def iter_qa_record_files(run_id: str, run_root: Optional[Path] = None
                          ) -> List[Tuple[str, str, str, Path]]:
-    """Every ``(dataset, subject, video_id, path)`` under one run's tree."""
     base = (Path(run_root) if run_root else RUNS_ROOT) / run_id
     out: List[Tuple[str, str, str, Path]] = []
     if not base.is_dir():
@@ -85,30 +67,19 @@ def iter_qa_record_files(run_id: str, run_root: Optional[Path] = None
     return out
 
 
-# ---------------------------------------------------------------------------
-# 2. 最终指标汇总
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class EventMetricInputs:
-    """One TP/candidate event's recognition material (第 8 节 F1AU/JaccardAU/RegUF1/...)."""
-
     au_predicted: List[str] = field(default_factory=list)
     au_true: List[str] = field(default_factory=list)
     fine_true: str = ""
     fine_pred: str = ""
     text_candidate: str = ""
     text_reference: str = ""
-    #: Whether this event's proposal was a spotting true positive -- gates which events
-    #: count toward ``f1_analysis_on_tp`` for STRS (MEGC2025 sec. 2.5).
     is_spotting_tp: bool = False
 
 
 @dataclass
 class VideoMetricInputs:
-    """One video's spotting + counting + per-event recognition material."""
-
     dataset: str
     subject: str
     video_id: str
@@ -118,9 +89,10 @@ class VideoMetricInputs:
     truth: List[Tuple[int, int]] = field(default_factory=list)
     truth_types: List[str] = field(default_factory=list)
     truth_labels: List[str] = field(default_factory=list)
-    #: quantity ("expression"/"micro"/"macro") -> (predicted_count, true_count)
     counts: Dict[str, Tuple[Optional[int], Optional[int]]] = field(default_factory=dict)
     events: List[EventMetricInputs] = field(default_factory=list)
+    whole_text_candidate: str = ""
+    whole_text_reference: str = ""
 
 
 def _spotting_row(v: VideoMetricInputs) -> Dict[str, Any]:
@@ -133,10 +105,6 @@ def _spotting_row(v: VideoMetricInputs) -> Dict[str, Any]:
 
 def _group_report(videos: Sequence[VideoMetricInputs], iou_threshold: float = 0.5
                   ) -> Dict[str, Any]:
-    """One :func:`megc_metrics.megc_report` computed over ``videos`` (a dataset,
-    a subject, or the whole run) -- the exact same function every other grouping
-    calls, so per-dataset/per-subject/overall numbers are guaranteed comparable.
-    """
     spotting = spotting_scores([_spotting_row(v) for v in videos], iou_threshold)
 
     pairs_by_quantity: Dict[str, List[Tuple[int, int]]] = {}
@@ -157,9 +125,10 @@ def _group_report(videos: Sequence[VideoMetricInputs], iou_threshold: float = 0.
     recognition_text = text_scores([e.text_candidate for e in all_events],
                                    [e.text_reference for e in all_events])
 
-    # STRS's F1_a: MEGC fine-grained UF1 restricted to spotting-TP events (sec. 2.5),
-    # with the ground-truth-interval version carried alongside for the visible gap
-    # (megc_metrics.megc_report's own contract -- see its docstring point 3).
+    strs_text = text_scores(
+        [v.whole_text_candidate for v in videos],
+        [v.whole_text_reference for v in videos])
+
     def _f1a(events: Sequence[EventMetricInputs]) -> Optional[float]:
         if not events:
             return None
@@ -171,13 +140,81 @@ def _group_report(videos: Sequence[VideoMetricInputs], iou_threshold: float = 0.
     report = megc_report(
         spotting=spotting, counting=counting, recognition_au=recognition_au,
         recognition_emotion=recognition_emotion, recognition_text=recognition_text,
-        strs_text=recognition_text,
+        strs_text=strs_text,
         f1_analysis_on_tp=_f1a(tp_events), f1_analysis_on_truth=_f1a(all_events),
     )
     report["n_videos"] = len(videos)
     report["n_subjects"] = len({v.subject for v in videos})
     report["n_events"] = len(all_events)
     return report
+
+
+def collect_metric_inputs(
+    runs: Sequence[Any],
+    videos: Sequence[Any],
+    qa_by_id: Optional[Dict[str, Sequence[Any]]] = None,
+    config: Optional[Any] = None,
+) -> List[VideoMetricInputs]:
+    from .report import _canonical_or_empty, _paired_events, _qa_segment_reference
+
+    config = config or load_config()
+    by_id = {v.video_id: v for v in videos}
+    inputs: List[VideoMetricInputs] = []
+    for run in runs:
+        video = by_id.get(run.video_id)
+        if video is None:
+            continue
+        micro_events = list(video.micro_events())
+        all_events = list(video.events)
+        analyses = run.analyses()
+        labels = [_canonical_or_empty(a.get("fine_label", "")) for a in analyses]
+        item = VideoMetricInputs(
+            dataset=str(getattr(video, "dataset", "casme_sq")),
+            subject=str(getattr(video, "subject", "")),
+            video_id=run.video_id,
+            proposals=run.proposals(),
+            proposal_types=["micro-expression"] * len(run.proposals()),
+            proposal_labels=labels,
+            truth=[e.interval for e in micro_events],
+            truth_types=["micro-expression"] * len(micro_events),
+            truth_labels=[str(e.fine_label or "") for e in micro_events],
+            counts={
+                "micro": (len(run.proposals()), len(micro_events)),
+                "expression": (
+                    int(run.answer.get("n_detected", len(run.proposals()))),
+                    int(run.answer.get("n_annotated", len(all_events)))),
+                "macro": (
+                    int((run.summary.get("spotting") or {}).get("n_macro", 0)),
+                    len(all_events) - len(micro_events)),
+            },
+        )
+
+        qa_items: List[Any] = []
+        if qa_by_id is not None:
+            qa_items = list(qa_by_id.get(run.video_id) or [])
+            whole = next((it for it in qa_items if it.qtype == "reason_full"), None)
+            if whole is not None:
+                item.whole_text_candidate = str(run.answer.get("answer", ""))
+                item.whole_text_reference = whole.answer_text
+
+        for analysis, event, match in _paired_events(run, micro_events, config):
+            reference = ""
+            if qa_items:
+                interval = analysis.get("interval")
+                if isinstance(interval, (list, tuple)) and len(interval) >= 2:
+                    reference = _qa_segment_reference(
+                        (int(interval[0]), int(interval[1])), qa_items) or ""
+            item.events.append(EventMetricInputs(
+                au_predicted=[str(a) for a in (analysis.get("active_aus") or [])],
+                au_true=[str(a) for a in (event.aus or [])],
+                fine_true=_canonical_or_empty(event.fine_label),
+                fine_pred=_canonical_or_empty(analysis.get("fine_label", "")),
+                text_candidate=str(analysis.get("au_cot") or ""),
+                text_reference=reference,
+                is_spotting_tp=bool(getattr(match, "is_tp_strict", False)),
+            ))
+        inputs.append(item)
+    return inputs
 
 
 def aggregate_final_metrics(
@@ -188,12 +225,6 @@ def aggregate_final_metrics(
     mode: str,
     iou_threshold: float = 0.5,
 ) -> Dict[str, Any]:
-    """``per_dataset`` / ``per_subject`` / ``overall`` MEGC reports over every video.
-
-    ``protocol`` is ``"loso"`` or ``"lodo"``; ``mode`` is ``"api"`` or ``"open_weight"``
-    (第 6 节) -- both are carried through verbatim into the summary so a report can
-    never be read out of context.
-    """
     by_dataset: Dict[str, List[VideoMetricInputs]] = {}
     by_subject: Dict[str, List[VideoMetricInputs]] = {}
     for v in videos:
@@ -211,11 +242,7 @@ def aggregate_final_metrics(
             "status": "unavailable", "reason": "no videos supplied to aggregate_final_metrics",
         },
         "notes": [
-            "MAE/RMSE 为逐视频事件计数误差（MEGC2026 附录 C 口径），不是 onset/offset 边界误差",
-            "STRS 的识别侧 F1 只统计定位 TP 区间内的事件（MEGC2025 2.5 节），"
-            "ground-truth 区间上的同一数值一并给出用于对比",
-            "宏平均类指标 (RegUF1/RegUAR/SpotUF1/SpotUAR) 的 macro_divisor 字段标注了参与"
-            "平均的类别数，空提案的分组会显式报告 status=unavailable 而不是 0",
+            "......",
         ],
     }
     return summary
@@ -223,7 +250,6 @@ def aggregate_final_metrics(
 
 def write_summary(summary: Dict[str, Any], *, run_id: str,
                   run_root: Optional[Path] = None) -> Tuple[Path, Path]:
-    """``final_metrics_summary.json`` + a human-readable ``.md`` beside it."""
     base = (Path(run_root) if run_root else RUNS_ROOT) / run_id
     base.mkdir(parents=True, exist_ok=True)
     json_path = base / "final_metrics_summary.json"
@@ -242,40 +268,80 @@ def _fmt(value: Any) -> str:
 
 def _format_markdown(summary: Dict[str, Any]) -> str:
     lines = [
-        f"# MEWM-Agent 最终指标汇总 -- run `{summary.get('run_id')}`",
+        f"......",
         "",
         f"- protocol: `{summary.get('protocol')}`　mode: `{summary.get('mode')}`　"
         f"iou_threshold: `{summary.get('iou_threshold')}`",
         "",
     ]
 
-    def section(title: str, groups: Dict[str, Any]) -> None:
+    def localisation_section(title: str, groups: Dict[str, Any]) -> None:
         lines.append(f"## {title}")
         lines.append("")
-        lines.append("| 分组 | SpotUF1 | SpotUAR | F1AU | JaccardAU | RegUF1(megc) | "
-                     "RegUAR(megc) | BLEU | ROUGE-1 | STRS | n_videos | n_events |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        lines.append("......")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
         for name, report in groups.items():
-            spot = report.get("spotting", {}).get("interval", {}).get("unweighted_type", {})
-            au = report.get("recognition", {}).get("action_units", {})
-            emo = report.get("recognition", {}).get("emotion", {}).get("fine", {}).get("megc", {})
-            text = report.get("recognition", {}).get("text", {})
-            strs_block = report.get("strs", {}).get("score", {})
+            interval = report.get("spotting", {}).get("interval", {})
+            strict = interval.get("strict_iou", {})
+            unweighted = interval.get("unweighted_type", {})
+            counting = report.get("spotting", {}).get("counting", {})
+            mae = "/".join(_fmt(counting[q].get("mae")) if isinstance(counting.get(q), dict)
+                           else "n/a" for q in ("expression", "micro", "macro"))
+            rmse = "/".join(_fmt(counting[q].get("rmse")) if isinstance(counting.get(q), dict)
+                            else "n/a" for q in ("expression", "micro", "macro"))
             lines.append(
-                f"| {name} | {_fmt(spot.get('spot_uf1'))} | {_fmt(spot.get('spot_uar'))} | "
-                f"{_fmt(au.get('f1_au'))} | {_fmt(au.get('jaccard_au'))} | "
-                f"{_fmt(emo.get('reg_uf1'))} | {_fmt(emo.get('reg_uar'))} | "
-                f"{_fmt(text.get('bleu'))} | {_fmt(text.get('rouge_1'))} | "
-                f"{_fmt(strs_block.get('strs'))} | {report.get('n_videos')} | "
-                f"{report.get('n_events')} |")
+                f"| {name} | {_fmt(strict.get('f1'))} | {_fmt(strict.get('precision'))} | "
+                f"{_fmt(strict.get('recall'))} | {_fmt(strict.get('tp'))} | "
+                f"{_fmt(unweighted.get('spot_uf1'))} | {_fmt(unweighted.get('spot_uar'))} | "
+                f"{mae} | {rmse} | {report.get('n_videos')} |")
         lines.append("")
 
-    section("按数据集 (per_dataset)", summary.get("per_dataset", {}))
-    section("按受试者 (per_subject)", summary.get("per_subject", {}))
+    def recognition_section(title: str, groups: Dict[str, Any]) -> None:
+        lines.append(f"## {title}")
+        lines.append("")
+        lines.append("......")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for name, report in groups.items():
+            au = report.get("recognition", {}).get("action_units", {})
+            emo = report.get("recognition", {}).get("emotion", {})
+            fine = emo.get("fine", {}).get("megc", {})
+            coarse = emo.get("coarse", {}).get("megc", {})
+            text = report.get("recognition", {}).get("text", {})
+            reg_uf1 = f"{_fmt(fine.get('reg_uf1'))}/{_fmt(coarse.get('reg_uf1'))}"
+            reg_uar = f"{_fmt(fine.get('reg_uar'))}/{_fmt(coarse.get('reg_uar'))}"
+            lines.append(
+                f"| {name} | {_fmt(au.get('f1_au'))} | {_fmt(au.get('jaccard_au'))} | "
+                f"{reg_uf1} | {reg_uar} | {_fmt(text.get('bleu'))} | "
+                f"{_fmt(text.get('rouge_1'))} | {report.get('n_events')} |")
+        lines.append("")
+
+    def strs_section(title: str, groups: Dict[str, Any]) -> None:
+        lines.append(f"## {title}")
+        lines.append("")
+        lines.append("......")
+        lines.append("|---|---|---|---|---|---|---|")
+        for name, report in groups.items():
+            strs_block = report.get("strs", {}).get("score", {})
+            whole_text = report.get("strs", {}).get("text", {})
+            lines.append(
+                f"| {name} | {_fmt(strs_block.get('strs'))} | "
+                f"{_fmt(strs_block.get('f1_spot'))} | {_fmt(strs_block.get('f1_analysis'))} | "
+                f"{_fmt(whole_text.get('bleu'))} | {_fmt(whole_text.get('rouge_1'))} | "
+                f"{report.get('n_videos')} |")
+        lines.append("")
+
+    localisation_section("...", summary.get("per_dataset", {}))
+    recognition_section("...", summary.get("per_dataset", {}))
+    strs_section("...", summary.get("per_dataset", {}))
+    localisation_section("...", summary.get("per_subject", {}))
+    recognition_section("...", summary.get("per_subject", {}))
+    strs_section("...", summary.get("per_subject", {}))
     overall = summary.get("overall", {})
     if overall.get("status") != "unavailable":
-        section("全体 (overall)", {"overall": overall})
-    lines.append("## 备注")
+        localisation_section("...", {"overall": overall})
+        recognition_section("...", {"overall": overall})
+        strs_section("...", {"overall": overall})
+    lines.append("...")
     for note in summary.get("notes", []):
         lines.append(f"- {note}")
     return "\n".join(lines) + "\n"
@@ -283,5 +349,6 @@ def _format_markdown(summary: Dict[str, Any]) -> str:
 
 __all__ = [
     "qa_records_path", "write_qa_records", "read_qa_records", "iter_qa_record_files",
-    "EventMetricInputs", "VideoMetricInputs", "aggregate_final_metrics", "write_summary",
+    "EventMetricInputs", "VideoMetricInputs", "collect_metric_inputs",
+    "aggregate_final_metrics", "write_summary",
 ]

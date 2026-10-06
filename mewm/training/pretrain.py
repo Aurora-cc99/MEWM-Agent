@@ -1,16 +1,4 @@
-"""Stage 0 -- self-supervised pre-training of the representation and rollout engines.
-
-**No micro-expression labels are required.** Training uses random temporal splits
-(``kappa ~ U[0.7, 1.0)``) with the held-out future as the target. Annotations only
-calibrate the detection thresholds afterwards. In a field where labelled
-micro-expressions number in the thousands while unlabelled long video is effectively
-unlimited, that decouples dynamics-model capacity from annotation count.
-
-**Slot dropout at 0.15 is not regularisation.** It is what makes ``mask()`` legitimate at
-inference: the necessity check feeds the inference network an observation set with slots
-removed, and unless that input shape was seen during training the resulting belief is an
-extrapolation and ``MNI`` measures nothing trustworthy.
-"""
+"""Pre-training stage: world-model prediction pre-training on video corpora."""
 
 from __future__ import annotations
 
@@ -33,28 +21,22 @@ try:
     import torch.nn.functional as F
     from torch.utils.data import DataLoader, Dataset
     _TORCH = True
-except ImportError:  # pragma: no cover
-    torch = None  # type: ignore
+except ImportError:
+    torch = None
     _TORCH = False
-    Dataset = object  # type: ignore
-
-
-# ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
+    Dataset = object
 
 
 @dataclass
 class PretrainConfig:
-    """Appendix F.1 defaults."""
 
-    window: int = 64                  # frames per training window
+    window: int = 64
     batch_size: int = 16
     epochs: int = 10
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03
-    kappa_low: float = 0.7            # temporal split ratio lower bound
+    kappa_low: float = 0.7
     slot_dropout: float = 0.15
     lambda_imagine: float = 1.0
     lambda_flow: float = 0.5
@@ -66,11 +48,6 @@ class PretrainConfig:
 
 
 class LongVideoWindows(Dataset):
-    """Fixed-length windows of ``(measurements, slot activations)`` over long video.
-
-    Windows are cached as arrays rather than re-read per epoch: the flow decode dominates
-    the cost, and re-decoding it every epoch would make the loader the bottleneck.
-    """
 
     def __init__(
         self,
@@ -90,7 +67,6 @@ class LongVideoWindows(Dataset):
         activations = np.asarray(window["activations"], dtype=np.float32)
         n = measurements.shape[0]
 
-        # Random temporal split: the retained prefix conditions, the suffix supervises.
         kappa = float(self.rng.uniform(self.config.kappa_low, 1.0))
         split = max(2, int(round(n * kappa)))
         split = min(split, n - 1) if n > 2 else max(1, n - 1)
@@ -105,7 +81,6 @@ class LongVideoWindows(Dataset):
 
 
 def collate(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """Pad a batch of windows to a common length."""
     if not _TORCH:
         raise ImportError("collate needs PyTorch")
     longest = max(item["measurements"].shape[0] for item in batch)
@@ -134,12 +109,6 @@ def harvest_windows(
     max_windows_per_video: int = 20,
     exclude_subjects: Sequence[str] = (),
 ) -> List[Dict[str, np.ndarray]]:
-    """Extract training windows from long video.
-
-    ``exclude_subjects`` is a hard exclusion by subject id, applied here rather than at
-    split time: pre-training corpus overlap with the test fold is the contamination that
-    is easiest to introduce accidentally and hardest to detect afterwards.
-    """
     from ..pipeline import run_representation
 
     config = config or load_config()
@@ -156,7 +125,7 @@ def harvest_windows(
                 video, config, stride=1,
                 max_frames=pretrain.window * max_windows_per_video,
             )
-        except Exception as exc:  # noqa: BLE001 - a broken video must not stop the harvest
+        except Exception as exc:
             LOGGER.warning("skipping %s: %s", video.video_id, exc)
             continue
 
@@ -189,13 +158,7 @@ def harvest_windows(
     return windows
 
 
-# ---------------------------------------------------------------------------
-# Trainer
-# ---------------------------------------------------------------------------
-
-
 class WorldModelPretrainer:
-    """Stage-0 trainer for the slot encoder, the latent encoder and the dynamics model."""
 
     def __init__(
         self,
@@ -226,12 +189,10 @@ class WorldModelPretrainer:
             weight_decay=self.pretrain.weight_decay)
         self.history: List[Dict[str, float]] = []
 
-    # -- loss ---------------------------------------------------------------
 
     def compute_loss(self, batch: Dict[str, Any]) -> Tuple[Any, Dict[str, float]]:
-        """``L_WM`` for one batch."""
-        measurements = batch["measurements"].to(self.device)     # (B, T, n_roi*4)
-        activations = batch["activations"].to(self.device)       # (B, T, K)
+        measurements = batch["measurements"].to(self.device)
+        activations = batch["activations"].to(self.device)
         flow_velocity = batch["flow_velocity"].to(self.device)
         batch_size, steps, _ = measurements.shape
         n_roi = measurements.shape[-1] // 4
@@ -239,15 +200,12 @@ class WorldModelPretrainer:
         total = torch.zeros((), device=self.device)
         parts = {"recon": 0.0, "dynamics": 0.0, "imagine": 0.0, "flow": 0.0, "slow": 0.0}
 
-        # -- per-frame encoding
         frame_view = measurements.reshape(batch_size * steps, n_roi, 4)
         slots, predicted_activation, observed = self.slot_encoder(
             frame_view, slot_dropout=self.pretrain.slot_dropout)
         slots = slots.reshape(batch_size, steps, K_SLOTS, -1)
         predicted_activation = predicted_activation.reshape(batch_size, steps, K_SLOTS)
 
-        # Reconstruction: activation read-out against the analytic target, scored only on
-        # slots that were actually observed after dropout.
         mask = observed.reshape(batch_size, steps, K_SLOTS)
         recon = (F.mse_loss(predicted_activation, activations, reduction="none") * mask)
         recon = recon.sum() / mask.sum().clamp(min=1.0)
@@ -259,7 +217,6 @@ class WorldModelPretrainer:
         z_fast = latents["z_fast"].reshape(batch_size, steps, -1)
         predicted_velocity = latents["flow_velocity"].reshape(batch_size, steps, -1)
 
-        # -- one-step transition
         dynamics_loss = torch.zeros((), device=self.device)
         for t in range(steps - 1):
             output = self.dynamics(slots[:, t], z_slow[:, t], z_fast[:, t])
@@ -269,7 +226,6 @@ class WorldModelPretrainer:
         total = total + dynamics_loss
         parts["dynamics"] = float(dynamics_loss.detach())
 
-        # -- multi-step imagination on the held-out suffix
         split = int(batch["split"].min().item())
         split = max(1, min(split, steps - 1))
         imagined = self.dynamics.imagine(
@@ -288,7 +244,6 @@ class WorldModelPretrainer:
                 total = total + self.pretrain.lambda_imagine * imagine_loss
                 parts["imagine"] = float(imagine_loss.detach())
 
-        # -- flow constraint on the fast variable
         flow_loss = self.latent_encoder.flow_constraint_loss(
             z_fast.reshape(batch_size * steps, -1),
             predicted_velocity.reshape(batch_size * steps, -1),
@@ -296,7 +251,6 @@ class WorldModelPretrainer:
         total = total + self.pretrain.lambda_flow * flow_loss
         parts["flow"] = float(flow_loss.detach())
 
-        # -- slow-variable consistency
         prior_mean = z_slow[:, :-1].detach()
         prior_var = torch.full_like(prior_mean,
                                     self.config.representation.slow_process_noise
@@ -309,7 +263,6 @@ class WorldModelPretrainer:
         parts["total"] = float(total.detach())
         return total, parts
 
-    # -- loop ---------------------------------------------------------------
 
     def fit(self, dataset: LongVideoWindows,
             output_dir: Optional[Path | str] = None) -> List[Dict[str, float]]:
@@ -345,16 +298,13 @@ class WorldModelPretrainer:
         return self.history
 
     def _schedule(self, step: int, warmup: int, total: int) -> float:
-        """Linear warm-up then cosine decay."""
         if step <= warmup:
             return self.pretrain.learning_rate * step / warmup
         progress = (step - warmup) / max(1, total - warmup)
         return self.pretrain.learning_rate * 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
 
-    # -- persistence --------------------------------------------------------
 
     def save(self, output_dir: Path | str) -> Path:
-        """Freeze and version both engines (appendix F.1)."""
         target = Path(output_dir)
         target.mkdir(parents=True, exist_ok=True)
         torch.save(self.slot_encoder.state_dict(), target / "v2_slot_encoder.pt")
@@ -373,22 +323,11 @@ class WorldModelPretrainer:
         return target
 
 
-# ---------------------------------------------------------------------------
-# Threshold calibration
-# ---------------------------------------------------------------------------
-
-
 def calibrate_detection_thresholds(
     videos: Sequence[Any],
     config: Optional[MEWMConfig] = None,
     dynamics: Optional[Any] = None,
 ) -> Dict[str, float]:
-    """Fit ``(tau_hi, tau_lo)`` on a labelled calibration fold (appendix F.1).
-
-    The only place annotations enter stage 0, and only on the training/calibration fold:
-    initialise at the Youden point of the alignment AUC, then report the achieved AUC so
-    the threshold choice can be judged rather than assumed.
-    """
     from ..engines.m2_spotting import alignment_auc, calibrate_thresholds
     from ..pipeline import run_representation, run_spotting
 
@@ -402,7 +341,7 @@ def calibrate_detection_thresholds(
         try:
             representation = run_representation(video, config)
             spotting = run_spotting(video, representation, config, dynamics)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             LOGGER.warning("calibration skipped %s: %s", video.video_id, exc)
             continue
         record = spotting.error_record

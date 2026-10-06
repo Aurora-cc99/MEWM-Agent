@@ -1,20 +1,4 @@
-"""A-Agent -- AU activation adjudication and the AU->AU dynamic graph (paper 3.4.3).
-
-* **encode** -- turn salient regional motion into AU fit evidence (direction fit,
-  magnitude, symmetry), adjudicate the active and weak sets, and cross-check against the
-  object-slot read-out. The cross-check is two genuinely independent paths -- rule fitting
-  over anatomy versus a learned encoder -- so a disagreement is registered as an open
-  question rather than averaged. Averaging would destroy the only signal that says the
-  two views of the same evidence do not agree.
-
-* **graph** -- build ``G^AU_j``: nodes carry the phase triple and slopes read off the slot
-  trajectories; edges carry polarity, phase lag, and a weight that is the **harmonic
-  mean** of the model's interaction prior and the measured lagged cross-correlation. The
-  harmonic mean is chosen so a near-zero value on either side drags the edge down: an
-  edge needs both the population regularity and the in-sample fact. Where the two sources
-  disagree in sign the weight is undefined and an open question is filed -- a statistical
-  prior contradicting the individual case is exactly the thing worth surfacing.
-"""
+"""Structuring agent: builds AU sets and temporal dynamic graphs."""
 
 from __future__ import annotations
 
@@ -35,20 +19,9 @@ from .base import AgentResult, BaseAgent, coerce_float, format_evidence_lines
 
 LOGGER = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Deterministic graph construction (also the reference parser of appendix C.6)
-# ---------------------------------------------------------------------------
-
-
 def lagged_cross_correlation(
     a: np.ndarray, b: np.ndarray, max_lag: int = 10,
 ) -> Tuple[str, int, float]:
-    """``(polarity, lag, peak)`` of the lagged cross-correlation between two trajectories.
-
-    A positive lag means ``a`` leads ``b`` -- the phase-precedence relation the graph's
-    temporal edges encode.
-    """
     a = np.asarray(a, dtype=np.float64).reshape(-1)
     b = np.asarray(b, dtype=np.float64).reshape(-1)
     n = min(a.size, b.size)
@@ -72,11 +45,8 @@ def lagged_cross_correlation(
             best_lag, best_value = lag, value
     return ("+" if best_value >= 0 else "-"), best_lag, abs(best_value)
 
-
 def permutation_test(a: np.ndarray, b: np.ndarray, observed: float,
                      n_permutations: int = 200, seed: int = 0) -> float:
-    """p-value for a lag-maximised cross-correlation, via phase-randomised surrogates.
-    """
     a = np.asarray(a, dtype=np.float64).reshape(-1)
     b = np.asarray(b, dtype=np.float64).reshape(-1)
     n = min(a.size, b.size)
@@ -93,22 +63,19 @@ def permutation_test(a: np.ndarray, b: np.ndarray, observed: float,
     exceed = 0
     for _ in range(n_permutations):
         phases = rng.uniform(0.0, 2.0 * np.pi, magnitude.shape)
-        phases[0] = 0.0                       # keep the DC term real
+        phases[0] = 0.0
         if n % 2 == 0 and magnitude.size:
-            phases[-1] = 0.0                  # and the Nyquist term, for a real signal
+            phases[-1] = 0.0
         surrogate = np.fft.irfft(magnitude * np.exp(1j * phases), n=n)
         _polarity, _lag, value = lagged_cross_correlation(a, surrogate)
         exceed += int(value >= observed)
     return round((exceed + 1) / (n_permutations + 1), 4)
 
-
 def harmonic_mean(a: float, b: float) -> float:
-    """Harmonic mean of two magnitudes; zero when either side is zero."""
     a, b = abs(float(a)), abs(float(b))
     if a <= 1e-9 or b <= 1e-9:
         return 0.0
     return round(2.0 * a * b / (a + b), 5)
-
 
 def build_reference_graph(
     slot_trajectories: Dict[str, np.ndarray],
@@ -122,8 +89,6 @@ def build_reference_graph(
     active_aus: Optional[Sequence[str]] = None,
     weak_aus: Optional[Sequence[str]] = None,
 ) -> Tuple[AUDynGraph, List[OpenQuestion]]:
-    """The deterministic parser of appendix C.6.
-    """
     from ..engines.v2_slots import phase_profile
 
     graph = AUDynGraph(cid=cid)
@@ -162,10 +127,8 @@ def build_reference_graph(
             b = np.asarray(slot_trajectories[target], dtype=np.float64).reshape(-1)
             polarity, lag, peak = lagged_cross_correlation(a, b)
             if lag < 0:
-                continue                       # keep the leading direction of each pair
+                continue
             if lag == 0 and source > target:
-                # Simultaneous pair: keep one orientation, or the graph carries the same
-                # relation twice and the edit distance double-counts it.
                 continue
             p_value = permutation_test(a, b, peak, n_permutations, seed=i)
             if p_value >= 0.05:
@@ -199,12 +162,10 @@ def build_reference_graph(
                 ))
     return graph, questions
 
-
 def graph_edit_distance(
     reference: AUDynGraph, predicted: AUDynGraph,
     node_cost: float = 1.0, edge_cost: float = 1.0, polarity_cost: float = 0.5,
 ) -> float:
-    """Edit distance used by the structure reward (appendix C.6)."""
     reference_nodes, predicted_nodes = set(reference.nodes), set(predicted.nodes)
     cost = node_cost * len(reference_nodes ^ predicted_nodes)
 
@@ -219,14 +180,7 @@ def graph_edit_distance(
             cost += polarity_cost
     return round(cost, 4)
 
-
-# ---------------------------------------------------------------------------
-# Agent
-# ---------------------------------------------------------------------------
-
-
 class StructureAgent(BaseAgent):
-    """Activation adjudication and dynamic-graph construction."""
 
     role_files = {
         PHASE_A_ENCODE: "a_agent_encode",
@@ -238,8 +192,6 @@ class StructureAgent(BaseAgent):
 
     def phases(self) -> Tuple[str, ...]:
         return (PHASE_A_ENCODE, PHASE_A_GRAPH)
-
-    # -- prompts ------------------------------------------------------------
 
     def build_user_prompt(self, phase: str, projection: Projection,
                           state: MEWMState, **kwargs: Any) -> str:
@@ -330,8 +282,6 @@ class StructureAgent(BaseAgent):
         )
         return "\n".join(lines)
 
-    # -- parsing ------------------------------------------------------------
-
     def parse(self, phase: str, payload: Dict[str, Any], projection: Projection,
               state: MEWMState, **kwargs: Any) -> AgentResult:
         if phase == PHASE_A_ENCODE:
@@ -346,9 +296,6 @@ class StructureAgent(BaseAgent):
         weak = [str(a) for a in (payload.get("weak_aus") or []) if a in SLOT_INDEX]
         fits = list(payload.get("fits") or [])
 
-        # A model can also over-declare, especially when handed a saturated coherence
-        # channel. Cap against the competitive pre-selection and record what was cut, so
-        # the trim is visible rather than silent.
         cap = self.config.representation.max_active_aus
         if len(active) > cap:
             readout: Dict[str, float] = kwargs.get("slot_readout") or {}
@@ -374,7 +321,6 @@ class StructureAgent(BaseAgent):
             ))
 
         questions = list(payload.get("open_questions") or [])
-        # Disagreement between the two activation paths is registered, never averaged.
         readout: Dict[str, float] = kwargs.get("slot_readout") or {}
         if readout:
             for au in active:
@@ -417,8 +363,6 @@ class StructureAgent(BaseAgent):
                      state: MEWMState, **kwargs: Any) -> AgentResult:
         result = AgentResult(phase=PHASE_A_GRAPH)
         cid = projection.cid
-        # The tool-computed graph is authoritative for parameters; the model supplies the
-        # account. That keeps R3 satisfiable and keeps the numbers reproducible.
         reference: Optional[AUDynGraph] = kwargs.get("reference_graph")
         graph = reference if reference is not None else _graph_from_payload(payload, cid)
         graph.narrative = str(payload.get("graph_narrative", ""))
@@ -441,8 +385,6 @@ class StructureAgent(BaseAgent):
             cid=cid,
         ))
         return result
-
-    # -- fallback -----------------------------------------------------------
 
     def fallback(self, phase: str, projection: Projection, state: MEWMState,
                  reason: str, **kwargs: Any) -> AgentResult:
@@ -493,7 +435,6 @@ class StructureAgent(BaseAgent):
         ))
         return result
 
-
 def _graph_from_payload(payload: Dict[str, Any], cid: str) -> AUDynGraph:
     graph = AUDynGraph(cid=cid)
     raw = payload.get("au_graph") or {}
@@ -526,7 +467,6 @@ def _graph_from_payload(payload: Dict[str, Any], cid: str) -> AUDynGraph:
             p_value=float(edge.get("p_value", 1.0) or 1.0),
         ))
     return graph
-
 
 __all__ = [
     "lagged_cross_correlation", "permutation_test", "harmonic_mean",

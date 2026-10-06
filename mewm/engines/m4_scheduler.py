@@ -1,6 +1,4 @@
-"""M4 -- the scheduling signal (paper 3.3.4, appendix F.4).
-"""
-
+"""M4 scheduler: coordinates engine inference ordering across pipeline stages."""
 from __future__ import annotations
 
 import logging
@@ -19,16 +17,14 @@ PATHS = (PATH_FAST, PATH_STANDARD, PATH_DEEP)
 
 @dataclass
 class ScheduleSignal:
-    """Per-proposal routing inputs and the decision they produce."""
-
     cid: str
-    evidence_margin: float = 0.0        # Delta: ES gap between the top two hypotheses
-    likelihood_ratio: float = 0.0       # Lambda: l(e1) - l(e2)
-    belief_variance: float = 1.0        # Var[z^e], normalised entropy in [0, 1]
-    detection_margin: float = 0.0       # S_apex - tau_hi
-    predictive_variance: float = 0.0    # transition-model uncertainty
+    evidence_margin: float = 0.0
+    likelihood_ratio: float = 0.0
+    belief_variance: float = 1.0
+    detection_margin: float = 0.0
+    predictive_variance: float = 0.0
     open_questions: int = 0
-    confidence: Optional[float] = None  # available only after adjudication
+    confidence: Optional[float] = None
     suppression: str = "none"
     challenge_upheld: bool = False
     path: str = PATH_STANDARD
@@ -49,14 +45,11 @@ class ScheduleSignal:
 
 
 class Scheduler:
-    """Deterministic path selection.  No LLM is involved in this decision."""
-
     def __init__(self, config: Optional[SchedulerConfig] = None) -> None:
         self.config = config or SchedulerConfig()
         self.history: List[ScheduleSignal] = []
 
     def route(self, signal: ScheduleSignal) -> ScheduleSignal:
-        """Assign ``signal.path`` from the F.4 conditions; deep wins over fast."""
         reasons: List[str] = []
 
         deep = False
@@ -105,7 +98,6 @@ class Scheduler:
         self, signal: ScheduleSignal, confidence: float,
         suppression: str = "none", challenge_upheld: bool = False,
     ) -> ScheduleSignal:
-        """Re-evaluate once the verdict exists; may escalate a proposal to deep."""
         signal.confidence = confidence
         signal.suppression = suppression
         signal.challenge_upheld = challenge_upheld
@@ -134,7 +126,6 @@ def build_signal(
     predictive_variance: float = 0.0,
     open_questions: int = 0,
 ) -> ScheduleSignal:
-    """Assemble a routing signal from the engine and agent outputs."""
     margin = 0.0
     if es_scores and len(es_scores) >= 2:
         ordered = sorted(es_scores.values(), reverse=True)

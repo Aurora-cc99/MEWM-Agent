@@ -1,11 +1,4 @@
-"""``K_AU`` -- the AU anatomy knowledge base (paper 3.5, static semantic memory).
-
-* the 29 FACS anatomical regions and their index/label ordering,
-* the AU -> region map ``R_k`` that drives V2's hard mask routing (eq. 4), together with
-  the expected pull direction that turns a raw angle into a direction-fit verdict,
-* the ``K = 16`` slot vocabulary of the object-centric encoder.
-"""
-
+"""AU anatomy knowledge base: facial muscle groups, AU co-occurrence priors."""
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -14,9 +7,6 @@ from ..config import ensure_pre_process_importable
 
 KB_VERSION = "K_AU-1.0.0"
 
-# ---------------------------------------------------------------------------
-# 29 anatomical regions, in the canonical order (roi index = position, 1-based)
-# ---------------------------------------------------------------------------
 
 ROI_ORDER: List[Tuple[str, str]] = [
     ("left_eye_lower_left", "Left Lower Eyelid (Left Side)"),
@@ -50,8 +40,6 @@ ROI_ORDER: List[Tuple[str, str]] = [
     ("right_cheek", "Right Cheek"),
 ]
 
-# Region -> [(AU, significance, expected pull directions in degrees)].
-# Significance: * primary, <> secondary, o incidental.
 ROI_CANDIDATES: Dict[str, List[Tuple[str, str, List[float]]]] = {
     "left_eye_lower_left": [("AU6", "★", [90, 60, 120]), ("AU7", "◈", [90]), ("AU43", "○", [270])],
     "left_eye_lower_center": [("AU6", "★", [90]), ("AU7", "◈", [90]), ("AU43", "○", [270])],
@@ -84,18 +72,16 @@ ROI_CANDIDATES: Dict[str, List[Tuple[str, str, List[float]]]] = {
     "right_cheek": [("AU6", "★", [90, 45, 135]), ("AU12", "◈", [45, 135]), ("AU14", "○", [0, 180])],
 }
 
-# Try the shared front-end definitions first so ROI geometry can never drift between
-# the flow pipeline and this package.
-try:  # pragma: no cover - depends on the surrounding checkout
+try:
     ensure_pre_process_importable()
-    from me_facs_core import (  # type: ignore
+    from me_facs_core import (
         ROI_ORDER as _SHARED_ROI_ORDER,
         ROI_CANDIDATES as _SHARED_ROI_CANDIDATES,
     )
     if _SHARED_ROI_ORDER and _SHARED_ROI_CANDIDATES:
         ROI_ORDER = list(_SHARED_ROI_ORDER)
         ROI_CANDIDATES = dict(_SHARED_ROI_CANDIDATES)
-except Exception:  # noqa: BLE001 - standalone use is explicitly supported
+except Exception:
     pass
 
 
@@ -105,7 +91,6 @@ ROI_INDEX: Dict[str, int] = {name: i for i, (name, _) in enumerate(ROI_ORDER, st
 INDEX_TO_ROI: Dict[int, str] = {i: name for name, i in ROI_INDEX.items()}
 N_ROI = len(ROI_ORDER)
 
-# Chinese labels used by the Chinese-language prompts and narratives.
 ROI_LABELS_ZH: Dict[str, str] = {
     "left_eye_lower_left": "左下睑（左侧）", "left_eye_lower_center": "左下睑（中部）",
     "left_eye_lower_right": "左下睑（右侧）", "right_eye_lower_left": "右下睑（左侧）",
@@ -123,9 +108,6 @@ ROI_LABELS_ZH: Dict[str, str] = {
     "chin": "下颏", "left_cheek": "左颊", "right_cheek": "右颊",
 }
 
-# ---------------------------------------------------------------------------
-# AU vocabulary
-# ---------------------------------------------------------------------------
 
 AU_ANATOMY: Dict[str, str] = {
     "AU1": "inner brow raise", "AU2": "outer brow raise", "AU4": "brow draw-down",
@@ -145,9 +127,6 @@ AU_ANATOMY_ZH: Dict[str, str] = {
     "AU26": "下颌下落", "AU38": "鼻翼扩张", "AU43": "闭眼",
 }
 
-# ``K = 16`` object slots (paper 3.2.2).  AU38/AU43 stay in the ROI candidate table as
-# discriminators but get no slot: they are physiological (nostril flare, blink) rather
-# than expressive, and M2 already removes their error mass through the physio channel.
 SLOT_AUS: List[str] = [
     "AU1", "AU2", "AU4", "AU5", "AU6", "AU7", "AU9", "AU10",
     "AU12", "AU14", "AU15", "AU17", "AU20", "AU23", "AU24", "AU25",
@@ -165,10 +144,6 @@ FIT_WEIGHTS: Dict[str, float] = {"FIT": 1.0, "PARTIAL": 0.62, "NO-FIT": 0.15}
 MAGNITUDE_WEIGHTS: Dict[str, float] = {"Micro": 0.42, "Moderate": 0.72, "Macro": 1.0}
 COHERENCE_WEIGHTS: Dict[str, float] = {"Low": 0.42, "Medium": 0.72, "High": 1.0}
 
-# ---------------------------------------------------------------------------
-# Derived maps: AU -> regions (R_k, the V2 routing mask) and expected directions
-# ---------------------------------------------------------------------------
-
 
 def _build_au_regions() -> Dict[str, List[str]]:
     table: Dict[str, List[str]] = {}
@@ -180,14 +155,12 @@ def _build_au_regions() -> Dict[str, List[str]]:
 
 AU_REGIONS: Dict[str, List[str]] = _build_au_regions()
 
-#: ``(AU, ROI) -> (significance, expected directions)``
 AU_ROI_PRIOR: Dict[Tuple[str, str], Tuple[str, List[float]]] = {
     (au, roi): (sig, dirs)
     for roi, cands in ROI_CANDIDATES.items()
     for au, sig, dirs in cands
 }
 
-# Bilateral pairs -- symmetry is part of the A-Agent's activation evidence.
 SYMMETRIC_PAIRS: List[Tuple[str, str]] = [
     ("left_eye_lower_left", "right_eye_lower_right"),
     ("left_eye_lower_center", "right_eye_lower_center"),
@@ -201,8 +174,6 @@ SYMMETRIC_PAIRS: List[Tuple[str, str]] = [
     ("left_cheek", "right_cheek"),
 ]
 
-# Co-occurrence / antagonism priors used by gate rule R4.  A pair listed as antagonistic
-# that is nonetheless reported as jointly active must be registered as an open question.
 AU_ANTAGONISTS: List[Tuple[str, str]] = [
     ("AU4", "AU1"), ("AU4", "AU2"), ("AU4", "AU12"), ("AU12", "AU15"),
     ("AU12", "AU24"), ("AU5", "AU7"), ("AU5", "AU43"), ("AU24", "AU25"),
@@ -218,25 +189,10 @@ AU_SYNERGISTS: List[Tuple[str, str]] = [
 _ANTAGONIST_SET = {frozenset(p) for p in AU_ANTAGONISTS}
 _SYNERGIST_SET = {frozenset(p) for p in AU_SYNERGISTS}
 
-#: Pairs asserted as *both* synergistic and antagonistic.
-#:
-#: These are not table errors -- they are genuinely both. AU1 (inner brow raise) and AU4
-#: (brow lowerer) are mechanically opposed at the inner brow, yet AU1+AU4 is the standard
-#: sadness brow and part of the fear brow, so they co-occur constantly. Resolving that by
-#: whichever table is consulted first would hand the graph a confident prior sign that is
-#: only half true, and would then raise a spurious sign conflict against any measurement.
-#: They are reported as having *no* directional prior instead, so the edge is judged on
-#: the measurement alone.
 AMBIGUOUS_PAIRS = _ANTAGONIST_SET & _SYNERGIST_SET
 
 
-# ---------------------------------------------------------------------------
-# Query helpers
-# ---------------------------------------------------------------------------
-
-
 def regions_of(au: str) -> List[str]:
-    """``R_k`` -- the anatomical regions AU ``k`` is allowed to read (eq. 4)."""
     return AU_REGIONS.get(au, [])
 
 
@@ -249,13 +205,11 @@ def aus_of_region(roi: str) -> List[str]:
 
 
 def angular_distance(a: float, b: float) -> float:
-    """Smallest absolute angle between two headings, in degrees."""
     diff = abs(float(a) - float(b)) % 360.0
     return diff if diff <= 180.0 else 360.0 - diff
 
 
 def direction_fit(angle_deg: float, expected: Sequence[float]) -> str:
-    """FIT (<=35 deg) / PARTIAL (<=70 deg) / NO-FIT, as in the flow front end."""
     if not expected:
         return "NO-FIT"
     best = min(angular_distance(angle_deg, ref) for ref in expected)
@@ -267,7 +221,6 @@ def direction_fit(angle_deg: float, expected: Sequence[float]) -> str:
 
 
 def direction_fit_score(angle_deg: float, expected: Sequence[float]) -> float:
-    """Continuous counterpart of :func:`direction_fit`, in ``[0, 1]``."""
     if not expected:
         return 0.0
     best = min(angular_distance(angle_deg, ref) for ref in expected)
@@ -275,7 +228,6 @@ def direction_fit_score(angle_deg: float, expected: Sequence[float]) -> float:
 
 
 def fit_au_at_region(au: str, roi: str, angle_deg: float) -> Optional[Dict[str, object]]:
-    """Direction-fit verdict for one (AU, region) pair, or ``None`` if unrelated."""
     prior = AU_ROI_PRIOR.get((au, roi))
     if prior is None:
         return None
@@ -294,7 +246,6 @@ def fit_au_at_region(au: str, roi: str, angle_deg: float) -> Optional[Dict[str, 
 
 
 def candidate_entries(roi: str, angle_deg: float) -> List[Dict[str, object]]:
-    """All AU candidates of a region, ranked by fit -- the A-Agent's per-ROI input."""
     entries = []
     for au, significance, expected in ROI_CANDIDATES.get(roi, []):
         verdict = direction_fit(angle_deg, expected)
@@ -310,25 +261,20 @@ def candidate_entries(roi: str, angle_deg: float) -> List[Dict[str, object]]:
 
 
 def is_ambiguous(au_a: str, au_b: str) -> bool:
-    """Whether the pair carries contradictory prior claims (see AMBIGUOUS_PAIRS)."""
     return frozenset((au_a, au_b)) in AMBIGUOUS_PAIRS
 
 
 def is_antagonistic(au_a: str, au_b: str) -> bool:
-    """Antagonistic *and* not also claimed synergistic."""
     pair = frozenset((au_a, au_b))
     return pair in _ANTAGONIST_SET and pair not in AMBIGUOUS_PAIRS
 
 
 def is_synergistic(au_a: str, au_b: str) -> bool:
-    """Synergistic *and* not also claimed antagonistic."""
     pair = frozenset((au_a, au_b))
     return pair in _SYNERGIST_SET and pair not in AMBIGUOUS_PAIRS
 
 
 def prior_polarity(au_a: str, au_b: str) -> Optional[str]:
-    """``'+'`` / ``'-'`` / ``None`` -- the sign the interaction prior expects.
-    """
     if is_ambiguous(au_a, au_b):
         return None
     if frozenset((au_a, au_b)) in _SYNERGIST_SET:
@@ -339,7 +285,6 @@ def prior_polarity(au_a: str, au_b: str) -> Optional[str]:
 
 
 def hard_conflicts(active_aus: Sequence[str]) -> List[Tuple[str, str]]:
-    """Antagonistic pairs jointly reported active (gate rule R4)."""
     active = sorted(set(active_aus))
     return [
         (a, b)
@@ -366,7 +311,6 @@ def describe_au(au: str, lang: str = "en") -> str:
 
 
 def knowledge_digest() -> Dict[str, object]:
-    """Compact, promptable view of ``K_AU``."""
     return {
         "version": KB_VERSION,
         "n_roi": N_ROI,

@@ -1,5 +1,4 @@
-"""Long-video and event loading for the four benchmarks.
-"""
+"""Dataset loaders for CAS(ME)², SAMM, CAS(ME)³, and 4D-ME."""
 
 from __future__ import annotations
 
@@ -21,14 +20,8 @@ MICRO = "micro-expression"
 MACRO = "macro-expression"
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class ExpressionEvent:
-    """One annotated onset/apex/offset event inside a long video (ground truth)."""
 
     event_id: str
     onset: int
@@ -72,7 +65,6 @@ class ExpressionEvent:
 
 @dataclass
 class LongVideo:
-    """One long video: where its frames and flow live, plus its annotated events."""
 
     dataset: str
     video_key: str
@@ -126,7 +118,6 @@ class LongVideo:
         return [e.interval for e in events]
 
     def to_meta(self):
-        """Build the ``VideoMeta`` interface object."""
         from ..schemas import VideoMeta
         return VideoMeta(
             video_id=self.video_id, dataset=self.dataset,
@@ -148,7 +139,6 @@ class LongVideo:
 
 @dataclass
 class DatasetIndex:
-    """All long videos of one dataset plus the statistics the front end derived."""
 
     dataset: str
     videos: List[LongVideo] = field(default_factory=list)
@@ -173,7 +163,6 @@ class DatasetIndex:
         return [v for v in self.videos if v.subject == subject]
 
     def loso_folds(self) -> List[Tuple[str, List[LongVideo], List[LongVideo]]]:
-        """Leave-one-subject-out splits -- the protocol every P1/P2 number uses."""
         folds = []
         for subject in self.subjects():
             test = self.by_subject(subject)
@@ -194,16 +183,9 @@ class DatasetIndex:
         }
 
 
-# ---------------------------------------------------------------------------
-# Cross-domain protocol
-# ---------------------------------------------------------------------------
-
-
 def lodo_folds(
     indices: Sequence["DatasetIndex"],
 ) -> List[Tuple[str, List[LongVideo], List[LongVideo]]]:
-    """Leave-one-dataset-out splits: train on every other corpus, test on one.
-    """
     named = [(index.dataset, index) for index in indices]
     duplicates = sorted({name for name, _ in named if
                          sum(1 for other, _ in named if other == name) > 1})
@@ -224,28 +206,18 @@ def lodo_folds(
     return folds
 
 
-# ---------------------------------------------------------------------------
-# Adapter over pre_process/me_datasets.py
-# ---------------------------------------------------------------------------
-
-
 def _import_reference_loader():
     ensure_pre_process_importable()
     try:
-        import me_datasets  # type: ignore
+        import me_datasets
         return me_datasets
-    except Exception as exc:  # noqa: BLE001 - optional dependency on the sibling tree
+    except Exception as exc:
         LOGGER.warning("pre_process/me_datasets.py unavailable (%s); "
                        "falling back to filesystem discovery", exc)
         return None
 
 
 def _folder_rel_tail(dataset: str, folder_rel: str) -> str:
-    """Strip the dataset frame-root prefix off a ``pre_process`` relative folder.
-
-    ``me_datasets`` stores paths relative to ``dataset/`` (``CASME_sq/rawpic_crop/s15/x``)
-    while :class:`VideoPaths` wants them relative to the frame root (``s15/x``).
-    """
     from .paths import DATASET_FRAME_REL
     prefix = DATASET_FRAME_REL[dataset].strip("/") + "/"
     cleaned = folder_rel.replace("\\", "/").strip("/")
@@ -276,11 +248,6 @@ def _event_from_spec(spec, index: int) -> ExpressionEvent:
 
 
 def _parse_aus(raw: object) -> List[str]:
-    """Normalise an AU annotation cell into ``['AU4', 'AU7', ...]``.
-
-    Head- and gaze-movement codes (>= 50) live in the same column in SAMM and
-    CAS(ME)^3 and must not be read as facial action units.
-    """
     if not raw:
         return []
     text = str(raw).replace("＋", "+").replace("，", ",")
@@ -301,7 +268,6 @@ def _parse_aus(raw: object) -> List[str]:
 
 
 def load_dataset(dataset: str, limit_videos: int = 0) -> DatasetIndex:
-    """Load one dataset's long videos and annotations."""
 
     if dataset not in DATASETS:
         raise KeyError(f"unknown dataset {dataset!r}; expected one of {DATASETS}")
@@ -312,7 +278,7 @@ def load_dataset(dataset: str, limit_videos: int = 0) -> DatasetIndex:
 
     try:
         bundle = module.load_dataset(dataset, limit_videos=limit_videos)
-    except Exception as exc:  # noqa: BLE001 - missing workbook, unreadable sheet, ...
+    except Exception as exc:
         LOGGER.warning("annotation load failed for %s (%s); "
                        "falling back to filesystem discovery", dataset, exc)
         index = discover_dataset(dataset, limit_videos=limit_videos)
@@ -352,11 +318,6 @@ def load_dataset(dataset: str, limit_videos: int = 0) -> DatasetIndex:
 
 
 def discover_dataset(dataset: str, limit_videos: int = 0) -> DatasetIndex:
-    """Filesystem-only discovery: videos without ground truth.
-
-    Enough to run stage I/II (representation + spotting) on unlabelled long video, which
-    is exactly what stage 0 pre-training needs.
-    """
 
     root = dataset_frame_root(dataset)
     gap, fps = flow_gap_of(dataset), fps_of(dataset)
@@ -386,7 +347,6 @@ def discover_dataset(dataset: str, limit_videos: int = 0) -> DatasetIndex:
 
 
 def _iter_clip_dirs(dataset: str, root: Path) -> Iterator[Path]:
-    """Yield the directories that hold frames, respecting each dataset's nesting."""
     if dataset == "samm":
         yield from (p for p in sorted(root.iterdir()) if p.is_dir())
         return
@@ -403,7 +363,6 @@ def _iter_clip_dirs(dataset: str, root: Path) -> Iterator[Path]:
 
 
 def load_all(limit_videos: int = 0, datasets: Optional[Sequence[str]] = None) -> Dict[str, DatasetIndex]:
-    """Load every dataset present on this machine."""
     out: Dict[str, DatasetIndex] = {}
     for name in (datasets or DATASETS):
         if not dataset_frame_root(name).is_dir():
@@ -414,7 +373,6 @@ def load_all(limit_videos: int = 0, datasets: Optional[Sequence[str]] = None) ->
 
 
 def resolve_video(dataset: str, video_key: str) -> Optional[LongVideo]:
-    """Look one video up by key -- used by the CLI and the QA joiner."""
     index = load_dataset(dataset)
     return index.by_key(video_key)
 

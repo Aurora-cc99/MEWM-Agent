@@ -1,1 +1,1 @@
-"""MEWM-Agent orchestration subpackage."""
+"""Orchestration sub-package: ACE state machine and existence gate."""

@@ -1,19 +1,9 @@
-"""The first evaluation layer's rollout-quality metrics (paper 4.2, layer 1).
-
-* ``alignment_auc`` -- does the spotting curve rank event frames above non-event frames.
-  Already wired, in :mod:`mewm.engines.m2_spotting`.
-* **rollout prediction error** -- roll the frozen dynamics forward over a held-out future
-  segment and measure how fast the prediction decays. This module.
-* **counterfactual structure** -- condition the rollout on each of the eight emotion
-  hypotheses in turn and measure how far apart the resulting trajectories are, plus
-  whether that separation is ordered the way arousal is. This module.
-"""
-
+"""World-model rollout quality metrics: prediction accuracy and consistency."""
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -22,17 +12,7 @@ from ..knowledge.emotion_prototypes import FINE_EMOTIONS, VALENCE_AROUSAL
 LOGGER = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Held-out rollout prediction error
-# ---------------------------------------------------------------------------
-
-
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity, with the all-zero case defined rather than NaN.
-
-    Two flat slot vectors are a perfectly-predicted quiet stretch, not an undefined
-    comparison; scoring that 1.0 keeps a neutral segment from poisoning the mean.
-    """
     na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
     if na == 0.0 and nb == 0.0:
         return 1.0
@@ -43,22 +23,14 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 @dataclass
 class RolloutErrorCurve:
-    """Prediction error as a function of how far ahead the model was asked to see."""
-
-    #: Mean squared error at horizon 1..k, in slot-activation units.
     mse: List[float] = field(default_factory=list)
-    #: Mean cosine similarity between predicted and observed slot vectors at 1..k.
     cosine: List[float] = field(default_factory=list)
-    #: Windows that contributed at each horizon. Falls off near the end of a video,
-    #: where a k-step future does not exist; reported so a rising tail can be read as
-    #: thin evidence rather than as degradation.
     n_windows: List[int] = field(default_factory=list)
     k_steps: int = 0
     n_sequences: int = 0
 
     @property
     def decay(self) -> float:
-        """MSE at the last horizon minus MSE at the first -- how fast it comes apart."""
         if len(self.mse) < 2:
             return 0.0
         return round(self.mse[-1] - self.mse[0], 6)
@@ -79,8 +51,6 @@ def rollout_prediction_error(
     context: int = 2,
     stride: int = 1,
 ) -> RolloutErrorCurve:
-    """Roll the frozen dynamics over held-out futures and report error by horizon.
-    """
     curve = RolloutErrorCurve(k_steps=int(k_steps))
     if k_steps < 1:
         return curve
@@ -102,7 +72,7 @@ def rollout_prediction_error(
             try:
                 out = dynamics.rollout(prefix[-1], steps=k_steps, emotion=emotion,
                                        momentum=momentum)
-            except Exception as exc:  # noqa: BLE001 - one bad window must not kill the sweep
+            except Exception as exc:
                 LOGGER.warning("rollout failed at frame %d: %s", start, exc)
                 continue
             predicted = np.asarray(out["trajectory"], dtype=np.float64)
@@ -118,13 +88,7 @@ def rollout_prediction_error(
     return curve
 
 
-# ---------------------------------------------------------------------------
-# Counterfactual structure
-# ---------------------------------------------------------------------------
-
-
 def _spearman(a: Sequence[float], b: Sequence[float]) -> float:
-    """Spearman rank correlation, ties averaged. Zero when either side is constant."""
     x, y = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     if x.size < 2 or x.size != y.size:
         return 0.0
@@ -133,8 +97,6 @@ def _spearman(a: Sequence[float], b: Sequence[float]) -> float:
         order = values.argsort()
         out = np.empty_like(values)
         out[order] = np.arange(values.size, dtype=np.float64)
-        # Average the ranks of tied values, otherwise the correlation depends on the
-        # arbitrary order argsort happened to break the tie in.
         for value in np.unique(values):
             mask = values == value
             if mask.sum() > 1:
@@ -150,18 +112,9 @@ def _spearman(a: Sequence[float], b: Sequence[float]) -> float:
 
 @dataclass
 class CounterfactualStructure:
-    """How far apart the eight emotion hypotheses push the same imagined future."""
-
     emotions: List[str] = field(default_factory=list)
-    #: Symmetric ``(E, E)`` matrix of mean cosine distance between conditioned rollouts.
     divergence: List[List[float]] = field(default_factory=list)
-    #: Spearman correlation between each hypothesis's mean divergence from the others and
-    #: its arousal coordinate. The paper's claim is that high-arousal hypotheses imagine
-    #: more extreme futures; this is the number that claim lives or dies by.
     arousal_rank_correlation: float = 0.0
-    #: Mean off-diagonal divergence. Near zero means conditioning did nothing -- the
-    #: model imagines the same future whatever it is told, and every downstream
-    #: counterfactual comparison is measuring noise.
     mean_divergence: float = 0.0
     n_contexts: int = 0
 
@@ -179,8 +132,6 @@ def counterfactual_structure(
     steps: int = 8,
     emotions: Optional[Sequence[str]] = None,
 ) -> CounterfactualStructure:
-    """The ``E x E`` trajectory-divergence matrix and its arousal rank correlation.
-    """
     labels = [e for e in (emotions or FINE_EMOTIONS) if e != "other"]
     structure = CounterfactualStructure(emotions=list(labels))
     if len(labels) < 2:
@@ -200,7 +151,7 @@ def counterfactual_structure(
             try:
                 out = dynamics.rollout(prefix[-1], steps=steps, emotion=emotion,
                                        momentum=momentum)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 LOGGER.warning("counterfactual rollout failed for %s: %s", emotion, exc)
                 continue
             trajectories[emotion] = np.asarray(out["trajectory"], dtype=np.float64).ravel()
@@ -222,7 +173,6 @@ def counterfactual_structure(
     off_diagonal = matrix[~np.eye(n, dtype=bool)]
     structure.mean_divergence = round(float(off_diagonal.mean()), 5) if off_diagonal.size else 0.0
 
-    # Each hypothesis's distinctiveness is its mean distance from the other seven.
     distinctiveness = [float(matrix[i].sum() / max(1, n - 1)) for i in range(n)]
     arousal = [VALENCE_AROUSAL.get(e, (0.0, 0.0))[1] for e in labels]
     structure.arousal_rank_correlation = round(_spearman(distinctiveness, arousal), 5)

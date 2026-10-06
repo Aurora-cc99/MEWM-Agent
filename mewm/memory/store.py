@@ -1,22 +1,4 @@
-"""The three-layer memory of paper 3.5 and appendix E.
-
-**Working memory W** (within a call / within a proposal)
-    Latent and slot trajectories for the current proposal, the local error-curve
-    segment, evidence entries under construction.  Isolated per proposal.  Overflow is
-    event-compressed into episodic memory rather than truncated.
-
-**Episodic memory E** (within a video, across proposals)
-    A per-sample tree: the root holds video metadata, the slow-variable log and a
-    piecewise-linear index of the *whole* ``S_t`` curve; level one holds proposals; leaves
-    hold evidence entries.  Adjacent proposals are linked by baseline continuity or
-    affect shift, and the belief at one proposal's offset primes the next.
-
-**Semantic memory S** (across videos)
-    Static: ``K_AU`` and ``K_E``, exact look-up, versioned, read-only.  Dynamic: a case
-    library and a rollout-precedent library, indexed so the critic can prefer check types
-    that discriminated well historically.
-"""
-
+"""Three-layer memory store: episodic, semantic, and working memory management."""
 from __future__ import annotations
 
 import json
@@ -39,15 +21,8 @@ from ..schemas import (
 LOGGER = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Working memory
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class SegmentSummary:
-    """A stationary run folded into one token (appendix E.2 rule i)."""
-
     t_start: int
     t_end: int
     mean_state: List[float]
@@ -63,7 +38,6 @@ class SegmentSummary:
 
 
 class WorkingMemory:
-    """Per-proposal scratch space with event-based compression on overflow."""
 
     def __init__(self, cid: str, config: Optional[MemoryConfig] = None) -> None:
         self.cid = cid
@@ -80,7 +54,6 @@ class WorkingMemory:
         return entry
 
     def flush(self, chain: EvidenceChain) -> List[Evidence]:
-        """Commit staged entries into the proposal's evidence chain."""
         committed = []
         for entry in self.pending:
             chain.add(entry)
@@ -91,12 +64,6 @@ class WorkingMemory:
     def compress_stationary(
         self, s_curve: Sequence[float], t_start: int, tau_lo: float,
     ) -> List[SegmentSummary]:
-        """Fold runs of ``>= L`` frames below ``tau_lo`` into segment summaries.
-
-        Compression is lossy for representation detail but never for *time coverage* --
-        the raw curve stays in episodic memory as a piecewise-linear index, so any moment
-        remains queryable.
-        """
         summaries: List[SegmentSummary] = []
         run_start: Optional[int] = None
         values = list(s_curve)
@@ -116,16 +83,10 @@ class WorkingMemory:
         return summaries
 
     def belief_tokens(self, n_active_aus: int) -> int:
-        """``N_q`` -- more query tokens when more AUs are in play (appendix E.2 rule ii)."""
         return (self.config.n_query_tokens_multi_au if n_active_aus > 1
                 else self.config.n_query_tokens_single_au)
 
     def aggregate_trajectory(self, trajectory: np.ndarray, n_queries: int) -> np.ndarray:
-        """Compress a multi-step slot trajectory into ``n_queries`` belief tokens.
-
-        Boundary frames are always retained (residual boundary injection) so the segment
-        edges -- where onset and offset live -- survive the compression.
-        """
         trajectory = np.atleast_2d(np.asarray(trajectory, dtype=np.float64))
         steps = trajectory.shape[0]
         if steps <= n_queries:
@@ -147,14 +108,8 @@ class WorkingMemory:
         }
 
 
-# ---------------------------------------------------------------------------
-# Episodic memory
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class PiecewiseLinear:
-    """Compressed but fully queryable index of the ``S_t`` curve (appendix E.1)."""
 
     knots_t: List[int] = field(default_factory=list)
     knots_v: List[float] = field(default_factory=list)
@@ -162,14 +117,12 @@ class PiecewiseLinear:
 
     @classmethod
     def fit(cls, values: Sequence[float], t_start: int = 0, tolerance: float = 0.05) -> "PiecewiseLinear":
-        """Ramer-Douglas-Peucker style knot selection under an L-infinity tolerance."""
         values = list(values)
         if not values:
             return cls([], [], tolerance)
         knots_t, knots_v = [t_start], [float(values[0])]
         anchor = 0
         for i in range(1, len(values)):
-            # Keep a knot as soon as the straight line from the last one drifts too far.
             span = i - anchor
             if span < 2:
                 continue
@@ -186,7 +139,6 @@ class PiecewiseLinear:
         return cls(knots_t, knots_v, tolerance)
 
     def at(self, t: int) -> float:
-        """Interpolated value at any frame -- the "look up any moment" guarantee."""
         if not self.knots_t:
             return 0.0
         if t <= self.knots_t[0]:
@@ -218,7 +170,6 @@ class PiecewiseLinear:
 
 @dataclass
 class ProposalNode:
-    """Level-one node: everything produced for one proposal."""
 
     cid: str
     interval: Tuple[int, int]
@@ -256,7 +207,6 @@ CROSS_LINK_KINDS = ("baseline_continuity", "affect_shift", "mask_context")
 
 @dataclass
 class CrossLink:
-    """Relation between two proposals -- the global evolution line."""
 
     source: str
     target: str
@@ -269,7 +219,6 @@ class CrossLink:
 
 
 class EpisodicMemory:
-    """The per-video tree of appendix E.1."""
 
     def __init__(self, video_meta: VideoMeta, config: Optional[MemoryConfig] = None) -> None:
         self.config = config or MemoryConfig()
@@ -282,10 +231,7 @@ class EpisodicMemory:
         self.cross_links: List[CrossLink] = []
         self.narrative: Optional[Narrative] = None
 
-    # -- root ---------------------------------------------------------------
-
     def index_error_record(self, record: ErrorRecord) -> None:
-        """Store the full-video curve as a piecewise-linear index."""
         self.error_record = record
         tolerance = self.config.piecewise_linear_tol
         self.error_curve = PiecewiseLinear.fit(record.s_curve, record.t_start, tolerance)
@@ -299,11 +245,9 @@ class EpisodicMemory:
         }
 
     def baseline_at(self, t: int) -> float:
-        """``S_t`` anywhere in the video, including outside every proposal."""
         return self.error_curve.at(t) if self.error_curve else 0.0
 
     def outside_proposal_summary(self, padding: int = 0) -> List[Dict[str, Any]]:
-        """Segments not covered by any proposal -- the narrative's baseline material."""
         if not self.error_curve or not self.error_curve.knots_t:
             return []
         lo, hi = self.error_curve.knots_t[0], self.error_curve.knots_t[-1]
@@ -323,8 +267,6 @@ class EpisodicMemory:
             for a, b in gaps if b >= a
         ]
 
-    # -- proposals ----------------------------------------------------------
-
     def add_proposal(self, proposal: CandidateInterval) -> ProposalNode:
         node = ProposalNode(
             cid=proposal.cid, interval=(proposal.t_on, proposal.t_off),
@@ -340,14 +282,7 @@ class EpisodicMemory:
     def ordered_nodes(self) -> List[ProposalNode]:
         return sorted(self.proposals.values(), key=lambda n: n.interval[0])
 
-    # -- cross links --------------------------------------------------------
-
     def link_adjacent(self, shift_threshold: float = 0.5) -> List[CrossLink]:
-        """Connect consecutive proposals by baseline continuity or affect shift.
-
-        The offset belief of one proposal becomes the prior of the next, which is what
-        turns a list of independent detections into a single affective evolution line.
-        """
         nodes = self.ordered_nodes()
         links: List[CrossLink] = []
         for previous, current in zip(nodes, nodes[1:]):
@@ -374,8 +309,6 @@ class EpisodicMemory:
         self.cross_links = links
         return links
 
-    # -- serialisation ------------------------------------------------------
-
     def to_dict(self) -> Dict[str, Any]:
         return {
             "root": {
@@ -397,14 +330,8 @@ class EpisodicMemory:
         return target
 
 
-# ---------------------------------------------------------------------------
-# Semantic memory
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class CaseEntry:
-    """One archived reasoning fragment in the case library."""
 
     case_id: str
     dataset: str
@@ -413,7 +340,7 @@ class CaseEntry:
     emotion: str = ""
     content: str = ""
     quality: float = 0.5
-    kind: str = "support"           # support | confusion | counterexample | precedent
+    kind: str = "support"
     outcome: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -422,7 +349,6 @@ class CaseEntry:
 
 @dataclass
 class PrecedentEntry:
-    """Historical discriminative power of one check type, keyed by AU signature."""
 
     check_type: str
     au_signature: List[str]
@@ -432,7 +358,6 @@ class PrecedentEntry:
 
     @property
     def discriminative_power(self) -> float:
-        """Share of uses where the check actually surfaced a real problem."""
         return round(self.n_upheld / self.n_used, 4) if self.n_used else 0.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -450,11 +375,6 @@ def jaccard(a: Sequence[str], b: Sequence[str]) -> float:
 
 
 class SemanticMemory:
-    """Static knowledge bases plus the case and precedent libraries.
-
-    Case libraries are isolated *per dataset* and never contain reference ground truth
-    (appendix G.1), so retrieval cannot leak test-fold answers into a prediction.
-    """
 
     def __init__(self, config: Optional[MemoryConfig] = None,
                  store_path: Optional[Path | str] = None) -> None:
@@ -465,8 +385,6 @@ class SemanticMemory:
         if self.store_path and self.store_path.is_file():
             self.load(self.store_path)
 
-    # -- static -------------------------------------------------------------
-
     @staticmethod
     def au_knowledge() -> Dict[str, Any]:
         from ..knowledge.au_anatomy import knowledge_digest
@@ -476,8 +394,6 @@ class SemanticMemory:
     def emotion_knowledge(lang: str = "en") -> Dict[str, Any]:
         from ..knowledge.emotion_prototypes import knowledge_digest
         return knowledge_digest(lang)
-
-    # -- dynamic ------------------------------------------------------------
 
     def add_case(self, case: CaseEntry) -> CaseEntry:
         self.cases.append(case)
@@ -496,7 +412,6 @@ class SemanticMemory:
         return entry
 
     def best_checks(self, au_signature: Sequence[str], n: int = 3) -> List[PrecedentEntry]:
-        """Check types that historically discriminated best for a similar AU signature."""
         scored = [
             (jaccard(entry.au_signature, au_signature) * entry.discriminative_power, entry)
             for entry in self.precedents.values()
@@ -504,8 +419,6 @@ class SemanticMemory:
         scored = [(score, entry) for score, entry in scored if score > 0]
         scored.sort(key=lambda pair: -pair[0])
         return [entry for _score, entry in scored[:n]]
-
-    # -- persistence --------------------------------------------------------
 
     def save(self, path: Optional[Path | str] = None) -> Optional[Path]:
         target = Path(path) if path else self.store_path
@@ -528,17 +441,7 @@ class SemanticMemory:
             self.precedents[(entry.check_type, tuple(entry.au_signature))] = entry
 
 
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
-
-
 class CheckpointStore:
-    """SQLite checkpoint keyed by ``video_id`` (appendix D.2).
-
-    Persisting after every node execution buys three things the paper asks for: resume
-    after interruption, step-by-step replay for audit, and a human-in-the-loop pause.
-    """
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)

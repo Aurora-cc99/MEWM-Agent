@@ -1,17 +1,4 @@
-"""The MEGC evaluation channel: score every reference instruction, report by category.
-
-**Two spotting numbers, because "proposal" and "claim" are different objects.** The task
-statement scores the *proposal* against ground truth at IoU >= 0.5. That proposal comes
-from the frozen stage-I/II engines and involves no language model at all, so it is
-evaluated directly and is the paper-faithful number. What the policy *writes* when asked
-to localise is a second, weaker thing: prose that may agree or disagree with the engine
-that fed it. Both are reported, separately labelled, because collapsing them would let a
-fluent narrator take credit for a spotter's recall or hide a spotter's failure.
-
-**Nothing here is casme_sq-specific.** The router keys on the reference templates, which
-are shared across the corpora; the dataset name, video pool and reference file are all
-arguments.
-"""
+"""QA evaluation loop: answer correctness scoring for training feedback."""
 
 from __future__ import annotations
 
@@ -53,9 +40,6 @@ EVAL_SYSTEM_PROMPT = (
     "corpus contain no micro-expression at all. Do not invent an event to fill a field."
 )
 
-#: What each group must return. Deliberately per-group rather than one universal skeleton:
-#: asking for a "fine_label" on a counting question invites a fabricated emotion, and
-#: asking for prose on a counting question makes the integer harder to parse, not easier.
 _SKELETONS: Dict[str, str] = {
     GROUP_COUNT_EXPRESSION: '{"count": <integer>, "answer": "<one sentence>"}',
     GROUP_COUNT_MICRO: '{"count": <integer>, "answer": "<one sentence>"}',
@@ -108,14 +92,8 @@ _GROUP_HINTS: Dict[str, str] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class EvalItem:
-    """One reference instruction, ready to sample and score."""
 
     question_id: str
     question: str
@@ -128,7 +106,6 @@ class EvalItem:
     evidence_status: str
     anchor: Dict[str, int] = field(default_factory=dict)
     truth: Dict[str, Any] = field(default_factory=dict)
-    # filled in by sampling
     raw_text: str = ""
     product: Dict[str, Any] = field(default_factory=dict)
     error: str = ""
@@ -144,12 +121,6 @@ def build_eval_items(
     qa_rows: Iterable[Dict[str, Any]],
     evidence_by_video: Optional[Dict[str, VideoEvidence]] = None,
 ) -> Tuple[List[EvalItem], Dict[str, Any]]:
-    """Route every reference row and attach its evidence block.
-
-    Unlike the augmentation path nothing is filtered out here: a row whose video is
-    missing, or whose template is unrecognised, is *counted* in the routing report rather
-    than dropped, so the denominator of every metric is traceable back to 1178.
-    """
     evidence_by_video = evidence_by_video or {}
     by_key = {v.video_key: v for v in videos}
 
@@ -215,7 +186,6 @@ def build_eval_items(
 
 
 def _anchor_from_type_question(video: LongVideo, question: str) -> Dict[str, int]:
-    """A window for the type question, which names an ordinal but no frames."""
     from ..eval.megc_questions import event_ordinal
 
     ordinal = event_ordinal(question)
@@ -228,18 +198,11 @@ def _anchor_from_type_question(video: LongVideo, question: str) -> Dict[str, int
 
 
 def _type_of_event(event: Any, video: LongVideo) -> str:
-    """``"micro-expression"`` or ``"macro-expression"`` for an annotated event.
-
-    Read from the annotation via the video's own micro-event set rather than re-derived
-    from a duration threshold: the corpora do not all use the same cut-off, and inventing
-    one here would put this channel's ground truth out of step with the dataset's.
-    """
     micro = {tuple(e.interval) for e in video.micro_events()}
     return "micro-expression" if tuple(event.interval) in micro else "macro-expression"
 
 
 def build_user_prompt(item: EvalItem) -> str:
-    """Evidence, question, and the literal object shape the answer must take."""
     hint = _GROUP_HINTS.get(item.group, "")
     hint_block = f"\n{hint}\n" if hint else "\n"
     return (
@@ -249,11 +212,6 @@ def build_user_prompt(item: EvalItem) -> str:
         f"{_SKELETONS[item.group]}\n\n"
         "Output the JSON and nothing else."
     )
-
-
-# ---------------------------------------------------------------------------
-# Sampling
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -285,13 +243,6 @@ def sample_answers(
     caller: Optional[Callable[..., Any]] = None,
     progress: Optional[Callable[[int, int], None]] = None,
 ) -> EvalSamplingStats:
-    """Draw one answer per item, in place. ``k=1``: this measures, it does not search.
-
-    A failed call or an unparsable reply leaves ``product`` empty and records the reason.
-    Such an item still counts in its group's denominator -- as a parse failure, reported
-    separately -- because dropping it would turn every metric into a metric over
-    "questions the policy happened to answer in the required shape".
-    """
     from .api_sampler import extract_product
 
     stats = EvalSamplingStats()
@@ -307,7 +258,7 @@ def sample_answers(
                             reasoning_effort=reasoning_effort or None)
             text = getattr(response, "text", str(response))
             latency = float(getattr(response, "latency_s", 0.0) or 0.0)
-        except Exception as exc:  # noqa: BLE001 - recorded on the item, not swallowed
+        except Exception as exc:
             with lock:
                 stats.n_calls += 1
                 stats.n_failed_calls += 1
@@ -338,13 +289,7 @@ def sample_answers(
     return stats
 
 
-# ---------------------------------------------------------------------------
-# Scoring
-# ---------------------------------------------------------------------------
-
-
 def _pred_text(item: EvalItem) -> str:
-    """The prose the policy produced, for BLEU/ROUGE."""
     answer = item.product.get("answer")
     if isinstance(answer, str) and answer.strip():
         return answer.strip()
@@ -352,7 +297,6 @@ def _pred_text(item: EvalItem) -> str:
 
 
 def _score_counts(items: Sequence[EvalItem]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """MAE/RMSE per counted quantity, plus a parse-failure tally."""
     quantity_of = {GROUP_COUNT_EXPRESSION: "expression", GROUP_COUNT_MICRO: "micro",
                    GROUP_COUNT_MACRO: "macro"}
     pairs: Dict[str, List[Tuple[float, float]]] = {q: [] for q in mm.COUNT_QUANTITIES}
@@ -382,23 +326,8 @@ def _score_spotting(
     videos: Sequence[LongVideo],
     iou_threshold: float,
 ) -> Dict[str, Any]:
-    """Spotting scored twice: the engine's proposals, and the policy's written claims.
-
-    The engine number is the one the task statement describes -- proposal against ground
-    truth at IoU >= 0.5 -- and it needs no language model. The policy number says whether
-    the narrative agrees with the engine that produced it.
-    """
     by_key = {v.video_key: v for v in videos}
 
-    # -- the engine's proposals, once per video (not once per question) --------
-    # Scored *by expression type*. The spotter's micro-scale proposal set is capped at
-    # ``max_micro_seconds`` (15 frames at 30 fps), so a 15-frame proposal cannot reach
-    # IoU >= 0.5 against an 85-frame macro-expression however well placed it is. Pooling
-    # the two would therefore charge the micro spotter a false positive for every macro
-    # event in the corpus and report a precision that measures the type mismatch rather
-    # than the spotter. The task statement is explicit that the comparison is
-    # micro-proposal against micro ground truth; the engine's separate macro interval set
-    # is scored against macro ground truth, and a pooled view is reported alongside.
     micro_rows: List[Dict[str, Any]] = []
     macro_rows: List[Dict[str, Any]] = []
     combined_rows: List[Dict[str, Any]] = []
@@ -436,7 +365,6 @@ def _score_spotting(
             "truth_labels": [str(e.fine_label or "") for e in video.events],
         })
 
-    # -- what the policy wrote, per localisation question ----------------------
     policy_by_scope: Dict[str, List[Dict[str, Any]]] = {}
     parse_failures: Dict[str, int] = {}
     for item in items:
@@ -454,8 +382,6 @@ def _score_spotting(
             predicted = parse_intervals(item.product.get("events")) or []
             if not predicted:
                 predicted = parse_intervals(_pred_text(item))
-        # A missing or empty answer is a claim of nothing: recall is charged, precision
-        # is not, which is the correct treatment of silence.
         policy_by_scope[scope].append({
             "video": item.video,
             "proposals": [p["interval"] for p in predicted],
@@ -509,7 +435,6 @@ def _score_spotting(
 
 
 def _score_au(items: Sequence[EvalItem]) -> Dict[str, Any]:
-    """F1_AU / Jaccard_AU over the whole-video AU inventory."""
     predicted: List[Sequence[str]] = []
     truth: List[Sequence[str]] = []
     unmapped_pred: Dict[str, int] = {}
@@ -539,8 +464,6 @@ def _score_au(items: Sequence[EvalItem]) -> Dict[str, Any]:
     scores = mm.au_scores(predicted, truth)
     scores["n_questions"] = len(truth)
     scores["unparsed_predictions"] = parse_failures
-    # Reported, not discarded: an unmapped vocabulary and a wrong AU are different
-    # failures, and a set metric cannot tell them apart on its own.
     scores["unmapped_names"] = {
         "in_predictions": dict(sorted(unmapped_pred.items(), key=lambda kv: -kv[1])),
         "in_reference": dict(sorted(unmapped_truth.items(), key=lambda kv: -kv[1])),
@@ -549,12 +472,6 @@ def _score_au(items: Sequence[EvalItem]) -> Dict[str, Any]:
 
 
 def _score_type_binary(items: Sequence[EvalItem]) -> Dict[str, Any]:
-    """MEGC2026 sec. C's ME-vs-MaE binary task, reported as UF1 and UAR.
-
-    This is the documentary basis for SpotUF1/SpotUAR: the challenge scores expression
-    *type* as a two-class problem with the unweighted pair, so the same convention is
-    applied here to the question that asks for exactly that.
-    """
     pairs: List[Tuple[str, str]] = []
     parse_failures = 0
     no_truth = 0
@@ -581,8 +498,6 @@ def _score_type_binary(items: Sequence[EvalItem]) -> Dict[str, Any]:
     y_true = [p[0] for p in pairs]
     y_pred = [p[1] for p in pairs]
     scores = dict(mm._emotion_pair(y_true, y_pred, mm.EXPRESSION_TYPES, "expression_type"))
-    # The shared helper names its outputs for the emotion task; this group is the
-    # localisation-side pair, so the same numbers are surfaced under the spotting names.
     if "reg_uf1" in scores:
         scores["spot_uf1"] = scores.pop("reg_uf1")
         scores["spot_uar"] = scores.pop("reg_uar")
@@ -594,7 +509,6 @@ def _score_type_binary(items: Sequence[EvalItem]) -> Dict[str, Any]:
 
 
 def _score_event_recognition(items: Sequence[EvalItem]) -> Dict[str, Any]:
-    """RegUF1/RegUAR over emotion classes, plus BLEU/ROUGE-1 on the description."""
     fine_true: List[str] = []
     fine_pred: List[str] = []
     candidates: List[str] = []
@@ -617,8 +531,6 @@ def _score_event_recognition(items: Sequence[EvalItem]) -> Dict[str, Any]:
             fine_true.append(gold)
             fine_pred.append("")
             continue
-        # Passed through raw: ``recognition_scores`` canonicalises both sides itself, and
-        # doing it twice here would hide which side was out of vocabulary.
         fine_true.append(gold)
         fine_pred.append(str(item.product.get("fine_label") or ""))
 
@@ -638,8 +550,6 @@ def _score_video_strs(
     videos: Sequence[LongVideo],
     iou_threshold: float,
 ) -> Dict[str, Any]:
-    """STRS on the whole-video answers, plus BLEU/ROUGE-1 on the narrative.
-    """
     by_key = {v.video_key: v for v in videos}
     rows: List[Dict[str, Any]] = []
     candidates: List[str] = []
@@ -681,10 +591,6 @@ def _score_video_strs(
             except (TypeError, ValueError):
                 continue
             proposals.append(interval)
-            # ``was_recognised`` is kept, not discarded: an unrecognised free-form label
-            # folds to ``other``, and a truth label of ``other`` would then "match" it.
-            # That is exactly how a fluent but uninformative label inflates a score, so a
-            # fold is recorded as no label at all.
             label, recognised = canonical_fine_label(
                 str(entry.get("fine_label") or ""))
             claimed_labels.append(label if recognised else "")
@@ -699,11 +605,6 @@ def _score_video_strs(
             "truth_labels": [str(e.fine_label or "") for e in truth_events],
         })
 
-        # F1_a's numerator: of the intervals that matched at IoU >= threshold, how many
-        # also carried the right emotion.
-        # ``_greedy_pairs`` returns every overlapping pair and leaves the threshold to
-        # its caller, so the IoU floor is applied here: an emotion attached to an
-        # interval that never reached IoU >= threshold is not a recognition success.
         for pred_i, truth_i, overlap in mm._greedy_pairs(proposals, truth,
                                                          iou_threshold):
             if overlap < iou_threshold:
@@ -740,7 +641,6 @@ def score_items(
     evidence_by_video: Dict[str, VideoEvidence],
     iou_threshold: float = mm.DEFAULT_IOU_THRESHOLD,
 ) -> Dict[str, Any]:
-    """The full MEGC table, grouped the way the task statement groups it."""
     counting, counting_failures = _score_counts(items)
     return {
         "localisation": {
@@ -765,18 +665,12 @@ def score_items(
     }
 
 
-# ---------------------------------------------------------------------------
-# Per-subject view and the report
-# ---------------------------------------------------------------------------
-
-
 def by_subject(
     items: Sequence[EvalItem],
     videos: Sequence[LongVideo],
     evidence_by_video: Dict[str, VideoEvidence],
     iou_threshold: float = mm.DEFAULT_IOU_THRESHOLD,
 ) -> Dict[str, Any]:
-    """The same table computed per subject, so a LOSO reader can see the spread."""
     by_key = {v.video_key: v for v in videos}
     subjects: Dict[str, List[EvalItem]] = {}
     for item in items:
@@ -813,7 +707,6 @@ def build_report(
     iou_threshold: float = mm.DEFAULT_IOU_THRESHOLD,
     include_per_subject: bool = True,
 ) -> Dict[str, Any]:
-    """The JSON written next to the augmented QA set."""
     parse_by_group: Dict[str, Dict[str, int]] = {}
     for item in items:
         row = parse_by_group.setdefault(item.group, {"n": 0, "unparsed": 0})
@@ -846,12 +739,6 @@ def build_report(
 
 
 def write_predictions(items: Sequence[EvalItem], path: Path) -> Path:
-    """One JSONL row per question: what was asked, answered, and scored.
-
-    Without this the metrics JSON is a table of numbers with no way to check any of them.
-    A reader who doubts a score can find the question, the reference answer, the raw
-    completion and the value the parser extracted, and settle it.
-    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -877,18 +764,12 @@ def write_predictions(items: Sequence[EvalItem], path: Path) -> Path:
 
 
 def write_report(report: Dict[str, Any], path: Path) -> Path:
-    """Write the metrics JSON, creating parents."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str),
                     encoding="utf-8")
     LOGGER.info("wrote MEGC metrics to %s", path)
     return path
-
-
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
 
 
 def run_evaluation(
@@ -909,12 +790,6 @@ def run_evaluation(
     caller: Optional[Callable[..., Any]] = None,
     include_per_subject: bool = True,
 ) -> Dict[str, Any]:
-    """Perceive, sample every routed instruction once, score, write.
-
-    ``evidence_by_video`` lets a caller that has just finished an augmentation sweep hand
-    over the perception it already paid for; otherwise it is loaded from ``cache_root`` or
-    recomputed.
-    """
     config = config or load_config()
     started = time.time()
 
@@ -936,8 +811,6 @@ def run_evaluation(
 
     items, routing = build_eval_items(dataset, videos, qa_rows, evidence_by_video)
     if max_questions and len(items) > max_questions:
-        # A smoke-run switch. Recorded, because a truncated pool changes every
-        # denominator and must never read as full coverage.
         routing["truncated_to"] = max_questions
         routing["truncation_note"] = (
             "max_questions was set: this report covers a prefix of the routed pool and "

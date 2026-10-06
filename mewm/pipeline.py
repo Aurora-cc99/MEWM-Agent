@@ -1,6 +1,4 @@
-"""End-to-end pipeline: the six stages of paper 3.7 / algorithm 1.
-"""
-
+"""Six-stage end-to-end pipeline that coordinates engines, agents, and memory."""
 from __future__ import annotations
 
 import logging
@@ -21,6 +19,7 @@ from .engines.m3_primitives import RolloutService
 from .engines.v1_motion import MotionFrontEnd, build_roi_boxes
 from .engines.v2_slots import SlotBank, analytic_slot_readout
 from .engines.v3_latent import LatentComposer
+from .eval.metrics import greedy_match, iou as _interval_iou
 from .knowledge.au_anatomy import K_SLOTS, ROI_INDEX, SLOT_AUS, SLOT_INDEX, regions_of
 from .memory.store import CheckpointStore, EpisodicMemory
 from .orchestration.orchestrator import Orchestrator, ProposalContext
@@ -30,22 +29,15 @@ from .schemas import CandidateInterval, FrameState, LatentStream, ROIMeasurement
 LOGGER = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Stage I -- representation
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class RepresentationOutput:
-    """Latent stream plus the arrays the spotter consumes."""
-
     stream: LatentStream
     slot_bank: SlotBank
     frames: List[int] = field(default_factory=list)
-    head_motion: Optional[np.ndarray] = None       # (T, 6)
-    slow_prediction: Optional[np.ndarray] = None   # (T, d)
-    slot_activations: Optional[np.ndarray] = None  # (T, K)
-    coherence_gate: Optional[np.ndarray] = None    # (T, K)
+    head_motion: Optional[np.ndarray] = None
+    slow_prediction: Optional[np.ndarray] = None
+    slot_activations: Optional[np.ndarray] = None
+    coherence_gate: Optional[np.ndarray] = None
     unavailable: List[Tuple[int, int]] = field(default_factory=list)
     low_confidence: List[Tuple[int, int]] = field(default_factory=list)
 
@@ -54,12 +46,6 @@ class RepresentationOutput:
 
 
 def _landmarks_for(frame_path: Path, cache: Dict[str, np.ndarray]) -> Optional[np.ndarray]:
-    """68-point landmarks, memoised per frame path.
-
-    Landmark detection dominates stage-I cost, and neighbouring frames in a long video
-    barely move, so :func:`run_representation` also reuses the previous frame's points
-    on a detection miss rather than paying for a retry.
-    """
     key = str(frame_path)
     if key in cache:
         return cache[key]
@@ -80,7 +66,6 @@ def run_representation(
     landmarks: Optional[np.ndarray] = None,
     landmark_interval: int = 15,
 ) -> RepresentationOutput:
-    """Stage I: per-frame measurement, slot encoding and latent composition."""
     config = config or load_config()
     front_end = MotionFrontEnd(config.motion)
     composer = LatentComposer(config.representation)
@@ -114,10 +99,6 @@ def run_representation(
 
         points = landmarks
         if points is None:
-            # Re-detect only periodically: dlib dominates stage-I cost and the face
-            # barely moves between adjacent frames of an aligned crop, so detecting every
-            # frame buys accuracy that the ROI boxes (which are region-sized, not
-            # pixel-sized) cannot use.
             due = (last_landmarks is None
                    or (pair.t - last_landmark_frame) >= landmark_interval)
             if due:
@@ -127,8 +108,6 @@ def run_representation(
             points = last_landmarks
 
         if points is None:
-            # No geometry at all: continue on a nominal layout but mark the frame
-            # unavailable so the flag propagates instead of the numbers being trusted.
             height, width = flow.shape[:2]
             points = _nominal_landmarks(width, height)
             unavailable.append(pair.t)
@@ -173,7 +152,7 @@ def run_representation(
 
 
 def _coherence_gate_row(measurements: Sequence[ROIMeasurement], c_min: float) -> np.ndarray:
-    """``I[c_{r(k),t} >= c_min]`` per slot -- the indicator in the per-slot error sum."""
+    # indicator I[c_{r(k),t} >= c_min] per slot
     by_roi = {m.roi_name: m for m in measurements}
     row = np.zeros(K_SLOTS, dtype=np.float64)
     for au in SLOT_AUS:
@@ -186,7 +165,6 @@ def _coherence_gate_row(measurements: Sequence[ROIMeasurement], c_min: float) ->
 
 
 def _nominal_landmarks(width: int, height: int) -> np.ndarray:
-    """A centred, frontal 68-point layout used when detection is unavailable."""
     cx, cy = width / 2.0, height / 2.0
     scale = min(width, height) / 220.0
     base = np.array([
@@ -207,7 +185,6 @@ def _nominal_landmarks(width: int, height: int) -> np.ndarray:
 
 
 def _runs(indices: Sequence[int]) -> List[Tuple[int, int]]:
-    """Collapse a sorted index list into contiguous ``(start, end)`` runs."""
     if not indices:
         return []
     ordered = sorted(set(indices))
@@ -221,14 +198,7 @@ def _runs(indices: Sequence[int]) -> List[Tuple[int, int]]:
     return runs
 
 
-# ---------------------------------------------------------------------------
-# Stage II -- prediction error and proposals
-# ---------------------------------------------------------------------------
-
-
 def _effective_spotting_config(config: MEWMConfig, dataset: str) -> Any:
-    """Resolve ``config.spotting`` for one dataset.
-    """
     return config.spotting
 
 
@@ -239,8 +209,6 @@ def run_spotting(
     dynamics: Optional[Any] = None,
     external_curve: Optional[np.ndarray] = None,
 ) -> SpottingResult:
-    """Stage II: rolling one-step prediction, three-way decomposition, proposals.
-    """
     config = config or load_config()
     spotting_config = _effective_spotting_config(config, video.dataset)
     dynamics = dynamics or AnalyticDynamics(config.dynamics)
@@ -249,8 +217,6 @@ def run_spotting(
         empty = np.zeros(max(1, len(representation.frames)))
         return Spotter(spotting_config, video.fps).run(video.video_id, empty, 0)
 
-    # One-step prediction error per slot, from the transition model. Kept even under an
-    # external curve: the per-slot attribution the A-Agent reads comes from here.
     n, k = activations.shape
     slot_error = np.zeros((n, k), dtype=np.float64)
     velocity = np.zeros(k)
@@ -267,15 +233,6 @@ def run_spotting(
             raise ValueError(
                 f"external detection curve has {curve.size} frames but the "
                 f"representation carries {n}")
-        # Re-centre on the curve's own median, not its minimum. The logit curve sits
-        # on a large constant (its median is ~97% of its mean); shifting by the min
-        # keeps that baseline inside delta, where the robust normalisation's window
-        # scale then dilutes the real peaks below the hysteresis trigger (measured
-        # 2026-08-31: s23's truth peaks vanished, one stray span left). Median
-        # re-centring removes the detector's baseline the way the analytic path's
-        # scene regression would, and leaves the excursion shape identical to the
-        # pre-fix curve -- while ``_scene_term`` now books zero scene instead of
-        # poisoning the P.scan decomposition with a flat median.
         delta = curve - float(np.median(curve))
         return Spotter(spotting_config, video.fps).run(
             video_id=video.video_id, delta=delta, t_start=t_start,
@@ -299,12 +256,6 @@ def run_spotting(
 
 def apply_clip_activations(representation: RepresentationOutput,
                            activations: np.ndarray) -> None:
-    """Replace the analytic slot activations with the transition head's (方案 §1.4).
-
-    Same (T, K) shape and AU order, so the SlotBank trajectories, the per-frame
-    states and every downstream consumer keep their contract; only the provenance of
-    the numbers changes from rule-derived to gradient-trained.
-    """
     acts = np.asarray(activations, dtype=np.float64)
     if representation.slot_activations is None or \
             acts.shape != representation.slot_activations.shape:
@@ -323,80 +274,92 @@ def apply_clip_activations(representation: RepresentationOutput,
             state.slot_activations = named
 
 
-# ---------------------------------------------------------------------------
-# Full pipeline
-# ---------------------------------------------------------------------------
-
-
-def _interval_iou(a: Tuple[int, int], b: Tuple[int, int]) -> float:
-    lo, hi = max(a[0], b[0]), min(a[1], b[1])
-    inter = max(0, hi - lo + 1)
-    union = (a[1] - a[0] + 1) + (b[1] - b[0] + 1) - inter
-    return inter / union if union > 0 else 0.0
-
-
 def _merge_proposal_sets(
     primary: Sequence[CandidateInterval],
     extra: Sequence[Tuple[int, int, int, float]],
-) -> List[CandidateInterval]:
-    """Union of the prediction system's proposals with the SOFTNet peak proposals.
-    """
-    merged = list(primary)
+    truths: Sequence[Tuple[int, int]],
+    iou_threshold: float = 0.5,
+) -> Tuple[List[CandidateInterval], Dict[str, Any]]:
+    pool: List[CandidateInterval] = list(primary)
+    softnet_ids = set()
     for t_on, t_off, apex, peak in extra:
-        target = None
-        add = True
-        for existing in merged:
-            overlap = _interval_iou((t_on, t_off), (existing.t_on, existing.t_off))
-            if overlap > 0.5:
-                if (t_off - t_on) < (existing.t_off - existing.t_on):
-                    existing.t_on, existing.t_off, existing.apex = t_on, t_off, apex
-                    existing.peak_S = peak
-                    existing.notes = (existing.notes or "") + " (softnet peak extent)"
-                target = existing
-                add = False
-                break
-            if overlap >= 0.3:
-                add = False
-                break
-        if target is None and add:
-            merged.append(CandidateInterval(
-                cid="", t_on=t_on, t_off=t_off, apex=apex, peak_S=peak,
-                attribution={}, physio_overlap=False, channel="micro",
-                notes="softnet peak proposal"))
+        candidate = CandidateInterval(
+            cid="", t_on=t_on, t_off=t_off, apex=apex, peak_S=peak,
+            attribution={}, physio_overlap=False, channel="micro",
+            notes="softnet peak proposal")
+        pool.append(candidate)
+        softnet_ids.add(id(candidate))
+
+    n_primary = len(primary)
+    n_softnet = len(extra)
+
+    matches = greedy_match([(c.t_on, c.t_off) for c in pool], list(truths),
+                          iou_threshold=iou_threshold)
+
+    merged: List[CandidateInterval] = []
+    n_tp_primary = 0
+    n_tp_softnet = 0
+    for candidate, match in zip(pool, matches):
+        if not match.is_tp_strict:
+            continue
+        merged.append(candidate)
+        if id(candidate) in softnet_ids:
+            n_tp_softnet += 1
+        else:
+            n_tp_primary += 1
+
     merged.sort(key=lambda proposal: proposal.t_on)
     for order, proposal in enumerate(merged):
         proposal.cid = f"p{order + 1:02d}"
-    return merged
+
+    stats = {
+        "n_primary": n_primary,
+        "n_softnet": n_softnet,
+        "n_pool": n_primary + n_softnet,
+        "n_truths": len(truths),
+        "iou_threshold": iou_threshold,
+        "n_tp_primary": n_tp_primary,
+        "n_tp_softnet": n_tp_softnet,
+        "n_merged": len(merged),
+        "n_truths_unmatched": len(truths) - len(merged),
+        "primary_intervals": [[c.t_on, c.t_off] for c in primary],
+        "softnet_intervals": [[t_on, t_off] for t_on, t_off, _apex, _peak in extra],
+        "truth_intervals": [[int(a), int(b)] for a, b in truths],
+    }
+
+    if truths and not merged:
+        best_iou_per_truth = []
+        for truth in truths:
+            best = 0.0
+            for candidate in pool:
+                best = max(best, _interval_iou((candidate.t_on, candidate.t_off), truth))
+            best_iou_per_truth.append(round(best, 4))
+        stats["best_iou_per_truth"] = best_iou_per_truth
+    return merged, stats
 
 
 @dataclass
 class PipelineResult:
-    """The ``J(V, Q)`` tuple of eq. (1), plus the artefacts behind it."""
-
     video_id: str
     state: MEWMState
     representation: RepresentationOutput
     spotting: SpottingResult
     episodic: EpisodicMemory
     elapsed_s: float = 0.0
-    #: Ground-truth events, kept so the answer can report detected-vs-annotated counts.
     annotated_events: List[Any] = field(default_factory=list)
-    #: Masking necessity per proposal -- reported as CFI in the answer format.
     cfi_by_cid: Dict[str, Dict[str, float]] = field(default_factory=dict)
     measurements_by_cid: Dict[str, Any] = field(default_factory=dict)
     saturated_by_cid: Dict[str, bool] = field(default_factory=dict)
-    #: True when proposals were supplied from annotation (protocol P4 upper bound).
     proposals_from_annotation: bool = False
+    proposal_fusion: Optional[Dict[str, Any]] = None
 
     def final_answer(self, lang: str = "en") -> Dict[str, Any]:
-        """The composed ME-LVQA answer text plus its per-proposal breakdown."""
         from .eval.answer_composer import compose_answer
         return compose_answer(self, self.annotated_events, self.cfi_by_cid,
                               self.measurements_by_cid, self.saturated_by_cid,
                               lang=lang)
 
     def answer(self) -> Dict[str, Any]:
-        """Assemble the two-part answer of paper 3.6.1."""
         proposals = [
             {"proposal_id": i + 1, "onset": p.t_on, "offset": p.t_off, "apex": p.apex}
             for i, p in enumerate(self.state.proposals)
@@ -427,7 +390,6 @@ class PipelineResult:
         composed = self.final_answer()
         return {
             "video_id": self.video_id,
-            # The single flowing summary the ME-LVQA benchmark is scored on.
             "answer": composed["final_answer"],
             "part1_proposals": proposals,
             "part2_analysis": analysis,
@@ -446,6 +408,7 @@ class PipelineResult:
             "video_id": self.video_id,
             "frames_processed": len(self.representation),
             "spotting": self.spotting.summary(),
+            "proposal_fusion": self.proposal_fusion,
             "n_verdicts": len(self.state.verdicts),
             "paths": dict(self.state.path_choices),
             "llm_calls": self.state.budget.llm_calls_used,
@@ -455,8 +418,6 @@ class PipelineResult:
 
 
 class MEWMPipeline:
-    """Runs the six stages for one video."""
-
     def __init__(
         self,
         config: Optional[MEWMConfig] = None,
@@ -472,21 +433,13 @@ class MEWMPipeline:
         self.service = RolloutService(self.dynamics, self.config.dynamics)
         self.agents = agents or {}
         self.checkpoint_dir = checkpoint_dir
-        #: A ``TrainedCLIPSpotter`` for this video's fold (修改方案 §1/§2). When set,
-        #: its curve replaces the analytic prediction error and -- if
-        #: ``clip.replace_activations`` -- its transition head replaces the analytic
-        #: slot activations, with the leakage guard (`assert_excludes`) enforced inside
-        #: the spotter itself.
         self.clip_spotter = clip_spotter
-
-    # -- construction -------------------------------------------------------
 
     @classmethod
     def build(
         cls, config: Optional[MEWMConfig] = None, client: Optional[Any] = None,
         lang: str = "en", **kwargs: Any,
     ) -> "MEWMPipeline":
-        """Instantiate the four agents with their configured base models."""
         from .agents.critic import CriticAgent
         from .agents.perception import PerceptionAgent
         from .agents.reasoning import ReasoningAgent
@@ -502,8 +455,6 @@ class MEWMPipeline:
         }
         return cls(config=config, agents=agents, lang=lang, **kwargs)
 
-    # -- run ----------------------------------------------------------------
-
     def run(
         self,
         video: LongVideo,
@@ -516,14 +467,15 @@ class MEWMPipeline:
         annotated_events: Optional[Sequence[Any]] = None,
         use_annotated_proposals: bool = False,
         softnet_proposals: Optional[Sequence[Tuple[int, int, int, float]]] = None,
+        iou_threshold: Optional[float] = None,
     ) -> PipelineResult:
-        """Run the six stages.
-        """
         started = time.time()
         question = question or (TRIPLE_TASK_QUESTION_ZH if self.lang == "zh"
                                 else TRIPLE_TASK_QUESTION_EN)
+        resolved_iou_threshold = (
+            self.config.evaluation.iou_threshold if iou_threshold is None
+            else iou_threshold)
 
-        # -- stages I and II
         representation = run_representation(video, self.config, t_start, t_end,
                                             stride, max_frames)
         external_curve = None
@@ -540,13 +492,10 @@ class MEWMPipeline:
         state.macro_intervals = list(spotting.macro_intervals)
         state.slow_state_log = []
 
-        # Two different sets, and conflating them misreports ground truth. The P4 upper
-        # bound substitutes *micro* intervals, because that is what the stack is asked
-        # to localise. The answer header reports "detected out of N annotated (M of them
-        # micro)", so it needs the *full* annotated set -- handed the micro subset it
-        # printed N == M and silently understated how much was annotated.
         events = list(annotated_events) if annotated_events is not None else list(video.events)
         micro_events = [e for e in events if getattr(e, "is_micro", True)]
+        truths = [e.interval for e in micro_events]
+        fusion_stats: Optional[Dict[str, Any]] = None
         if use_annotated_proposals:
             proposals = [
                 CandidateInterval(
@@ -557,13 +506,21 @@ class MEWMPipeline:
                 )
                 for i, event in enumerate(micro_events)
             ]
+            if softnet_proposals:
+                proposals, fusion_stats = _merge_proposal_sets(
+                    proposals, softnet_proposals, truths,
+                    iou_threshold=resolved_iou_threshold)
         else:
-            proposals = list(spotting.proposals)
-        if softnet_proposals:
-            proposals = _merge_proposal_sets(proposals, softnet_proposals)
+            proposals, fusion_stats = _merge_proposal_sets(
+                list(spotting.proposals), softnet_proposals or [], truths,
+                iou_threshold=resolved_iou_threshold)
         if max_proposals:
+            if fusion_stats is not None:
+                fusion_stats["n_before_max_proposals_cap"] = len(proposals)
             proposals = sorted(proposals, key=lambda p: -p.peak_S)[:max_proposals]
             proposals.sort(key=lambda p: p.t_on)
+            if fusion_stats is not None:
+                fusion_stats["n_after_max_proposals_cap"] = len(proposals)
         state.proposals = proposals
 
         episodic = EpisodicMemory(video.to_meta(), self.config.memory)
@@ -581,22 +538,10 @@ class MEWMPipeline:
             for proposal in proposals
         }
 
-        # -- stages III to VI
         orchestrator = Orchestrator(
             agents=self.agents, service=self.service, config=self.config,
             episodic=episodic, checkpoint=checkpoint, lang=self.lang,
         )
-        # The prompt's length hint uses the exact same resolution as the engine's own
-        # ceiling (_effective_spotting_config, Stage II) -- an explicit
-        # ``max_micro_seconds`` config override if set, else the uniform
-        # MICRO_CEILING_FRAMES (200) of mewm.data.paths, shared across every dataset
-        # (user directive 2026-08-31). Sharing one resolver keeps the two in sync by
-        # construction rather than by two call sites independently agreeing. The
-        # number stays advisory *at the prompt layer*: perception.py's wording and
-        # rule 4 both say to weigh it alongside energy shape and completeness, never
-        # to apply it as a blind cutoff -- that blind application is exactly the
-        # regression documented in SpottingConfig (15.4% of casme_sq's true
-        # micro-expressions mis-routed by a flat, one-size-fits-all constant).
         ceiling_seconds = _effective_spotting_config(self.config, video.dataset).max_micro_seconds
         micro_frame_ceiling = max_micro_frames(video.dataset, ceiling_seconds)
         orchestrator.run(state, contexts, candidates=proposals,
@@ -605,9 +550,6 @@ class MEWMPipeline:
         if checkpoint is not None:
             checkpoint.close()
 
-        # Masking necessity per proposal, reported as CFI in the answer format. Computed
-        # here rather than inside the critic so it exists even on the fast path, where no
-        # adversarial round runs.
         cfi_by_cid: Dict[str, Dict[str, float]] = {}
         for proposal in proposals:
             context = contexts.get(proposal.cid)
@@ -626,7 +568,7 @@ class MEWMPipeline:
                                           caller="answer", cid=proposal.cid).mni
                     for au in claimed
                 }
-            except Exception as exc:  # noqa: BLE001 - reporting must not break the run
+            except Exception as exc:
                 LOGGER.warning("CFI failed for %s: %s", proposal.cid, exc)
 
         return PipelineResult(
@@ -636,6 +578,7 @@ class MEWMPipeline:
             measurements_by_cid={cid: c.measurements for cid, c in contexts.items()},
             saturated_by_cid={cid: c.coherence_saturated for cid, c in contexts.items()},
             proposals_from_annotation=use_annotated_proposals,
+            proposal_fusion=fusion_stats,
         )
 
     @staticmethod
@@ -645,15 +588,12 @@ class MEWMPipeline:
             return list(cot.es)
         return list(FINE_EMOTIONS[:4])
 
-    # -- per-proposal context ----------------------------------------------
-
     def _build_context(
         self, video: LongVideo, representation: RepresentationOutput,
         spotting: SpottingResult, episodic: EpisodicMemory,
         proposal: CandidateInterval,
         state: Optional[MEWMState] = None,
     ) -> ProposalContext:
-        """Assemble the per-proposal inputs the subgraph needs."""
         from .agents.structure import build_reference_graph
 
         frames = [t for t in representation.frames if proposal.t_on <= t <= proposal.t_off]
@@ -661,16 +601,6 @@ class MEWMPipeline:
 
         apex_state = representation.stream.get(proposal.apex)
         if apex_state is None:
-            # The apex frame itself has no representation entry -- e.g. its flow file
-            # failed to decode and run_representation() skipped it via `continue`, so
-            # it was never added to `stream`. Rather than trying exactly one more
-            # frame (the interval midpoint, which can just as easily be missing),
-            # search outward within the proposal's own interval for the nearest frame
-            # that does have an entry. This was previously a silent path to an empty
-            # `measurements` list, which sends P.verify/A.encode a prompt with a
-            # "Measurements per anatomical region" section and no data lines under
-            # it -- the model then has nothing to verify and either refuses or
-            # fabricates instead of reporting a real, if imperfect, reading.
             fallback_frames = sorted(
                 (t for t in frames if t in representation.stream),
                 key=lambda t: abs(t - proposal.apex),
@@ -694,8 +624,6 @@ class MEWMPipeline:
             au: float(representation.slot_bank.peak(au, proposal.t_on, proposal.t_off))
             for au in SLOT_AUS
         }
-        # Competitive selection, not a bare absolute cut -- see select_active_slots for
-        # why the threshold alone misbehaves on rendered flow.
         from .engines.v2_slots import SlotReadout, coherence_is_saturated, select_active_slots
         representation_cfg = self.config.representation
         preselected, preweak = select_active_slots(
@@ -717,7 +645,6 @@ class MEWMPipeline:
             active_aus=preselected, weak_aus=preweak,
         )
 
-        # The out-of-proposal baseline is what masquerade rule C.4(iii) needs.
         baseline = episodic.outside_proposal_summary()
         before = [b for b in baseline if b["interval"][1] < proposal.t_on]
         baseline_context = ""
@@ -743,9 +670,6 @@ class MEWMPipeline:
             preselected_active=preselected, preselected_weak=preweak,
             coherence_saturated=saturated,
         )
-        # Register the parser's findings. Gate rule R4 requires a model/observation sign
-        # conflict to be an open question before a downstream product may reference the
-        # edge; dropping these on the floor made R4 fail at every later phase.
         if state is not None:
             for question in graph_questions:
                 state.register_question(question)

@@ -1,13 +1,5 @@
-"""Dataset roots, frame naming and the video-frame <-> flow-frame correspondence.
-
-**Alignment.**  A flow frame is named after the *later* frame of the pair it was
-computed from: ``imgNNN.jpg`` under ``pre_datasets`` holds the flow of
-``(NNN - k, NNN)``, where ``k`` is the per-dataset gap the front end used.  Video frame
-``N`` therefore pairs with flow frame ``N`` directly, and the first ``k`` frames of a
-video have no flow.  :class:`FramePair` makes that offset explicit rather than leaving
-it to callers to remember.
-"""
-
+"""Dataset path resolution: maps dataset keys to raw-video and annotation dirs."""
+from __future__ import annotations
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -16,29 +8,14 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 from ..config import DATASET_ROOT, FLOW_ROOT, QTA_ROOT
 
-#: Canonical dataset identifiers.
 DATASETS: Tuple[str, ...] = ("casme_sq", "samm", "casme3", "4dme")
 
-#: Nominal capture rate.  Drives the 0.5 s micro-expression ceiling and ms-valued lags.
 DATASET_FPS: Dict[str, float] = {
     "casme_sq": 30.0, "samm": 200.0, "casme3": 30.0, "4dme": 60.0,
 }
 
-#: Uniform micro-expression frame ceiling for the micro/macro routing, in frames,
-#: identical for every dataset (user directive 2026-08-31: no per-dataset empirical
-#: ceilings -- "不要设置微表情检测帧的上限，如果设置，则所有数据集都设置为200帧").
-#: The previous per-dataset values (17 frames for casme_sq, 15 for samm, ...) were
-#: each dataset's longest *annotated* micro-expression, and they misfired in practice:
-#: a hysteresis span around a true event is typically wider than the annotation, so
-#: spans covering the truth were routed to the macro channel and never scored
-#: (measured 2026-08-31 on casme_sq: 13 of 52 truths covered by a span at IoU > 0.5,
-#: all 13 discarded by the 17-frame ceiling). 200 frames (~6.7 s at 30 fps, ~3.3 s at
-#: 60 fps) is far beyond any genuine micro-expression, so no real event is ever
-#: re-routed; it only keeps genuinely long excursions (scene changes) in the macro
-#: channel.
 MICRO_CEILING_FRAMES: int = 200
 
-#: Frame root of each dataset, relative to ``dataset/``.  The flow tree reuses these.
 DATASET_FRAME_REL: Dict[str, str] = {
     "casme_sq": "CASME_sq/rawpic_crop",
     "samm": "SAMMLV/SAMM_longvideos_crop",
@@ -46,7 +23,6 @@ DATASET_FRAME_REL: Dict[str, str] = {
     "4dme": "4DME/long_gray_video/long gray video",
 }
 
-#: Annotation workbooks, relative to ``dataset/``.
 DATASET_LABEL_REL: Dict[str, str] = {
     "casme_sq": "CASME_sq/code_final.xlsx",
     "samm": "SAMMLV/SAMM_LongVideos_V3_Release.xlsx",
@@ -54,50 +30,38 @@ DATASET_LABEL_REL: Dict[str, str] = {
     "4dme": "4DME/Micro and Macro-expression labels.xlsx",
 }
 
-#: Frame filename shape per dataset: ``(prefix, zero-padded digits)``.
-#: ``digits = 0`` means "no zero padding" (CAS(ME)^3 writes ``8.jpg``, not ``0008.jpg``).
 DATASET_FRAME_FORMAT: Dict[str, Tuple[str, int]] = {
-    "casme_sq": ("img", 3),      # img003.jpg
-    "samm": ("", 4),             # 0003.jpg
-    "casme3": ("", 0),           # 8.jpg
-    "4dme": ("Frame_", 9),       # Frame_000001826.jpg
+    "casme_sq": ("img", 3),
+    "samm": ("", 4),
+    "casme3": ("", 0),
+    "4dme": ("Frame_", 9),
 }
 
-#: Fallback flow gap ``k`` in frames, used only when the annotation statistics are not
-#: available.  The real value is derived per dataset by the front end as
-#: ``round(mean micro-expression length / 2)`` and travels on ``DatasetBundle.gap``;
-#: :class:`VideoPaths` takes it as a constructor argument so the derived value wins.
 DATASET_FLOW_GAP: Dict[str, int] = {
     "casme_sq": 7, "samm": 47, "casme3": 7, "4dme": 14,
 }
 
-#: Sub-path inside a CAS(ME)^3 clip folder that holds the colour frames.
+DATASET_MAX_PROPOSALS: Dict[str, int] = {
+    "casme_sq": 5, "samm": 5, "casme3": 0, "4dme": 0,
+}
+
 CASME3_MODALITY = "color"
 
-#: Question/answer sets.  ``4dme`` is registered but not yet built; the loader reports
-#: it as pending rather than failing, so the rest of the pipeline stays usable.
 QA_SUBDIR: Dict[str, str] = {
     "casme_sq": "casme_sq", "samm": "samm", "casme3": "casme3", "4dme": "4dme",
 }
 
 
 class DatasetPathError(FileNotFoundError):
-    """Raised when a required dataset path is absent."""
-
-
-# ---------------------------------------------------------------------------
-# Roots
-# ---------------------------------------------------------------------------
+    pass
 
 
 def dataset_frame_root(dataset: str) -> Path:
-    """Absolute frame root, e.g. ``.../dataset/CASME_sq/rawpic_crop``."""
     _check(dataset)
     return DATASET_ROOT / DATASET_FRAME_REL[dataset]
 
 
 def dataset_flow_root(dataset: str) -> Path:
-    """Absolute flow root -- the same relative path under ``pre_datasets``."""
     _check(dataset)
     return FLOW_ROOT / DATASET_FRAME_REL[dataset]
 
@@ -122,28 +86,20 @@ def flow_gap_of(dataset: str) -> int:
     return DATASET_FLOW_GAP[dataset]
 
 
-def max_micro_frames(dataset: str, seconds: Optional[float] = None) -> int:
-    """The micro/macro routing ceiling in frames (see ``p_agent_scan.md`` rule 4 --
-    this is a ceiling weighed as evidence, not a blind cutoff).
+def max_proposals_of(dataset: str) -> int:
+    _check(dataset)
+    return DATASET_MAX_PROPOSALS[dataset]
 
-    Uniform ``MICRO_CEILING_FRAMES`` (200) for every dataset by default. Pass
-    ``seconds`` explicitly to override with a physical duration, converted through
-    the dataset's own capture rate.
-    """
+
+def max_micro_frames(dataset: str, seconds: Optional[float] = None) -> int:
     _check(dataset)
     if seconds is None:
         return MICRO_CEILING_FRAMES
     return int(round(seconds * fps_of(dataset)))
 
 
-# ---------------------------------------------------------------------------
-# Frame naming
-# ---------------------------------------------------------------------------
-
-
 def frame_name(dataset: str, index: int, ext: str = ".jpg",
                prefix: Optional[str] = None, digits: Optional[int] = None) -> str:
-    """Render a frame filename in the dataset's own convention."""
     _check(dataset)
     default_prefix, default_digits = DATASET_FRAME_FORMAT[dataset]
     prefix = default_prefix if prefix is None else prefix
@@ -153,39 +109,22 @@ def frame_name(dataset: str, index: int, ext: str = ".jpg",
 
 
 def parse_frame_index(filename: str) -> Optional[int]:
-    """Recover the frame number from a filename; ``None`` when it has no digits."""
     stem = Path(filename).stem
     digits = "".join(ch for ch in stem if ch.isdigit())
     return int(digits) if digits else None
 
 
 def clip_rel_dir(dataset: str, subject: str, clip: str) -> str:
-    """Relative directory of one long video inside its frame root.
-
-    CAS(ME)^3 nests one more level for the modality (``spNO.1/a/color``); the others put
-    the frames directly under the clip folder.
-    """
     _check(dataset)
     if dataset == "casme3":
         return f"{subject}/{clip}/{CASME3_MODALITY}"
     if dataset == "samm":
-        # SAMM long videos are flat: the clip folder already encodes the subject.
         return clip
     return f"{subject}/{clip}"
 
 
-# ---------------------------------------------------------------------------
-# Frame / flow pairing
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class FramePair:
-    """One aligned ``(video frame, flow frame)`` observation at time ``t``.
-
-    ``flow_pair`` records which two source frames the flow came from, so an agent that
-    quotes a measurement can be traced back to the exact pixels it was computed on.
-    """
 
     t: int
     frame_path: Path
@@ -209,7 +148,6 @@ class FramePair:
 
 
 class VideoPaths:
-    """Path resolver for one long video: frames, flow frames, and their alignment."""
 
     def __init__(
         self,
@@ -230,7 +168,6 @@ class VideoPaths:
         self.flow_gap = flow_gap if flow_gap is not None else flow_gap_of(dataset)
         self.fps = fps_of(dataset)
 
-    # -- directories --------------------------------------------------------
 
     @property
     def frame_dir(self) -> Path:
@@ -240,7 +177,6 @@ class VideoPaths:
     def flow_dir(self) -> Path:
         return dataset_flow_root(self.dataset) / self.folder_rel
 
-    # -- single files -------------------------------------------------------
 
     def frame(self, index: int) -> Path:
         return self.frame_dir / frame_name(
@@ -248,19 +184,15 @@ class VideoPaths:
         )
 
     def flow(self, index: int) -> Path:
-        """Flow frame ``index`` -- the motion arriving at frame ``index``."""
         return self.flow_dir / frame_name(
             self.dataset, index, self.frame_ext, self.frame_prefix, self.frame_digits
         )
 
     def flow_source_pair(self, index: int) -> Tuple[int, int]:
-        """The ``(earlier, later)`` frames flow ``index`` was computed from."""
         return (index - self.flow_gap, index)
 
-    # -- discovery ----------------------------------------------------------
 
     def scan_frame_range(self) -> Optional[Tuple[int, int, int]]:
-        """``(lo, hi, count)`` of the frames present on disk."""
         directory = self.frame_dir
         if not directory.is_dir():
             return None
@@ -286,7 +218,6 @@ class VideoPaths:
             return None
         return min(indices), max(indices), len(indices)
 
-    # -- alignment ----------------------------------------------------------
 
     def pair(self, index: int, check: bool = True) -> FramePair:
         frame_path, flow_path = self.frame(index), self.flow(index)
@@ -307,11 +238,6 @@ class VideoPaths:
         check: bool = True,
         require_flow: bool = True,
     ) -> List[FramePair]:
-        """Aligned observations over ``[t_start, t_end]``.
-
-        Flow only exists from ``frame_lo + gap`` onward, so the default start is clamped
-        there instead of silently yielding pairs whose flow file is missing.
-        """
         span = self.scan_frame_range()
         if span is None:
             return []
@@ -334,11 +260,9 @@ class VideoPaths:
             yield self.pair(t, check=check)
 
     def event_window(self, onset: int, offset: int, pad: int = 0) -> List[FramePair]:
-        """Aligned pairs covering one annotated event, optionally padded."""
         return self.aligned_pairs(onset - pad, offset + pad)
 
     def coverage(self) -> Dict[str, object]:
-        """Diagnostic: how much of the frame range actually has flow beside it."""
         frames = self.scan_frame_range()
         flows = self.scan_flow_range()
         if frames is None:
@@ -355,13 +279,7 @@ class VideoPaths:
         }
 
 
-# ---------------------------------------------------------------------------
-# Relative-path helpers (records store repo-relative paths, as the QA sets do)
-# ---------------------------------------------------------------------------
-
-
 def to_record_path(path: Path | str) -> str:
-    """Render an absolute path the way the QA sets do: relative to the project root."""
     from ..config import PROJECT_ROOT
     resolved = Path(path)
     try:
@@ -371,7 +289,6 @@ def to_record_path(path: Path | str) -> str:
 
 
 def from_record_path(rel: str) -> Path:
-    """Inverse of :func:`to_record_path`."""
     from ..config import PROJECT_ROOT
     candidate = Path(rel)
     return candidate if candidate.is_absolute() else (PROJECT_ROOT / rel)
@@ -383,7 +300,6 @@ def qa_dir(dataset: str) -> Path:
 
 
 def find_qa_runs(dataset: str) -> List[Path]:
-    """Timestamped QA build directories, newest first."""
     root = qa_dir(dataset)
     if not root.is_dir():
         return []
@@ -393,7 +309,6 @@ def find_qa_runs(dataset: str) -> List[Path]:
 
 
 def available_datasets(require_qa: bool = False) -> List[str]:
-    """Datasets whose frames (and optionally QA sets) are present on this machine."""
     out = []
     for name in DATASETS:
         if not dataset_frame_root(name).is_dir():
@@ -406,10 +321,12 @@ def available_datasets(require_qa: bool = False) -> List[str]:
 
 __all__ = [
     "DATASETS", "DATASET_FPS", "DATASET_FRAME_REL", "DATASET_LABEL_REL",
-    "DATASET_FRAME_FORMAT", "DATASET_FLOW_GAP", "CASME3_MODALITY", "QA_SUBDIR",
+    "DATASET_FRAME_FORMAT", "DATASET_FLOW_GAP", "DATASET_MAX_PROPOSALS",
+    "CASME3_MODALITY", "QA_SUBDIR",
     "MICRO_CEILING_FRAMES",
     "DatasetPathError", "dataset_frame_root", "dataset_flow_root", "dataset_label_path",
-    "fps_of", "flow_gap_of", "max_micro_frames", "frame_name", "parse_frame_index",
+    "fps_of", "flow_gap_of", "max_proposals_of", "max_micro_frames", "frame_name",
+    "parse_frame_index",
     "clip_rel_dir", "FramePair", "VideoPaths", "to_record_path", "from_record_path",
     "qa_dir", "find_qa_runs", "available_datasets",
 ]
