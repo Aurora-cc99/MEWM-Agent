@@ -78,10 +78,12 @@ class PolicyBackend(ABC):
     @abstractmethod
     def sample(self, prompt: str, n: int, temperature: float) -> List[PolicySample]:
 
+        ...
     @abstractmethod
     def update(self, rollouts: Sequence[GroupRollout], clip: float,
                kl_coefficient: float, learning_rate: float) -> Dict[str, float]:
 
+        ...
     def save(self, path: Path | str) -> Optional[Path]:
         return None
 

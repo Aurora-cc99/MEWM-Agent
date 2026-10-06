@@ -20,6 +20,7 @@ QA_FIELDS = ("video_id", "video", "question", "answer")
 class AugmentationError(RuntimeError):
 
 
+    ...
 @dataclass
 class AugmentedPair:
 

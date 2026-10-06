@@ -61,11 +61,13 @@ class AgentPolicyBackend(ABC):
     @abstractmethod
     def act(self, observation: Dict[str, Any]) -> AgentSample:
 
+        ...
     @abstractmethod
     def update(self, batch: Sequence[TeamTransition], clip: float,
                kl_coefficient: float, learning_rate: float,
                entropy_coefficient: float) -> Dict[str, float]:
 
+        ...
     def save(self, path: Path | str) -> Optional[Path]:
         return None
 

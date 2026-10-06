@@ -53,6 +53,7 @@ class SFTBackend(ABC):
     @abstractmethod
     def step(self, batch: Sequence[Dict[str, Any]], learning_rate: float) -> float:
 
+        ...
     def evaluate(self, batch: Sequence[Dict[str, Any]]) -> float:
         return float("nan")
 
@@ -65,6 +66,7 @@ class SFTBackend(ABC):
     def restore(self, state: Any) -> None:
 
 
+        ...
 class DryRunSFT(SFTBackend):
 
     def __init__(self, loss_fn: Optional[Callable[[int, Sequence[Dict[str, Any]]], float]] = None,

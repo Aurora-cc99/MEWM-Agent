@@ -33,11 +33,14 @@ CLOSED_SOURCE_HINTS = (
 class PolicyNotTrainable(ValueError):
 
 
+    ...
 class ClipEngineUnavailable(RuntimeError):
 
+    ...
 class SoftNetEngineUnavailable(RuntimeError):
 
 
+    ...
 def require_open_weight(policy_model: str) -> str:
     lowered = policy_model.strip().lower()
     if not lowered:
