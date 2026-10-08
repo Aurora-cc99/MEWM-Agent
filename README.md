@@ -51,7 +51,7 @@ MEWM-Agent closes the loop around state representation, dynamics prediction, evi
 - **World Model Anchored Evidence-guided Policy Optimization (WAEPO):** behavior anchors are built from uniformly verified trajectories, while the advantage baseline is computed exclusively from on-policy samples to avoid advantage inversion; anchor supervision enters through a decoupled likelihood term combined with causal rewards from PRE, so policy updates are jointly constrained by outcome correctness, evidence sufficiency, and causal consistency.
 - **Long-range memory and evidence regulation:** four-layer working, episodic, semantic, and global memory with role-specific evidence token regulation maintains out-of-segment baselines and traces evidence provenance. Visibility projection enforces role isolation and supports suppression and masking judgments that depend on long-range context.
 
-MEWM-Agent is validated on four long-video benchmarks — CAS(ME)², SAMM, CAS(ME)³, and 4D-ME — across ME spotting, AU attribution, and ME-LVQA.
+MEWM-Agent is validated on four long-video benchmarks — CAS(ME)², SAMM, CAS(ME)³, and 4D-ME — across ME spotting, ME understanding, and ME-LVQA.
 
 ## MEWM-Agent in One Run
 
