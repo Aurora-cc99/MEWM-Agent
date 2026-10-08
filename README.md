@@ -194,7 +194,7 @@ The MEFlowNet optical-flow pipeline under `third_party/` loads two checkpoints t
 | DepthAnythingV2 (ViT-S) | `third_party/MELLM-main/MELLM_pipeline/thirdparty/DepthAnythingV2/depth_anything_v2/depth_anything_v2_vits.pth` | [Hugging Face](https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth?download=true) |
 | MEFlowNet | `third_party/MELLM-main/MELLM_pipeline/ckpt/meflownet.pth` | see the MELLM repository |
 
-Run `python third_party/MELLM-main/MELLM_pipeline/check_weights.py` to verify that every expected checkpoint is in place.
+The vendored DepthAnythingV2 package (`third_party/.../thirdparty/DepthAnythingV2/depth_anything_v2`) is likewise not included in this repository; restore it from the [Depth-Anything-V2 repository](https://github.com/DepthAnything/Depth-Anything-V2) before running the flow pipeline. Run `python third_party/MELLM-main/MELLM_pipeline/check_weights.py` to verify that every expected checkpoint is in place.
 
 ## 3. API Key Setup
 
@@ -424,12 +424,12 @@ MEWM-Agent-main/
 │       ├── config/meflownet.json         # MEFlowNet model configuration
 │       ├── model/meflownet.py            # MEFlowNet model definition
 │       ├── model/backbone/               # ViT + DepthAnythingV2 backbone modules
-│       └── thirdparty/DepthAnythingV2/   # DepthAnythingV2 depth-estimation module
-│                                         #   (checkpoint kept local, not in git)
+│       └── thirdparty/DepthAnythingV2/   # DepthAnythingV2 module (removed from
+│                                         #   repo; restore from upstream if needed)
 │
-├── assets/                               # runtime binary assets (kept local, not in git)
+├── assets/                               # runtime binary assets (empty placeholder in git)
 │   └── shape_predictor_68_face_landmarks.dat  # dlib 68-point facial landmark
-│                                              #   predictor (required at runtime)
+│                                              #   predictor (kept local, required at runtime)
 │
 └── Weights/                              # local model checkpoints (kept local; empty placeholder in git)
     ├── Qwen3-VL-30B-A3B-Instruct/        # default policy backbone
@@ -441,7 +441,7 @@ MEWM-Agent-main/
     └── GLM-4.1V-9B-Thinking/
 ```
 
-Empty directories (`Weights/`, `dataset/`, `runs/`, `Q-T-A/`, `pre_datasets/`) are kept on GitHub as placeholders via `.gitkeep`; their runtime contents (model checkpoints, raw videos, pre-computed outputs) stay local and are git-ignored.
+Empty directories (`Weights/`, `dataset/`, `runs/`, `Q-T-A/`, `pre_datasets/`, `assets/`, and `third_party/MELLM-main/MELLM_pipeline/data/`) are kept on GitHub as placeholders via `.gitkeep`; their runtime contents (model checkpoints, raw videos, pre-computed outputs) stay local and are git-ignored.
 
 ## Acknowledgements
 
