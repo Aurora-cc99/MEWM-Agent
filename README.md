@@ -185,6 +185,17 @@ Open-weight models are placed under `Weights/`. API-only models need no local fi
 | Qwen2.5-Omni-7B | `Weights/Qwen2.5-Omni-7B/` | omni alternative policy |
 | GLM-4.1V-9B-Thinking | `Weights/GLM-4.1V-9B-Thinking/` | alternative policy |
 
+### Third-party Flow Checkpoints
+
+The MEFlowNet optical-flow pipeline under `third_party/` loads two checkpoints that are **not included in this repository**:
+
+| Checkpoint | Expected path | Source |
+| --- | --- | --- |
+| DepthAnythingV2 (ViT-S) | `third_party/MELLM-main/MELLM_pipeline/thirdparty/DepthAnythingV2/depth_anything_v2/depth_anything_v2_vits.pth` | [Hugging Face](https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth?download=true) |
+| MEFlowNet | `third_party/MELLM-main/MELLM_pipeline/ckpt/meflownet.pth` | see the MELLM repository |
+
+Run `python third_party/MELLM-main/MELLM_pipeline/check_weights.py` to verify that every expected checkpoint is in place.
+
 ## 3. API Key Setup
 
 For API-hosted backbones, set the relevant key as an environment variable before running:
@@ -414,6 +425,7 @@ MEWM-Agent-main/
 │       ├── model/meflownet.py            # MEFlowNet model definition
 │       ├── model/backbone/               # ViT + DepthAnythingV2 backbone modules
 │       └── thirdparty/DepthAnythingV2/   # DepthAnythingV2 depth-estimation module
+│                                         #   (checkpoint kept local, not in git)
 │
 ├── assets/                               # runtime binary assets (kept local, not in git)
 │   └── shape_predictor_68_face_landmarks.dat  # dlib 68-point facial landmark

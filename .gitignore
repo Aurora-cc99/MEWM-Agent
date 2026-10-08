@@ -35,6 +35,9 @@ runs/
 # dlib landmark data and other binary assets
 assets/
 
+# Third-party flow checkpoints (kept local; download separately, see README "2. Model Weights")
+third_party/MELLM-main/MELLM_pipeline/thirdparty/DepthAnythingV2/depth_anything_v2/*.pth
+
 # Logs and temp outputs
 *.log
 *.tmp
