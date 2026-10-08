@@ -1,45 +1,93 @@
-# 🧠 MEWM-Agent: A Multi-Agent Interactive Emotional World Model for Long-video Micro-expression Question Answering
+<div align="center">
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
-[![PyTorch 2.7+](https://img.shields.io/badge/PyTorch-2.7%2B-orange)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+# MEWM-Agent
 
-Long-video micro-expression question answering (ME-LVQA) requires spotting brief and subtle micro-expressions (MEs) across thousands to tens of thousands of frames, attributing them to facial action units (AUs), and generating a global emotional narrative. Existing methods seldom model subject-specific normal facial dynamics, so they struggle to separate expression displacement from head motion and eye blinks and cannot maintain cross-segment emotional baselines or verifiable AU-to-emotion evidence chains. We propose **MEWM-Agent**, a multi-agent interactive emotional world model for ME understanding in long videos. MEWM-Agent learns subject-specific facial dynamics over AU-centered dual-timescale states and recasts ME spotting as the detection of structured prediction failures; emotion hypotheses are then examined through emotion-conditioned rollouts and counterfactual tests. On top of this world model, perception, structuring, reasoning, and critic-verification agents interact along the motion, AU, and emotion evidence hierarchy, and only candidates that pass both prediction and evidence verification enter subsequent reasoning. Three-layer memory and evidence token regulation maintain cross-segment context within a bounded token budget. We further introduce World Model Anchored Evidence-guided Policy Optimization (WAEPO), which incorporates verified trajectories as behavior anchors into group-relative advantage estimation and combines them with hierarchical process rewards computed by the prediction engine, so that policy updates are jointly constrained by outcome correctness, evidence sufficiency, and causal consistency. Experiments on four long-video datasets confirm the effectiveness of MEWM-Agent across ME spotting, AU attribution, and ME-LVQA.
+### Spotting as Prediction Failure
 
-## 📚 Table of Contents
+**Multi-agent interactive emotional world model for long-video micro-expression question answering**
 
-- [Overall Architecture](#️-overall-architecture)
-- [Agent Roles and Interactions](#-agent-roles-and-interactions)
-- [End-to-End Case Study](#-end-to-end-case-study)
-- [Supported Backbone Models](#-supported-backbone-models)
-- [Hardware Requirements](#-hardware-requirements)
-- [Repository Layout](#-repository-layout)
-- [Datasets & Protocols](#-datasets--protocols)
-- [1. Install](#-1-install)
-- [2. Model Weights](#-2-model-weights)
-- [3. API Key Setup](#-3-api-key-setup)
-- [4. Run](#-4-run)
-- [5. Training](#-5-training)
+<p>
+  <a href="#why-mewm-agent">🔍 Why MEWM-Agent</a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="#mewm-agent-in-one-run">🧠 Method</a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="#models">🤖 Models</a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="#repository-layout">📁 Repository Layout</a>
+</p>
+<p>
+  <a href="#1-install">⚙️ Install</a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="#4-run">🚀 Run</a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="#5-training">🏋️ Training</a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="LICENSE">⚖️ License</a>
+</p>
 
-## 🏗️ Overall Architecture
+<p align="center">
+  <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-blue"></a>
+  <a href="https://pytorch.org/"><img alt="PyTorch 2.7+" src="https://img.shields.io/badge/PyTorch-2.7%2B-orange"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg"></a>
+</p>
 
-![Overall architecture of MEWM-Agent](F1.png)
+<p align="center">
+  <img src="F1.png"
+       alt="Overall architecture of MEWM-Agent" width="92%">
+</p>
 
 Overall architecture of MEWM-Agent. **Top:** SRE, PRE, and ACE process a long video, with ACE coordinating four agents over shared memory to produce emotion labels, AU→emotion causal chains, and verified evidence reports. **Middle:** Three-layer memory is retrieved, filtered, and token-regulated before injection into each agent's context. **Bottom:** WAEPO mixes verified anchor trajectories with current policy samples and updates the policy with cascaded rewards.
 
-## 🤖 Agent Roles and Interactions
+</div>
 
-![Agent roles and interactions](F2.png)
+## Why MEWM-Agent
+
+Long-video micro-expression question answering (ME-LVQA) requires spotting brief and subtle micro-expressions (MEs) across thousands to tens of thousands of frames, attributing them to facial action units (AUs), and generating a global emotional narrative. Existing methods seldom model subject-specific normal facial dynamics, so they struggle to separate expression displacement from head motion and eye blinks, and cannot maintain cross-segment emotional baselines or verifiable AU-to-emotion evidence chains.
+
+- **Subject-specific normal dynamics:** MEWM-Agent learns AU-centered dual-timescale states of each subject's normal facial dynamics, so expression displacement can be separated from head motion and eye blinks.
+- **Spotting as prediction failure:** ME spotting is recast as the detection of structured prediction failures; emotion hypotheses are then examined through emotion-conditioned rollouts and counterfactual tests.
+- **Four interacting agents:** perception, structuring, reasoning, and critic-verification agents interact along the motion, AU, and emotion evidence hierarchy, and only candidates that pass both prediction and evidence verification enter subsequent reasoning.
+- **Three-layer memory with a bounded token budget:** working, episodic, and semantic stores coordinated by the global memory 𝔾 maintain cross-segment context, with evidence token regulation keeping the injected context within budget.
+- **World-model anchored optimisation (WAEPO):** verified trajectories act as behavior anchors in group-relative advantage estimation and are combined with hierarchical process rewards computed by the prediction engine, so policy updates are jointly constrained by outcome correctness, evidence sufficiency, and causal consistency.
+- **Four long-video benchmarks:** validated on CAS(ME)², SAMM, CAS(ME)³, and 4D-ME across ME spotting, AU attribution, and ME-LVQA.
+
+## MEWM-Agent in One Run
+
+<p align="center">
+  <img src="F2.png"
+       alt="Agent roles and interactions" width="96%">
+</p>
 
 Each of the four agents is an MLLM with a role-specific LoRA adapter: perception validates motion evidence and proposals, structuring builds AU sets and temporal dynamic graphs, reasoning generates causal CoT and emotion labels, and critic-verification checks hypotheses and returns evidence reports. All agents access shared memory (top) and engine services (bottom) under level-specific visibility.
 
-## 📋 End-to-End Case Study
+A MEWM-Agent run turns a long video into verified AU→emotion evidence chains in six stages:
 
-![End-to-end case of MEWM-Agent on a long video](F4.png)
+1. **SRE:** V1–V3 encoders extract optical-flow motion features, AU-centered slot states, and subject-specific latent dynamics baselines across the whole video.
+2. **PRE:** the M1 dynamics model predicts AU-centered dual-timescale states, while V4 regulates the evidence token budget across segments.
+3. **Spot:** M2 turns prediction errors into ME candidates and refines interval boundaries; the P-agent rescans the candidates to confirm or reject them.
+4. **AU:** the A-agent builds the AU set and the temporal AU dynamic graph for each confirmed candidate.
+5. **Reason:** the R-agent generates causal chain-of-thought and an emotion label, while M3 runs emotion-conditioned rollouts and counterfactual tests; the C-agent verifies each hypothesis against evidence.
+6. **QA:** ACE composes the verified evidence chains into emotion labels, AU→emotion causal chains, and the final QA answer.
+
+## Three-Layer Memory
+
+<p align="center">
+  <img src="F3.png"
+       alt="Three-layer memory system of MEWM-Agent" width="92%">
+</p>
+
+Three-layer memory keeps cross-segment context within a bounded token budget. Working, episodic, and semantic stores are coordinated by the global memory 𝔾; evidence trees are retrieved, filtered, and token-regulated before injection into each agent's context, and memory reads and writes are audited during verification.
+
+## End-to-End Case Study
+
+<p align="center">
+  <img src="F4.png"
+       alt="End-to-end case of MEWM-Agent on a long video" width="100%">
+</p>
 
 End-to-end case of MEWM-Agent on a long video. Step 1 detects five candidates from the prediction error and rescans them to confirm three MEs and two MaEs. Step 2 shows the four-agent analysis of the first ME with memory reads and writes. Step 3 reports the final spotting intervals and AU-to-emotion chains for the three MEs.
 
-## 🤖 Supported Backbone Models
+## Models
 
 MEWM-Agent runs on both hosted API models and open-weight local models. The policy backbone is configured in `configs/mewm_agent.yaml` under `llm.reasoning_model`.
 
@@ -67,6 +115,8 @@ MEWM-Agent runs on both hosted API models and open-weight local models. The poli
 | Qwen3-VL-30B-Instruct | `Qwen3-VL-30B` | `Qwen3-VL-30B-Instruct/` |
 | GLM-4.1V-9B-Thinking | `GLM-4.1V-9B` | `GLM-4.1V-9B-Thinking/` |
 
+### Switching Backbones
+
 Switch the backbone without retraining by setting `llm.reasoning_model` in `configs/mewm_agent.yaml` or via the environment variable override:
 
 ```bash
@@ -74,7 +124,7 @@ set MEWM_LLM__REASONING_MODEL=Qwen3-VL-30B-A3B
 python -m mewm.cli.main run --video path/to/video --dataset casme_sq
 ```
 
-## 💻 Hardware Requirements
+## Hardware Requirements
 
 The default backbone, Qwen3-VL-30B-A3B-Instruct, is a 30B MoE model. The recommended setup is **two NVIDIA RTX Pro 6000 GPUs (96 GB VRAM each, 192 GB total)**, which gives enough headroom to run all four agents simultaneously with full-precision activations across long video sequences.
 
@@ -92,7 +142,111 @@ set MEWM_LLM__REASONING_MODEL=Qwen3-VL-8B
 set MEWM_LLM__REASONING_MODEL=gemini-3-pro
 ```
 
-## 📁 Repository Layout
+## Datasets & Protocols
+
+| Name | Dataset | Official page | Access |
+| --- | --- | --- | --- |
+| `casme_sq` | CAS(ME)² | <http://casme.psych.ac.cn/casme/e2> | license agreement, submitted on the site |
+| `samm` | SAMM | <http://www2.docm.mmu.ac.uk/STAFF/M.Yap/dataset.php> | license agreement, email `M.Yap@mmu.ac.uk` |
+| `casme3` | CAS(ME)³ | <http://casme.psych.ac.cn/casme/e4> | license agreement, submitted on the site |
+| `4dme` | 4D-ME | https://ieeexplore.ieee.org/document/9796028 | request via the dataset authors |
+
+All datasets are gated academic benchmarks. Each requires signing the hosting institution's license agreement before raw videos are released.
+
+Two evaluation protocols are implemented in `mewm/training/loso.py` and `mewm/training/lodo.py` and selected with `--protocol`:
+
+- **loso** — leave-one-subject-out within a single dataset
+- **lodo** — leave-one-dataset-out cross-corpus generalization
+
+Place raw datasets under `dataset/<name>/` or set the `MEWM_DATASET_ROOT` environment variable.
+
+## 1. Install
+
+The project is developed and tested on **Ubuntu 22.04** with CUDA 12.8.
+
+```bash
+pip install -r requirements.txt
+```
+
+Core dependencies: `torch 2.7.1+cu128`, `transformers 4.55.0`, `numpy 1.26.4`.
+
+```bash
+pip install bitsandbytes>=0.43
+```
+
+Then add `load_in_4bit: true` under `llm` in `configs/mewm_agent.yaml` before running.
+
+## 2. Model Weights
+
+Open-weight models are placed under `Weights/`. API-only models need no local files.
+
+| Model | Directory | Notes |
+| --- | --- | --- |
+| Qwen3-VL-30B-A3B-Instruct | `Weights/Qwen3-VL-30B-A3B-Instruct/` | **default policy** |
+| Qwen3-VL-8B-Instruct | `Weights/Qwen3-VL-8B-Instruct/` | lighter local policy |
+| Qwen3-VL-30B-Instruct | `Weights/Qwen3-VL-30B-Instruct/` | larger local policy |
+| Qwen2.5-VL-7B-Instruct | `Weights/Qwen2.5-VL-7B-Instruct/` | alternative policy |
+| Qwen2.5-VL-32B-Instruct | `Weights/Qwen2.5-VL-32B-Instruct/` | large alternative policy |
+| Qwen2.5-Omni-7B | `Weights/Qwen2.5-Omni-7B/` | omni alternative policy |
+| GLM-4.1V-9B-Thinking | `Weights/GLM-4.1V-9B-Thinking/` | alternative policy |
+
+## 3. API Key Setup
+
+For API-hosted backbones, set the relevant key as an environment variable before running:
+
+```bash
+# OpenAI (GPT-4o, GPT-4o-mini)
+set OPENAI_API_KEY=sk-...
+
+# Google (Gemini-2.5-Flash/Pro, Gemini-3-Flash/Pro)
+set GOOGLE_API_KEY=AIza...
+
+# Anthropic (Claude-Sonnet-4.5)
+set ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Then point the config at the desired model:
+
+```bash
+set MEWM_LLM__REASONING_MODEL=gemini-2.5-pro
+python -m mewm.cli.main run --video path/to/video --dataset casme_sq
+```
+
+## 4. Run
+
+```bash
+# single-video inference
+python -m mewm.cli.main run --video path/to/video --dataset casme_sq
+
+# calibrate thresholds on a calibration fold before reporting numbers
+python -m mewm.cli.main calibrate --dataset casme_sq
+
+# list available models
+python -m mewm.cli.main models
+
+# LOSO sweep over a whole dataset
+python scripts/loso_launcher.py --dataset casme_sq
+```
+
+Configuration can be overridden via environment variables using the `MEWM_<SECTION>__<FIELD>` pattern:
+
+```bash
+set MEWM_LLM__REASONING_MODEL=Qwen3-VL-30B-A3B
+python -m mewm.cli.main run --video path/to/video --dataset casme_sq
+```
+
+## 5. Training
+
+Training runs three stages: SFT → RFT → WAEPO. All stages are coordinated by `scripts/loso_launcher.py`:
+
+```bash
+# full LOSO training + evaluation on CAS(ME)²
+python scripts/loso_launcher.py --dataset casme_sq --policy MEWM-Agent
+```
+
+Before training, set the key hyperparameters in [configs/mewm_agent.yaml](configs/mewm_agent.yaml): the `training`, `clip`, `reward`, and `spotting` sections all contain values that must be calibrated on a held-out fold. Run `calibrate` first.
+
+## Repository Layout
 
 ```
 MEWM-Agent-main/
@@ -264,7 +418,6 @@ MEWM-Agent-main/
 │       ├── config/meflownet.json         # MEFlowNet model configuration
 │       ├── model/meflownet.py            # MEFlowNet model definition
 │       ├── model/backbone/               # ViT + DepthAnythingV2 backbone modules
-│       ├── weights/                      # face alignment + landmark model weights
 │       └── thirdparty/DepthAnythingV2/   # DepthAnythingV2 depth-estimation module
 │
 ├── assets/                               # runtime binary assets (kept local, not in git)
@@ -283,106 +436,15 @@ MEWM-Agent-main/
 
 Empty directories (`Weights/`, `dataset/`, `runs/`, `Q-T-A/`, `pre_datasets/`) are kept on GitHub as placeholders via `.gitkeep`; their runtime contents (model checkpoints, raw videos, pre-computed outputs) stay local and are git-ignored.
 
-## 📊 Datasets & Protocols
+## Acknowledgements
 
-| Name | Dataset | Official page | Access |
-| --- | --- | --- | --- |
-| `casme_sq` | CAS(ME)² | <http://casme.psych.ac.cn/casme/e2> | license agreement, submitted on the site |
-| `samm` | SAMM | <http://www2.docm.mmu.ac.uk/STAFF/M.Yap/dataset.php> | license agreement, email `M.Yap@mmu.ac.uk` |
-| `casme3` | CAS(ME)³ | <http://casme.psych.ac.cn/casme/e4> | license agreement, submitted on the site |
-| `4dme` | 4D-ME | https://ieeexplore.ieee.org/document/9796028 | request via the dataset authors |
+MEWM-Agent builds on open research and code. We thank the authors and maintainers of:
 
-All datasets are gated academic benchmarks. Each requires signing the hosting institution's license agreement before raw videos are released.
+- **MELLM** — the MEFlowNet optical-flow pipeline vendored under `third_party/MELLM-main/`.
+- **[DepthAnythingV2](https://github.com/DepthAnything/Depth-Anything-V2)** — the depth-estimation backbone vendored under `third_party/`.
+- **[dlib](http://dlib.net/)** — the 68-point facial landmark predictor used at runtime.
+- The **CAS(ME)²**, **SAMM**, **CAS(ME)³**, and **4D-ME** dataset teams for making their gated benchmarks available.
 
-`protocols.py` implements two evaluation protocols, selected with `--protocol`:
+## License
 
-- **loso** — leave-one-subject-out within a single dataset
-- **lodo** — leave-one-dataset-out cross-corpus generalization
-
-Place raw datasets under `dataset/<name>/` or set the `MEWM_DATASET_ROOT` environment variable.
-
-## 📦 1. Install
-
-The project is developed and tested on **Ubuntu 22.04** with CUDA 12.8.
-
-```bash
-pip install -r requirements.txt
-```
-
-Core dependencies: `torch 2.7.1+cu128`, `transformers 4.55.0`, `numpy 1.26.4`.
-
-```bash
-pip install bitsandbytes>=0.43
-```
-
-Then add `load_in_4bit: true` under `llm` in `configs/mewm_agent.yaml` before running.
-
-## 🧠 2. Model Weights
-
-Open-weight models are placed under `Weights/`. API-only models need no local files.
-
-| Model | Directory | Notes |
-| --- | --- | --- |
-| Qwen3-VL-30B-A3B-Instruct | `Weights/Qwen3-VL-30B-A3B-Instruct/` | **default policy** |
-| Qwen3-VL-8B-Instruct | `Weights/Qwen3-VL-8B-Instruct/` | lighter local policy |
-| Qwen3-VL-30B-Instruct | `Weights/Qwen3-VL-30B-Instruct/` | larger local policy |
-| Qwen2.5-VL-7B-Instruct | `Weights/Qwen2.5-VL-7B-Instruct/` | alternative policy |
-| Qwen2.5-VL-32B-Instruct | `Weights/Qwen2.5-VL-32B-Instruct/` | large alternative policy |
-| Qwen2.5-Omni-7B | `Weights/Qwen2.5-Omni-7B/` | omni alternative policy |
-| GLM-4.1V-9B-Thinking | `Weights/GLM-4.1V-9B-Thinking/` | alternative policy |
-
-## 🔑 3. API Key Setup
-
-For API-hosted backbones, set the relevant key as an environment variable before running:
-
-```bash
-# OpenAI (GPT-4o, GPT-4o-mini)
-set OPENAI_API_KEY=sk-...
-
-# Google (Gemini-2.5-Flash/Pro, Gemini-3-Flash/Pro)
-set GOOGLE_API_KEY=AIza...
-
-# Anthropic (Claude-Sonnet-4.5)
-set ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Then point the config at the desired model:
-
-```bash
-set MEWM_LLM__REASONING_MODEL=gemini-2.5-pro
-python -m mewm.cli.main run --video path/to/video --dataset casme_sq
-```
-
-## 🚀 4. Run
-
-```bash
-# single-video inference
-python -m mewm.cli.main run --video path/to/video --dataset casme_sq
-
-# calibrate thresholds on a calibration fold before reporting numbers
-python -m mewm.cli.main calibrate --dataset casme_sq
-
-# list available models
-python -m mewm.cli.main models
-
-# LOSO sweep over a whole dataset
-python scripts/loso_launcher.py --dataset casme_sq
-```
-
-Configuration can be overridden via environment variables using the `MEWM_<SECTION>__<FIELD>` pattern:
-
-```bash
-set MEWM_LLM__REASONING_MODEL=Qwen3-VL-30B-A3B
-python -m mewm.cli.main run --video path/to/video --dataset casme_sq
-```
-
-## 🏋️ 5. Training
-
-Training runs three stages: SFT → RFT → WAEPO. All stages are coordinated by `scripts/loso_launcher.py`:
-
-```bash
-# full LOSO training + evaluation on CAS(ME)²
-python scripts/loso_launcher.py --dataset casme_sq --policy MEWM-Agent
-```
-
-Before training, set the key hyperparameters in [configs/mewm_agent.yaml](configs/mewm_agent.yaml): the `training`, `clip`, `reward`, and `spotting` sections all contain values that must be calibrated on a held-out fold. Run `calibrate` first.
+MEWM-Agent source is released under [MIT](LICENSE). Vendored third-party code (`third_party/`), model checkpoints (`Weights/`), and the gated benchmark datasets retain their original licenses; refer to the corresponding upstream projects.
