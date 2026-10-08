@@ -441,8 +441,6 @@ MEWM-Agent-main/
     └── GLM-4.1V-9B-Thinking/
 ```
 
-Empty directories (`Weights/`, `dataset/`, `runs/`, `Q-T-A/`, `pre_datasets/`, `assets/`, and `third_party/MELLM-main/MELLM_pipeline/data/`) are kept on GitHub as placeholders via `.gitkeep`; their runtime contents (model checkpoints, raw videos, pre-computed outputs) stay local and are git-ignored.
-
 ## Acknowledgements
 
 MEWM-Agent builds on open research and code. We thank the authors and maintainers of:
