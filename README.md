@@ -36,7 +36,7 @@
        alt="Overall architecture of MEWM-Agent" width="92%">
 </p>
 
-Overall architecture of MEWM-Agent. **Top:** SRE, PRE, and ACE process a long video, with ACE coordinating four agents over shared memory to produce emotion labels, AU→emotion causal chains, and verified evidence reports. **Middle:** Four-layer memory is retrieved, filtered, and token-regulated before injection into each agent's context. **Bottom:** WAEPO mixes verified anchor trajectories with current policy samples and updates the policy with cascaded rewards.
+Overall architecture of MEWM-Agent. **Top:** the State Representation Engine (SRE), the Prediction and Rollout Engine (PRE), and the Agent Coordination Engine (ACE) process a long video, with ACE coordinating four agents over shared memory to produce emotion labels, AU→emotion causal chains, and verified evidence reports. **Middle:** Four-layer memory is retrieved, filtered, and token-regulated before injection into each agent's context. **Bottom:** WAEPO mixes verified anchor trajectories with current policy samples and updates the policy with cascaded rewards.
 
 </div>
 
@@ -44,12 +44,14 @@ Overall architecture of MEWM-Agent. **Top:** SRE, PRE, and ACE process a long vi
 
 Long-video micro-expression question answering (ME-LVQA) requires spotting brief and subtle micro-expressions (MEs) across thousands to tens of thousands of frames, attributing them to facial action units (AUs), and generating a global emotional narrative. Existing methods seldom model subject-specific normal facial dynamics, so they struggle to separate expression displacement from head motion and eye blinks, and cannot maintain cross-segment emotional baselines or verifiable AU-to-emotion evidence chains.
 
-- **Subject-specific normal dynamics:** MEWM-Agent learns AU-centered dual-timescale states of each subject's normal facial dynamics, so expression displacement can be separated from head motion and eye blinks.
-- **Spotting as prediction failure:** ME spotting is recast as the detection of structured prediction failures; emotion hypotheses are then examined through emotion-conditioned rollouts and counterfactual tests.
-- **Four interacting agents:** perception, structuring, reasoning, and critic-verification agents interact along the motion, AU, and emotion evidence hierarchy, and only candidates that pass both prediction and evidence verification enter subsequent reasoning.
-- **Four-layer memory with a bounded token budget:** working, episodic, and semantic stores coordinated by the global memory 𝔾 maintain cross-segment context, with evidence token regulation keeping the injected context within budget.
-- **World-model anchored optimisation (WAEPO):** verified trajectories act as behavior anchors in group-relative advantage estimation and are combined with hierarchical process rewards computed by the prediction engine, so policy updates are jointly constrained by outcome correctness, evidence sufficiency, and causal consistency.
-- **Four long-video benchmarks:** validated on CAS(ME)², SAMM, CAS(ME)³, and 4D-ME across ME spotting, AU attribution, and ME-LVQA.
+MEWM-Agent closes the loop around state representation, dynamics prediction, evidence reasoning, policy learning, and long-range memory. The main contributions are:
+
+- **AU-centered dual-timescale world-model state space:** a unified state space in which AU-centered dual-timescale states connect the representation of SRE, the subject-specific dynamics prediction of PRE, and the multi-agent coordination of ACE. Prediction deviations and conditional rollouts are exposed to each role as structured evidence entries, supporting progressive reasoning from motion observations to AU attribution, emotion hypotheses, and counterfactual verification.
+- **Predictive spotting and counterfactual verification:** ME detection is recast as the identification of structured prediction failures against subject-specific stationary dynamics, and emotion hypotheses are verified through emotion-conditioned trajectory rollouts and counterfactual tests. Insufficient evidence triggers targeted remeasurement or causal revision.
+- **World Model Anchored Evidence-guided Policy Optimization (WAEPO):** behavior anchors are built from uniformly verified trajectories, while the advantage baseline is computed exclusively from on-policy samples to avoid advantage inversion; anchor supervision enters through a decoupled likelihood term combined with causal rewards from PRE, so policy updates are jointly constrained by outcome correctness, evidence sufficiency, and causal consistency.
+- **Long-range memory and evidence regulation:** four-layer working, episodic, semantic, and global memory with role-specific evidence token regulation maintains out-of-segment baselines and traces evidence provenance. Visibility projection enforces role isolation and supports suppression and masking judgments that depend on long-range context.
+
+MEWM-Agent is validated on four long-video benchmarks — CAS(ME)², SAMM, CAS(ME)³, and 4D-ME — across ME spotting, AU attribution, and ME-LVQA.
 
 ## MEWM-Agent in One Run
 
@@ -60,7 +62,7 @@ Long-video micro-expression question answering (ME-LVQA) requires spotting brief
 
 Each of the four agents is an MLLM with a role-specific LoRA adapter: perception validates motion evidence and proposals, structuring builds AU sets and temporal dynamic graphs, reasoning generates causal CoT and emotion labels, and critic-verification checks hypotheses and returns evidence reports. All agents access shared memory (top) and engine services (bottom) under level-specific visibility.
 
-One MEWM-Agent run turns a long video into verified AU→emotion evidence chains: SRE compresses the observation stream into AU-centered dual-timescale states, PRE spots candidate events from structured prediction errors, and ACE coordinates the perception, structuring, reasoning, and critic-verification agents along the evidence hierarchy to produce emotion labels, AU→emotion causal chains, and verified evidence reports.
+One MEWM-Agent run turns a long video into verified AU→emotion evidence chains: the State Representation Engine (SRE) compresses frame-wise observations into AU-centered dual-timescale states; the Prediction and Rollout Engine (PRE) generates candidate events from structured prediction deviations under stationary conditions and provides emotion-conditioned trajectory rollouts and counterfactual verification; and the Agent Coordination Engine (ACE) organizes perception, structuring, reasoning, and critic-verification agents that form conclusions progressively along the motion, AU, emotion, and verification hierarchy.
 
 ## Four-Layer Memory
 
@@ -69,7 +71,7 @@ One MEWM-Agent run turns a long video into verified AU→emotion evidence chains
        alt="Four-layer memory system of MEWM-Agent" width="92%">
 </p>
 
-Four-layer memory keeps cross-segment context within a bounded token budget. Working, episodic, and semantic stores are coordinated by the global memory 𝔾; evidence trees are retrieved, filtered, and token-regulated before injection into each agent's context, and memory reads and writes are audited during verification.
+Four-layer memory keeps cross-segment context within a bounded token budget: working, episodic, and semantic stores plus the global memory 𝔾. Evidence trees are retrieved, filtered, and token-regulated before injection into each agent's context, and memory reads and writes are audited during verification.
 
 ## End-to-End Case Study
 
