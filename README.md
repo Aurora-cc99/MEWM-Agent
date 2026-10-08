@@ -2,7 +2,7 @@
 
 # MEWM-Agent
 
-### Spotting as Prediction Failure
+### Long-video micro-expression question answering (ME-LVQA)
 
 **Multi-agent interactive emotional world model for long-video micro-expression question answering**
 
@@ -36,7 +36,7 @@
        alt="Overall architecture of MEWM-Agent" width="92%">
 </p>
 
-Overall architecture of MEWM-Agent. **Top:** SRE, PRE, and ACE process a long video, with ACE coordinating four agents over shared memory to produce emotion labels, AU→emotion causal chains, and verified evidence reports. **Middle:** Three-layer memory is retrieved, filtered, and token-regulated before injection into each agent's context. **Bottom:** WAEPO mixes verified anchor trajectories with current policy samples and updates the policy with cascaded rewards.
+Overall architecture of MEWM-Agent. **Top:** SRE, PRE, and ACE process a long video, with ACE coordinating four agents over shared memory to produce emotion labels, AU→emotion causal chains, and verified evidence reports. **Middle:** Four-layer memory is retrieved, filtered, and token-regulated before injection into each agent's context. **Bottom:** WAEPO mixes verified anchor trajectories with current policy samples and updates the policy with cascaded rewards.
 
 </div>
 
@@ -47,7 +47,7 @@ Long-video micro-expression question answering (ME-LVQA) requires spotting brief
 - **Subject-specific normal dynamics:** MEWM-Agent learns AU-centered dual-timescale states of each subject's normal facial dynamics, so expression displacement can be separated from head motion and eye blinks.
 - **Spotting as prediction failure:** ME spotting is recast as the detection of structured prediction failures; emotion hypotheses are then examined through emotion-conditioned rollouts and counterfactual tests.
 - **Four interacting agents:** perception, structuring, reasoning, and critic-verification agents interact along the motion, AU, and emotion evidence hierarchy, and only candidates that pass both prediction and evidence verification enter subsequent reasoning.
-- **Three-layer memory with a bounded token budget:** working, episodic, and semantic stores coordinated by the global memory 𝔾 maintain cross-segment context, with evidence token regulation keeping the injected context within budget.
+- **Four-layer memory with a bounded token budget:** working, episodic, and semantic stores coordinated by the global memory 𝔾 maintain cross-segment context, with evidence token regulation keeping the injected context within budget.
 - **World-model anchored optimisation (WAEPO):** verified trajectories act as behavior anchors in group-relative advantage estimation and are combined with hierarchical process rewards computed by the prediction engine, so policy updates are jointly constrained by outcome correctness, evidence sufficiency, and causal consistency.
 - **Four long-video benchmarks:** validated on CAS(ME)², SAMM, CAS(ME)³, and 4D-ME across ME spotting, AU attribution, and ME-LVQA.
 
@@ -60,23 +60,16 @@ Long-video micro-expression question answering (ME-LVQA) requires spotting brief
 
 Each of the four agents is an MLLM with a role-specific LoRA adapter: perception validates motion evidence and proposals, structuring builds AU sets and temporal dynamic graphs, reasoning generates causal CoT and emotion labels, and critic-verification checks hypotheses and returns evidence reports. All agents access shared memory (top) and engine services (bottom) under level-specific visibility.
 
-A MEWM-Agent run turns a long video into verified AU→emotion evidence chains in six stages:
+One MEWM-Agent run turns a long video into verified AU→emotion evidence chains: SRE compresses the observation stream into AU-centered dual-timescale states, PRE spots candidate events from structured prediction errors, and ACE coordinates the perception, structuring, reasoning, and critic-verification agents along the evidence hierarchy to produce emotion labels, AU→emotion causal chains, and verified evidence reports.
 
-1. **SRE:** V1–V3 encoders extract optical-flow motion features, AU-centered slot states, and subject-specific latent dynamics baselines across the whole video.
-2. **PRE:** the M1 dynamics model predicts AU-centered dual-timescale states, while V4 regulates the evidence token budget across segments.
-3. **Spot:** M2 turns prediction errors into ME candidates and refines interval boundaries; the P-agent rescans the candidates to confirm or reject them.
-4. **AU:** the A-agent builds the AU set and the temporal AU dynamic graph for each confirmed candidate.
-5. **Reason:** the R-agent generates causal chain-of-thought and an emotion label, while M3 runs emotion-conditioned rollouts and counterfactual tests; the C-agent verifies each hypothesis against evidence.
-6. **QA:** ACE composes the verified evidence chains into emotion labels, AU→emotion causal chains, and the final QA answer.
-
-## Three-Layer Memory
+## Four-Layer Memory
 
 <p align="center">
   <img src="F3.png"
-       alt="Three-layer memory system of MEWM-Agent" width="92%">
+       alt="Four-layer memory system of MEWM-Agent" width="92%">
 </p>
 
-Three-layer memory keeps cross-segment context within a bounded token budget. Working, episodic, and semantic stores are coordinated by the global memory 𝔾; evidence trees are retrieved, filtered, and token-regulated before injection into each agent's context, and memory reads and writes are audited during verification.
+Four-layer memory keeps cross-segment context within a bounded token budget. Working, episodic, and semantic stores are coordinated by the global memory 𝔾; evidence trees are retrieved, filtered, and token-regulated before injection into each agent's context, and memory reads and writes are audited during verification.
 
 ## End-to-End Case Study
 
@@ -252,7 +245,7 @@ Before training, set the key hyperparameters in [configs/mewm_agent.yaml](config
 MEWM-Agent-main/
 ├── F1.png                                # overall architecture figure
 ├── F2.png                                # agent roles and interactions figure
-├── F3.png                                # three-layer memory system figure
+├── F3.png                                # four-layer memory system figure
 ├── F4.png                                # end-to-end case study figure
 ├── README.md                             # this file
 ├── requirements.txt                      # Python dependencies
@@ -273,8 +266,8 @@ MEWM-Agent-main/
 │   ├── __init__.py                       # package entry, version string
 │   ├── config.py                         # all dataclass configs + load_config();
 │   │                                     #   single source of truth for settings
-│   ├── pipeline.py                       # six-stage end-to-end pipeline:
-│   │                                     #   SRE → PRE → spot → AU → reason → QA
+│   ├── pipeline.py                       # end-to-end pipeline: SRE → PRE → ACE
+│   │                                     #   coordinating engines, agents, memory
 │   ├── schemas.py                        # typed dataclasses for inter-agent
 │   │                                     #   messages, evidence trees, QA outputs
 │   │
@@ -342,7 +335,7 @@ MEWM-Agent-main/
 │   │   ├── quant.py                      # bitsandbytes 4-bit/8-bit quant helpers
 │   │   └── registry.py                   # model-name → backend routing registry
 │   │
-│   ├── memory/                           # three-layer memory system
+│   ├── memory/                           # four-layer memory system
 │   │   ├── __init__.py
 │   │   ├── store.py                      # working / episodic / semantic stores
 │   │   │                                 #   with the global memory 𝔾 coordinator
